@@ -231,6 +231,32 @@ app.post("/api/telegram/sync-hourly", async (req, res) => {
   }
 })
 
+
+app.post("/api/admin/approve-listing/:id", async (req, res) => {
+  try {
+    const { id } = req.params
+
+    const { data: listing, error } = await supabaseAdmin
+      .from("channel_listings")
+      .update({ status: "approved" })
+      .eq("id", id)
+      .select()
+      .single()
+
+    if (error) throw error
+
+    // 🔹 THIS is the important line
+    await syncListingTelegramData(listing)
+
+    res.json({ ok: true })
+  } catch (err) {
+    console.error("Approve listing error:", err)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+
+
 const PORT = process.env.PORT || 3000
 
 app.listen(PORT, () => {
