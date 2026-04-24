@@ -1,4 +1,12 @@
+const express = require("express")
 const { createClient } = require("@supabase/supabase-js")
+
+const app = express()
+app.use(express.json())
+
+app.get("/", (req, res) => {
+  res.status(200).send("Telegram sync backend running")
+})
 
 const supabaseAdmin = createClient(
   process.env.SUPABASE_URL,
