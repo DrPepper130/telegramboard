@@ -117,6 +117,8 @@ async function syncListingTelegramData(listing) {
 
 
 app.post("/api/telegram/webhook", async (req, res) => {
+  console.log("Telegram webhook hit:", JSON.stringify(req.body, null, 2))
+  
   try {
     const update = req.body
 
