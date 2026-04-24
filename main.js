@@ -236,3 +236,44 @@ const PORT = process.env.PORT || 3000
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`)
 })
+
+
+
+app.get("/api/telegram/sync-hourly", async (req, res) => {
+  try {
+    if (req.query.secret !== process.env.CRON_SECRET) {
+      return res.status(401).json({ error: "Unauthorized" })
+    }
+
+    const { data: listings, error } = await supabaseAdmin
+      .from("channel_listings")
+      .select("*")
+      .eq("status", "approved")
+
+    if (error) throw error
+
+    const results = []
+
+    for (const listing of listings || []) {
+      try {
+        const synced = await syncListingTelegramData(listing)
+        results.push({
+          id: listing.id,
+          ok: true,
+          member_count: synced.memberCount,
+        })
+      } catch (err) {
+        results.push({
+          id: listing.id,
+          ok: false,
+          error: err.message,
+        })
+      }
+    }
+
+    res.json({ ok: true, results })
+  } catch (err) {
+    console.error("Hourly sync error:", err)
+    res.status(500).json({ error: err.message })
+  }
+})
