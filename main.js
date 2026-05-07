@@ -129,7 +129,7 @@ async function syncListingTelegramData(listing) {
 
 
 
-app.post("/api/discord/vote-feed", express.json(), async (req, res) => {
+app.post("/api/discord/vote-feed", async (req, res) => {
   console.log("Discord vote feed route hit:", req.body)
 
   try {
@@ -155,13 +155,21 @@ app.post("/api/discord/vote-feed", express.json(), async (req, res) => {
     const safeDescription =
       description || "A Telegram community was recently voted on TeleHub."
 
+    const safeTelegramLink = telegram_link?.startsWith("http")
+      ? telegram_link
+      : `https://${telegram_link}`
+
+    const safeListingUrl = listing_url?.startsWith("http")
+      ? listing_url
+      : `https://telehub.to${listing_url}`
+
     const embed = {
       username: "TeleHub",
       avatar_url: "https://telehub.to/favicon.ico",
       embeds: [
         {
           title: safeTitle,
-          url: listing_url,
+          url: safeListingUrl,
           description: safeDescription.slice(0, 250),
           color: 0x229ed9,
           thumbnail: icon_url ? { url: icon_url } : undefined,
@@ -202,13 +210,13 @@ app.post("/api/discord/vote-feed", express.json(), async (req, res) => {
               type: 2,
               style: 5,
               label: "View Listing",
-              url: listing_url,
+              url: safeListingUrl,
             },
             {
               type: 2,
               style: 5,
               label: "Join Telegram",
-              url: telegram_link,
+              url: safeTelegramLink,
             },
           ],
         },
@@ -223,8 +231,11 @@ app.post("/api/discord/vote-feed", express.json(), async (req, res) => {
       body: JSON.stringify(embed),
     })
 
+    console.log("Discord webhook status:", response.status)
+
     if (!response.ok) {
       const text = await response.text()
+      console.log("Discord webhook error:", text)
       return res.status(500).json({ error: text })
     }
 
