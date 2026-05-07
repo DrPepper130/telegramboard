@@ -116,6 +116,112 @@ async function syncListingTelegramData(listing) {
 
 
 
+app.post("/api/discord/vote-feed", express.json(), async (req, res) => {
+  try {
+    const webhookUrl = process.env.DISCORD_VOTE_WEBHOOK_URL
+
+    if (!webhookUrl) {
+      return res.status(500).json({ error: "Missing Discord webhook URL" })
+    }
+
+    const {
+      title,
+      description,
+      telegram_link,
+      listing_url,
+      icon_url,
+      image_url,
+      votes_count,
+      member_count,
+      categories,
+    } = req.body
+
+    const safeTitle = title || "Telegram Channel"
+    const safeDescription =
+      description || "A Telegram community was recently voted on TeleHub."
+
+    const embed = {
+      username: "TeleHub",
+      avatar_url: "https://telehub.to/favicon.ico",
+      embeds: [
+        {
+          title: safeTitle,
+          url: listing_url,
+          description: safeDescription.slice(0, 250),
+          color: 0x229ed9,
+          thumbnail: icon_url ? { url: icon_url } : undefined,
+          image: image_url ? { url: image_url } : undefined,
+          fields: [
+            {
+              name: "Votes",
+              value: String(votes_count || 0),
+              inline: true,
+            },
+            {
+              name: "Members",
+              value: member_count
+                ? Number(member_count).toLocaleString()
+                : "Updating",
+              inline: true,
+            },
+            {
+              name: "Categories",
+              value:
+                Array.isArray(categories) && categories.length
+                  ? categories.slice(0, 5).join(", ")
+                  : "General",
+              inline: false,
+            },
+          ],
+          footer: {
+            text: "Recently voted on TeleHub",
+          },
+          timestamp: new Date().toISOString(),
+        },
+      ],
+      components: [
+        {
+          type: 1,
+          components: [
+            {
+              type: 2,
+              style: 5,
+              label: "View Listing",
+              url: listing_url,
+            },
+            {
+              type: 2,
+              style: 5,
+              label: "Join Telegram",
+              url: telegram_link,
+            },
+          ],
+        },
+      ],
+    }
+
+    const response = await fetch(webhookUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(embed),
+    })
+
+    if (!response.ok) {
+      const text = await response.text()
+      return res.status(500).json({ error: text })
+    }
+
+    return res.json({ ok: true })
+  } catch (err) {
+    console.error("Discord vote feed error:", err)
+    return res.status(500).json({ error: "Failed to send Discord feed post" })
+  }
+})
+
+
+
 app.post("/api/telegram/webhook", async (req, res) => {
   console.log("Telegram webhook hit:", JSON.stringify(req.body, null, 2))
   
