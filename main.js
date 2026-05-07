@@ -170,7 +170,6 @@ app.post("/api/discord/vote-feed", async (req, res) => {
           description:
             (description || "A Telegram community was recently voted on TeleHub.").slice(0, 250),
           color: 2260697,
-          thumbnail: icon_url ? { url: icon_url } : undefined,
           image: image_url ? { url: image_url } : undefined,
           fields: [
             {
@@ -207,7 +206,7 @@ app.post("/api/discord/vote-feed", async (req, res) => {
             {
               type: 2,
               style: 5,
-              label: "View Listing",
+              label: "View on TeleHub",
               url: safeListingUrl,
             },
             {
