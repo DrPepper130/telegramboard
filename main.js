@@ -29,6 +29,12 @@ const supabaseAdmin = createClient(
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`
 
+
+const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || "")
+  .split(",")
+  .map((email) => email.trim().toLowerCase())
+  .filter(Boolean)
+
 async function tg(method, body) {
   const res = await fetch(`${TELEGRAM_API}/${method}`, {
     method: "POST",
@@ -127,7 +133,33 @@ async function syncListingTelegramData(listing) {
   return { chat, memberCount, iconUrl }
 }
 
+app.post("/api/auth/is-admin", async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || ""
+    const token = authHeader.replace("Bearer ", "")
 
+    if (!token) {
+      return res.status(401).json({ isAdmin: false })
+    }
+
+    const {
+      data: { user },
+      error,
+    } = await supabaseAdmin.auth.getUser(token)
+
+    if (error || !user) {
+      return res.status(401).json({ isAdmin: false })
+    }
+
+    const email = (user.email || "").toLowerCase()
+    const isAdmin = ADMIN_EMAILS.includes(email)
+
+    return res.json({ isAdmin })
+  } catch (err) {
+    console.error("Admin check error:", err)
+    return res.status(500).json({ isAdmin: false })
+  }
+})
 
 app.post("/api/discord/vote-feed", async (req, res) => {
   console.log("Discord vote feed route hit:", req.body)
