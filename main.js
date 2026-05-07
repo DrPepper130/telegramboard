@@ -136,6 +136,7 @@ app.post("/api/discord/vote-feed", async (req, res) => {
     const webhookUrl = process.env.DISCORD_VOTE_WEBHOOK_URL
 
     if (!webhookUrl) {
+      console.log("Missing DISCORD_VOTE_WEBHOOK_URL")
       return res.status(500).json({ error: "Missing Discord webhook URL" })
     }
 
@@ -151,10 +152,6 @@ app.post("/api/discord/vote-feed", async (req, res) => {
       categories,
     } = req.body
 
-    const safeTitle = title || "Telegram Channel"
-    const safeDescription =
-      description || "A Telegram community was recently voted on TeleHub."
-
     const safeTelegramLink = telegram_link?.startsWith("http")
       ? telegram_link
       : `https://${telegram_link}`
@@ -163,15 +160,16 @@ app.post("/api/discord/vote-feed", async (req, res) => {
       ? listing_url
       : `https://telehub.to${listing_url}`
 
-    const embed = {
+    const payload = {
       username: "TeleHub",
-      avatar_url: "https://telehub.to/favicon.ico",
+      content: `🔥 **${title || "A Telegram channel"}** was just voted on TeleHub!`,
       embeds: [
         {
-          title: safeTitle,
+          title: title || "Telegram Channel",
           url: safeListingUrl,
-          description: safeDescription.slice(0, 250),
-          color: 0x229ed9,
+          description:
+            (description || "A Telegram community was recently voted on TeleHub.").slice(0, 250),
+          color: 2260697,
           thumbnail: icon_url ? { url: icon_url } : undefined,
           image: image_url ? { url: image_url } : undefined,
           fields: [
@@ -223,29 +221,31 @@ app.post("/api/discord/vote-feed", async (req, res) => {
       ],
     }
 
+    console.log("Sending payload to Discord...")
+
     const response = await fetch(webhookUrl, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
       },
-      body: JSON.stringify(embed),
+      body: JSON.stringify(payload),
     })
 
+    const text = await response.text()
+
     console.log("Discord webhook status:", response.status)
+    console.log("Discord webhook response:", text)
 
     if (!response.ok) {
-      const text = await response.text()
-      console.log("Discord webhook error:", text)
       return res.status(500).json({ error: text })
     }
 
     return res.json({ ok: true })
   } catch (err) {
     console.error("Discord vote feed error:", err)
-    return res.status(500).json({ error: "Failed to send Discord feed post" })
+    return res.status(500).json({ error: err.message })
   }
 })
-
 
 
 app.post("/api/telegram/webhook", async (req, res) => {
