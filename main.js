@@ -130,6 +130,8 @@ async function syncListingTelegramData(listing) {
 
 
 app.post("/api/discord/vote-feed", express.json(), async (req, res) => {
+  console.log("Discord vote feed route hit:", req.body)
+
   try {
     const webhookUrl = process.env.DISCORD_VOTE_WEBHOOK_URL
 
