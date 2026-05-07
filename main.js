@@ -4,6 +4,19 @@ const { createClient } = require("@supabase/supabase-js")
 const app = express()
 app.use(express.json())
 
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "https://telehub.to")
+  res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(200)
+  }
+
+  next()
+})
+
+
 app.get("/", (req, res) => {
   res.status(200).send("Telegram sync backend running")
 })
