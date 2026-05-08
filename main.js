@@ -306,6 +306,103 @@ app.post("/api/discord/vote-feed", async (req, res) => {
 })
 
 
+
+function cleanReferralCode(value) {
+  return String(value || "")
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9-]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-+|-+$/g, "")
+}
+
+function shouldResetReferralWindow(listing) {
+  if (!listing.referral_last_reset) return true
+
+  const lastReset = new Date(listing.referral_last_reset).getTime()
+  if (!Number.isFinite(lastReset)) return true
+
+  return Date.now() - lastReset >= 24 * 60 * 60 * 1000
+}
+
+app.get("/api/referrals/track", async (req, res) => {
+  try {
+    const code = cleanReferralCode(req.query.code)
+
+    if (!code) {
+      return res.status(400).json({ error: "Missing referral code" })
+    }
+
+    const { data: listing, error } = await supabaseAdmin
+      .from("channel_listings")
+      .select("*")
+      .eq("short_invite", code)
+      .eq("status", "approved")
+      .maybeSingle()
+
+    if (error) throw error
+
+    if (!listing || listing.is_banned) {
+      return res.status(404).json({ error: "Invite not found" })
+    }
+
+    const now = new Date().toISOString()
+    const resetNeeded = shouldResetReferralWindow(listing)
+
+    const startingClicks = resetNeeded
+      ? 0
+      : Number(listing.referral_clicks_today || 0)
+
+    const canCount = startingClicks < 50
+    const nextClicks = canCount ? startingClicks + 1 : startingClicks
+    const nextBoost = Math.round((Math.min(nextClicks, 50) / 50) * 100)
+
+    const ip =
+      req.headers["x-forwarded-for"]?.split(",")[0]?.trim() ||
+      req.socket?.remoteAddress ||
+      null
+
+    const userAgent = req.headers["user-agent"] || null
+
+    if (canCount) {
+      await supabaseAdmin.from("listing_referral_clicks").insert({
+        listing_id: listing.id,
+        short_invite: code,
+        ip_address: ip,
+        user_agent: userAgent,
+        created_at: now,
+      })
+    }
+
+    const { error: updateError } = await supabaseAdmin
+      .from("channel_listings")
+      .update({
+        referral_clicks_today: nextClicks,
+        referral_boost_score: nextBoost,
+        referral_last_reset: resetNeeded ? now : listing.referral_last_reset,
+        updated_at: now,
+      })
+      .eq("id", listing.id)
+
+    if (updateError) throw updateError
+
+    return res.json({
+      ok: true,
+      counted: canCount,
+      telegram_link: listing.telegram_link,
+      clicks_today: nextClicks,
+      boost_percent: nextBoost,
+      daily_cap: 50,
+    })
+  } catch (err) {
+    console.error("Referral tracking error:", err)
+    return res.status(500).json({ error: err.message })
+  }
+})
+
+
+
+
 app.post("/api/telegram/webhook", async (req, res) => {
   console.log("Telegram webhook hit:", JSON.stringify(req.body, null, 2))
   
