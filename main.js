@@ -320,12 +320,34 @@ function cleanReferralCode(value) {
 }
 
 function shouldResetReferralWindow(listing) {
-  if (!listing.referral_last_reset) return true
+  const now = new Date()
 
-  const lastReset = new Date(listing.referral_last_reset).getTime()
-  if (!Number.isFinite(lastReset)) return true
+  // Arizona timezone
+  const arizonaNow = new Date(
+    now.toLocaleString("en-US", {
+      timeZone: "America/Phoenix",
+    })
+  )
 
-  return Date.now() - lastReset >= REFERRAL_WINDOW_HOURS * 60 * 60 * 1000
+  // Today's midnight in Arizona
+  const arizonaMidnight = new Date(arizonaNow)
+  arizonaMidnight.setHours(0, 0, 0, 0)
+
+  if (!listing.referral_last_reset) {
+    return true
+  }
+
+  const lastReset = new Date(listing.referral_last_reset)
+
+  // Convert last reset into Arizona timezone
+  const arizonaLastReset = new Date(
+    lastReset.toLocaleString("en-US", {
+      timeZone: "America/Phoenix",
+    })
+  )
+
+  // Reset once calendar day changes in Arizona
+  return arizonaLastReset < arizonaMidnight
 }
 
 function hashValue(value) {
