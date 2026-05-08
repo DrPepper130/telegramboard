@@ -305,7 +305,10 @@ app.post("/api/discord/vote-feed", async (req, res) => {
   }
 })
 
+const crypto = require("crypto")
 
+const REFERRAL_DAILY_CAP = 50
+const REFERRAL_WINDOW_HOURS = 24
 
 function cleanReferralCode(value) {
   return String(value || "")
@@ -322,12 +325,39 @@ function shouldResetReferralWindow(listing) {
   const lastReset = new Date(listing.referral_last_reset).getTime()
   if (!Number.isFinite(lastReset)) return true
 
-  return Date.now() - lastReset >= 24 * 60 * 60 * 1000
+  return Date.now() - lastReset >= REFERRAL_WINDOW_HOURS * 60 * 60 * 1000
+}
+
+function hashValue(value) {
+  if (!value) return null
+
+  return crypto
+    .createHash("sha256")
+    .update(String(value))
+    .digest("hex")
+}
+
+function getClientIp(req) {
+  const forwarded = req.headers["x-forwarded-for"]
+
+  if (forwarded) {
+    return forwarded.split(",")[0].trim()
+  }
+
+  return req.socket?.remoteAddress || null
+}
+
+function cleanVisitorId(value) {
+  return String(value || "")
+    .trim()
+    .replace(/[^a-zA-Z0-9_-]/g, "")
+    .slice(0, 80)
 }
 
 app.get("/api/referrals/track", async (req, res) => {
   try {
     const code = cleanReferralCode(req.query.code)
+    const visitorId = cleanVisitorId(req.query.visitor_id)
 
     if (!code) {
       return res.status(400).json({ error: "Missing referral code" })
@@ -346,30 +376,98 @@ app.get("/api/referrals/track", async (req, res) => {
       return res.status(404).json({ error: "Invite not found" })
     }
 
-    const now = new Date().toISOString()
+    const nowDate = new Date()
+    const now = nowDate.toISOString()
     const resetNeeded = shouldResetReferralWindow(listing)
+
+    const windowStartDate = resetNeeded
+      ? nowDate
+      : new Date(listing.referral_last_reset || now)
+
+    const windowStart = windowStartDate.toISOString()
+
+    const ip = getClientIp(req)
+    const userAgent = req.headers["user-agent"] || ""
+
+    const visitorHash = hashValue(visitorId)
+    const ipHash = hashValue(ip)
+    const userAgentHash = hashValue(userAgent)
+    const ipUserAgentHash = hashValue(`${ip || ""}|${userAgent || ""}`)
 
     const startingClicks = resetNeeded
       ? 0
       : Number(listing.referral_clicks_today || 0)
 
-    const canCount = startingClicks < 50
+    let alreadyCounted = false
+
+    let duplicateChecks = []
+
+    if (visitorHash) {
+      duplicateChecks.push(`visitor_hash.eq.${visitorHash}`)
+    }
+
+    if (ipHash) {
+      duplicateChecks.push(`ip_hash.eq.${ipHash}`)
+    }
+
+    if (ipUserAgentHash) {
+      duplicateChecks.push(`ip_user_agent_hash.eq.${ipUserAgentHash}`)
+    }
+
+    if (duplicateChecks.length > 0) {
+      const { data: existingClick, error: existingError } = await supabaseAdmin
+        .from("listing_referral_clicks")
+        .select("id")
+        .eq("listing_id", listing.id)
+        .gte("created_at", windowStart)
+        .or(duplicateChecks.join(","))
+        .limit(1)
+        .maybeSingle()
+
+      if (existingError) throw existingError
+
+      alreadyCounted = !!existingClick
+    }
+
+    const canCount =
+      !alreadyCounted &&
+      startingClicks < REFERRAL_DAILY_CAP &&
+      (visitorHash || ipHash || ipUserAgentHash)
+
     const nextClicks = canCount ? startingClicks + 1 : startingClicks
-    const nextBoost = Math.round((Math.min(nextClicks, 50) / 50) * 100)
-
-    const ip =
-      req.headers["x-forwarded-for"]?.split(",")[0]?.trim() ||
-      req.socket?.remoteAddress ||
-      null
-
-    const userAgent = req.headers["user-agent"] || null
+    const nextBoost = Math.round(
+      (Math.min(nextClicks, REFERRAL_DAILY_CAP) / REFERRAL_DAILY_CAP) * 100
+    )
 
     if (canCount) {
       await supabaseAdmin.from("listing_referral_clicks").insert({
         listing_id: listing.id,
         short_invite: code,
+
+        // Keep raw values only if your table already has these columns.
+        // If you prefer privacy-only, remove ip_address and user_agent.
         ip_address: ip,
         user_agent: userAgent,
+
+        visitor_hash: visitorHash,
+        ip_hash: ipHash,
+        user_agent_hash: userAgentHash,
+        ip_user_agent_hash: ipUserAgentHash,
+
+        counted: true,
+        created_at: now,
+      })
+    } else {
+      await supabaseAdmin.from("listing_referral_clicks").insert({
+        listing_id: listing.id,
+        short_invite: code,
+        ip_address: ip,
+        user_agent: userAgent,
+        visitor_hash: visitorHash,
+        ip_hash: ipHash,
+        user_agent_hash: userAgentHash,
+        ip_user_agent_hash: ipUserAgentHash,
+        counted: false,
         created_at: now,
       })
     }
@@ -389,10 +487,11 @@ app.get("/api/referrals/track", async (req, res) => {
     return res.json({
       ok: true,
       counted: canCount,
+      already_counted: alreadyCounted,
       telegram_link: listing.telegram_link,
       clicks_today: nextClicks,
       boost_percent: nextBoost,
-      daily_cap: 50,
+      daily_cap: REFERRAL_DAILY_CAP,
     })
   } catch (err) {
     console.error("Referral tracking error:", err)
