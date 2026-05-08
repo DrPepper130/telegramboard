@@ -501,6 +501,84 @@ app.get("/api/referrals/track", async (req, res) => {
 
 
 
+// ========================================
+// RANKING ALGORITHM
+// ========================================
+
+const RANKING_WEIGHTS = {
+  votes: 0.35,
+  referralBoost: 0.25,
+  memberGrowth: 0.25,
+  freshness: 0.15,
+}
+
+function clampNumber(value, min, max) {
+  const num = Number(value || 0)
+  if (!Number.isFinite(num)) return min
+  return Math.max(min, Math.min(max, num))
+}
+
+function normalizeLogScore(value, maxValue) {
+  const num = Math.max(0, Number(value || 0))
+  const max = Math.max(1, Number(maxValue || 1))
+
+  return Math.min(100, (Math.log10(num + 1) / Math.log10(max + 1)) * 100)
+}
+
+function getFreshnessScore(listing) {
+  const dateValue =
+    listing.updated_at ||
+    listing.last_synced_at ||
+    listing.created_at
+
+  if (!dateValue) return 0
+
+  const ageMs = Date.now() - new Date(dateValue).getTime()
+  const ageDays = ageMs / (1000 * 60 * 60 * 24)
+
+  if (!Number.isFinite(ageDays)) return 0
+
+  // Full power when very fresh, fades over 30 days
+  return clampNumber(100 - (ageDays / 30) * 100, 0, 100)
+}
+
+function calculateRankingScore(listing, maxStats) {
+  const voteScore = normalizeLogScore(
+    listing.votes_count || 0,
+    maxStats.maxVotes
+  )
+
+  const referralScore = clampNumber(
+    listing.referral_boost_score || 0,
+    0,
+    100
+  )
+
+  const memberGrowthScore = normalizeLogScore(
+    listing.member_growth_24h || 0,
+    maxStats.maxGrowth
+  )
+
+  const freshnessScore = getFreshnessScore(listing)
+
+  const rankingScore =
+    voteScore * RANKING_WEIGHTS.votes +
+    referralScore * RANKING_WEIGHTS.referralBoost +
+    memberGrowthScore * RANKING_WEIGHTS.memberGrowth +
+    freshnessScore * RANKING_WEIGHTS.freshness
+
+  return {
+    ranking_score: Math.round(rankingScore * 100) / 100,
+    ranking_breakdown: {
+      vote_score: Math.round(voteScore * 100) / 100,
+      referral_score: Math.round(referralScore * 100) / 100,
+      member_growth_score: Math.round(memberGrowthScore * 100) / 100,
+      freshness_score: Math.round(freshnessScore * 100) / 100,
+    },
+  }
+}
+
+
 
 app.post("/api/telegram/webhook", async (req, res) => {
   console.log("Telegram webhook hit:", JSON.stringify(req.body, null, 2))
@@ -641,6 +719,102 @@ app.post("/api/admin/approve-listing/:id", async (req, res) => {
   }
 })
 
+
+app.get("/api/listings/ranked", async (req, res) => {
+  try {
+    const { data: listings, error: listingsError } = await supabaseAdmin
+      .from("channel_listings")
+      .select("*")
+      .eq("status", "approved")
+
+    if (listingsError) throw listingsError
+
+    const listingIds = (listings || []).map((item) => item.id)
+
+    let snapshots = []
+
+    if (listingIds.length > 0) {
+      const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString()
+
+      const { data: snapshotData, error: snapshotError } = await supabaseAdmin
+        .from("channel_member_snapshots")
+        .select("listing_id, member_count, created_at")
+        .in("listing_id", listingIds)
+        .gte("created_at", since)
+        .order("created_at", { ascending: true })
+
+      if (snapshotError) throw snapshotError
+
+      snapshots = snapshotData || []
+    }
+
+    const snapshotsByListing = {}
+
+    snapshots.forEach((snapshot) => {
+      if (!snapshotsByListing[snapshot.listing_id]) {
+        snapshotsByListing[snapshot.listing_id] = []
+      }
+
+      snapshotsByListing[snapshot.listing_id].push(snapshot)
+    })
+
+    const listingsWithGrowth = (listings || []).map((listing) => {
+      const listingSnapshots = snapshotsByListing[listing.id] || []
+      const firstSnapshot = listingSnapshots[0]
+      const latestSnapshot = listingSnapshots[listingSnapshots.length - 1]
+
+      const oldMembers = Number(firstSnapshot?.member_count || listing.member_count || 0)
+      const latestMembers = Number(latestSnapshot?.member_count || listing.member_count || 0)
+
+      const memberGrowth24h = Math.max(0, latestMembers - oldMembers)
+
+      return {
+        ...listing,
+        member_growth_24h: memberGrowth24h,
+      }
+    })
+
+    const maxStats = {
+      maxVotes: Math.max(
+        1,
+        ...listingsWithGrowth.map((item) => Number(item.votes_count || 0))
+      ),
+      maxGrowth: Math.max(
+        1,
+        ...listingsWithGrowth.map((item) => Number(item.member_growth_24h || 0))
+      ),
+    }
+
+    const rankedListings = listingsWithGrowth
+      .map((listing) => {
+        const ranking = calculateRankingScore(listing, maxStats)
+
+        return {
+          ...listing,
+          ...ranking,
+        }
+      })
+      .sort((a, b) => {
+        if (b.ranking_score !== a.ranking_score) {
+          return b.ranking_score - a.ranking_score
+        }
+
+        return (
+          new Date(b.created_at).getTime() -
+          new Date(a.created_at).getTime()
+        )
+      })
+
+    return res.json({
+      ok: true,
+      listings: rankedListings,
+      weights: RANKING_WEIGHTS,
+    })
+  } catch (err) {
+    console.error("Ranked listings error:", err)
+    return res.status(500).json({ error: err.message })
+  }
+})
 
 
 const PORT = process.env.PORT || 3000
