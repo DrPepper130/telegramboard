@@ -35,6 +35,32 @@ const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || "")
   .map((email) => email.trim().toLowerCase())
   .filter(Boolean)
 
+
+// ========================================
+// FAKE ONLINE COUNTER
+// ========================================
+
+let fakeOnlineCount = 151
+
+function updateFakeOnlineCount() {
+    const movement = Math.floor(Math.random() * 7) - 3
+    fakeOnlineCount += movement
+
+    if (fakeOnlineCount < 100) fakeOnlineCount = 100
+    if (fakeOnlineCount > 200) fakeOnlineCount = 200
+}
+
+// update once per minute
+setInterval(updateFakeOnlineCount, 60 * 1000)
+
+app.get("/api/stats/online", async (req, res) => {
+    res.json({
+        online: fakeOnlineCount,
+    })
+})
+
+
+
 async function tg(method, body) {
   const res = await fetch(`${TELEGRAM_API}/${method}`, {
     method: "POST",
