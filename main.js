@@ -128,8 +128,9 @@ async function syncListingTelegramData(listing) {
   await supabaseAdmin.from("channel_member_snapshots").insert({
     listing_id: listing.id,
     member_count: memberCount,
+    created_at: new Date().toISOString(),
   })
-
+  
   return { chat, memberCount, iconUrl }
 }
 
