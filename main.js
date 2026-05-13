@@ -173,6 +173,35 @@ const RANK_PRICE_IDS = {
   sponsor: "price_1TWUuW7OqwgduKJF8FK40UYG",
 }
 
+
+app.post("/api/stripe/create-billing-portal", async (req, res) => {
+  try {
+    const { listing_id, user_id } = req.body
+
+    const { data: listing, error } = await supabaseAdmin
+      .from("channel_listings")
+      .select("id, user_id, stripe_customer_id")
+      .eq("id", listing_id)
+      .eq("user_id", user_id)
+      .single()
+
+    if (error || !listing?.stripe_customer_id) {
+      return res.status(400).json({ error: "No Stripe customer found." })
+    }
+
+    const session = await stripe.billingPortal.sessions.create({
+      customer: listing.stripe_customer_id,
+      return_url: "https://telehub.to/dashboard",
+    })
+
+    res.json({ url: session.url })
+  } catch (err) {
+    console.error("Billing portal error:", err)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+
 app.post("/api/stripe/create-rank-checkout", async (req, res) => {
   try {
     const { listing_id, rank, user_id } = req.body
