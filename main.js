@@ -66,6 +66,116 @@ const RANK_PRICE_IDS = {
   sponsor: "price_1TWUuW7OqwgduKJF8FK40UYG",
 }
 
+
+const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY)
+
+app.post(
+  "/api/stripe/webhook",
+  express.raw({ type: "application/json" }),
+  async (req, res) => {
+    const sig = req.headers["stripe-signature"]
+
+    let event
+
+    try {
+      event = stripe.webhooks.constructEvent(
+        req.body,
+        sig,
+        process.env.STRIPE_WEBHOOK_SECRET
+      )
+    } catch (err) {
+      console.error("Stripe webhook signature error:", err.message)
+      return res.status(400).send(`Webhook Error: ${err.message}`)
+    }
+
+    try {
+      if (event.type === "checkout.session.completed") {
+        const session = event.data.object
+
+        const listingId = session.metadata?.listing_id
+        const userId = session.metadata?.user_id
+        const rank = session.metadata?.rank
+        const subscriptionId = session.subscription
+        const customerId = session.customer
+
+        if (listingId && userId && rank && subscriptionId) {
+          const subscription =
+            await stripe.subscriptions.retrieve(subscriptionId)
+
+          await supabaseAdmin
+            .from("channel_listings")
+            .update({
+              paid_rank: rank,
+              paid_rank_status: subscription.status,
+              stripe_customer_id: customerId,
+              stripe_subscription_id: subscriptionId,
+              paid_rank_current_period_end: subscription.current_period_end
+                ? new Date(subscription.current_period_end * 1000).toISOString()
+                : null,
+              updated_at: new Date().toISOString(),
+            })
+            .eq("id", listingId)
+            .eq("user_id", userId)
+        }
+      }
+
+      if (
+        event.type === "customer.subscription.updated" ||
+        event.type === "customer.subscription.deleted"
+      ) {
+        const subscription = event.data.object
+
+        const listingId = subscription.metadata?.listing_id
+        const userId = subscription.metadata?.user_id
+        const rank = subscription.metadata?.rank
+
+        const activeStatuses = ["active", "trialing"]
+        const isActive = activeStatuses.includes(subscription.status)
+
+        if (listingId && userId) {
+          await supabaseAdmin
+            .from("channel_listings")
+            .update({
+              paid_rank: isActive ? rank : "free",
+              paid_rank_status: subscription.status,
+              stripe_subscription_id: subscription.id,
+              paid_rank_current_period_end:
+                subscription.current_period_end
+                  ? new Date(
+                      subscription.current_period_end * 1000
+                    ).toISOString()
+                  : null,
+              updated_at: new Date().toISOString(),
+            })
+            .eq("id", listingId)
+            .eq("user_id", userId)
+        }
+      }
+
+      if (event.type === "invoice.payment_failed") {
+        const invoice = event.data.object
+        const subscriptionId = invoice.subscription
+
+        if (subscriptionId) {
+          await supabaseAdmin
+            .from("channel_listings")
+            .update({
+              paid_rank_status: "payment_failed",
+              updated_at: new Date().toISOString(),
+            })
+            .eq("stripe_subscription_id", subscriptionId)
+        }
+      }
+
+      return res.json({ received: true })
+    } catch (err) {
+      console.error("Stripe webhook handling error:", err)
+      return res.status(500).json({ error: err.message })
+    }
+  }
+)
+
+
 app.post("/api/stripe/create-rank-checkout", async (req, res) => {
   try {
     const { listing_id, rank, user_id } = req.body
