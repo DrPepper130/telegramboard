@@ -100,8 +100,11 @@ app.post(
               paid_rank_status: subscription.status,
               stripe_customer_id: customerId,
               stripe_subscription_id: subscriptionId,
-              paid_rank_current_period_end: subscription.current_period_end
-                ? new Date(subscription.current_period_end * 1000).toISOString()
+              paid_rank_current_period_end:
+                subscription.items?.data?.[0]?.current_period_end
+                  ? new Date(
+                    subscription.items.data[0].current_period_end * 1000
+                  ).toISOString()
                 : null,
               updated_at: new Date().toISOString(),
             })
@@ -131,11 +134,11 @@ app.post(
               paid_rank_status: subscription.status,
               stripe_subscription_id: subscription.id,
               paid_rank_current_period_end:
-                subscription.current_period_end
+                subscription.items?.data?.[0]?.current_period_end
                   ? new Date(
-                      subscription.current_period_end * 1000
-                    ).toISOString()
-                  : null,
+                    subscription.items.data[0].current_period_end * 1000
+                  ).toISOString()
+                : null,
               updated_at: new Date().toISOString(),
             })
             .eq("id", listingId)
