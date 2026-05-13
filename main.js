@@ -1,8 +1,7 @@
 const express = require("express")
 const { createClient } = require("@supabase/supabase-js")
-
+const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY)
 const app = express()
-app.use(express.json())
 
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "https://telehub.to")
@@ -58,13 +57,8 @@ app.get("/api/stats/online", async (req, res) => {
     })
 })
 
-const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY)
 
-const RANK_PRICE_IDS = {
-  silver: "price_1TWUrs7OqwgduKJFky8xGosP",
-  gold: "price_1TWUtJ7OqwgduKJFU5ghC6Md",
-  sponsor: "price_1TWUuW7OqwgduKJF8FK40UYG",
-}
+
 
 app.post(
   "/api/stripe/webhook",
@@ -172,6 +166,12 @@ app.post(
   }
 )
 
+app.use(express.json())
+const RANK_PRICE_IDS = {
+  silver: "price_1TWUrs7OqwgduKJFky8xGosP",
+  gold: "price_1TWUtJ7OqwgduKJFU5ghC6Md",
+  sponsor: "price_1TWUuW7OqwgduKJF8FK40UYG",
+}
 
 app.post("/api/stripe/create-rank-checkout", async (req, res) => {
   try {
