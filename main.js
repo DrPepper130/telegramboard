@@ -16,7 +16,6 @@ app.use((req, res, next) => {
   next()
 })
 
-
 app.get("/", (req, res) => {
   res.status(200).send("Telegram sync backend running")
 })
@@ -59,7 +58,62 @@ app.get("/api/stats/online", async (req, res) => {
     })
 })
 
+const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY)
 
+const RANK_PRICE_IDS = {
+  silver: "price_1TWUrs7OqwgduKJFky8xGosP",
+  gold: "price_1TWUtJ7OqwgduKJFU5ghC6Md",
+  sponsor: "price_1TWUuW7OqwgduKJF8FK40UYG",
+}
+
+app.post("/api/stripe/create-rank-checkout", async (req, res) => {
+  try {
+    const { listing_id, rank, user_id } = req.body
+
+    const cleanRank = String(rank || "").toLowerCase()
+    const priceId = RANK_PRICE_IDS[cleanRank]
+
+    if (!listing_id || !user_id || !priceId) {
+      return res.status(400).json({ error: "Missing listing, user, or rank." })
+    }
+
+    const { data: listing, error } = await supabaseAdmin
+      .from("channel_listings")
+      .select("id, user_id, channel_name")
+      .eq("id", listing_id)
+      .eq("user_id", user_id)
+      .single()
+
+    if (error || !listing) {
+      return res.status(403).json({ error: "Listing not found or not yours." })
+    }
+
+    const session = await stripe.checkout.sessions.create({
+      mode: "subscription",
+      payment_method_types: ["card"],
+      line_items: [{ price: priceId, quantity: 1 }],
+      success_url: "https://telehub.to/dashboard?payment=success",
+      cancel_url: "https://telehub.to/dashboard?payment=cancelled",
+      metadata: {
+        listing_id,
+        user_id,
+        rank: cleanRank,
+      },
+      subscription_data: {
+        metadata: {
+          listing_id,
+          user_id,
+          rank: cleanRank,
+        },
+      },
+    })
+
+    return res.json({ url: session.url })
+  } catch (err) {
+    console.error("Stripe checkout error:", err)
+    return res.status(500).json({ error: err.message })
+  }
+})
 
 async function tg(method, body) {
   const res = await fetch(`${TELEGRAM_API}/${method}`, {
