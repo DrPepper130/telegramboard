@@ -66,9 +66,6 @@ const RANK_PRICE_IDS = {
   sponsor: "price_1TWUuW7OqwgduKJF8FK40UYG",
 }
 
-
-const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY)
-
 app.post(
   "/api/stripe/webhook",
   express.raw({ type: "application/json" }),
