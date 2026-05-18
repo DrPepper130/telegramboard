@@ -941,6 +941,7 @@ app.get("/api/listings/ranked", async (req, res) => {
       .from("channel_listings")
       .select("*")
       .eq("status", "approved")
+      .eq("is_banned", false)
 
     if (listingsError) throw listingsError
 
