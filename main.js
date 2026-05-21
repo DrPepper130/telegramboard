@@ -1035,6 +1035,51 @@ app.get("/api/listings/ranked", async (req, res) => {
 
 const PORT = process.env.PORT || 3000
 
+
+app.get("/api/widgets/preview", async (req, res) => {
+  try {
+    const link = String(req.query.link || "").trim()
+
+    if (!link) {
+      return res.status(400).json({ error: "Missing Telegram link" })
+    }
+
+    const username = extractUsernameFromLink(link)
+
+    if (!username) {
+      return res.status(400).json({
+        error: "This widget currently supports public t.me usernames only.",
+      })
+    }
+
+    const chat = await tg("getChat", { chat_id: username })
+    const memberCount = await tg("getChatMemberCount", { chat_id: chat.id })
+
+    let iconUrl = null
+
+    if (chat.photo?.big_file_id) {
+      const file = await tg("getFile", { file_id: chat.photo.big_file_id })
+      iconUrl = `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${file.file_path}`
+    }
+
+    return res.json({
+      ok: true,
+      title: chat.title || username,
+      username: cleanUsername(chat.username),
+      description: chat.description || chat.bio || "",
+      member_count: memberCount,
+      icon_url: iconUrl,
+      telegram_link: link,
+      theme_color: "#229ED9",
+    })
+  } catch (err) {
+    console.error("Widget preview error:", err)
+    return res.status(500).json({ error: err.message })
+  }
+})
+
+
+
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`)
 })
