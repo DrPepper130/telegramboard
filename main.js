@@ -1033,6 +1033,135 @@ app.get("/api/listings/ranked", async (req, res) => {
 })
 
 
+
+app.get("/api/listings/homepage", async (req, res) => {
+  try {
+    const limit = Math.min(
+      Math.max(parseInt(req.query.limit) || 18, 1),
+      30
+    )
+
+    // Reuse your ranked listings logic
+    const { data: listings, error: listingsError } =
+      await supabaseAdmin
+        .from("channel_listings")
+        .select("*")
+        .eq("status", "approved")
+        .eq("is_banned", false)
+
+    if (listingsError) throw listingsError
+
+    const listingIds = (listings || []).map((item) => item.id)
+
+    let snapshots = []
+
+    if (listingIds.length > 0) {
+      const since = new Date(
+        Date.now() - 24 * 60 * 60 * 1000
+      ).toISOString()
+
+      const {
+        data: snapshotData,
+        error: snapshotError,
+      } = await supabaseAdmin
+        .from("channel_member_snapshots")
+        .select("listing_id, member_count, created_at")
+        .in("listing_id", listingIds)
+        .gte("created_at", since)
+        .order("created_at", { ascending: true })
+
+      if (snapshotError) throw snapshotError
+
+      snapshots = snapshotData || []
+    }
+
+    const snapshotsByListing = {}
+
+    snapshots.forEach((snapshot) => {
+      if (!snapshotsByListing[snapshot.listing_id]) {
+        snapshotsByListing[snapshot.listing_id] = []
+      }
+
+      snapshotsByListing[snapshot.listing_id].push(snapshot)
+    })
+
+    const listingsWithGrowth = (listings || []).map((listing) => {
+      const listingSnapshots =
+        snapshotsByListing[listing.id] || []
+
+      const firstSnapshot = listingSnapshots[0]
+      const latestSnapshot =
+        listingSnapshots[listingSnapshots.length - 1]
+
+      const oldMembers = Number(
+        firstSnapshot?.member_count ||
+          listing.member_count ||
+          0
+      )
+
+      const latestMembers = Number(
+        latestSnapshot?.member_count ||
+          listing.member_count ||
+          0
+      )
+
+      const memberGrowth24h = Math.max(
+        0,
+        latestMembers - oldMembers
+      )
+
+      return {
+        ...listing,
+        member_growth_24h: memberGrowth24h,
+      }
+    })
+
+    const maxStats = {
+      maxVotes: Math.max(
+        1,
+        ...listingsWithGrowth.map((item) =>
+          Number(item.votes_count || 0)
+        )
+      ),
+      maxGrowth: Math.max(
+        1,
+        ...listingsWithGrowth.map((item) =>
+          Number(item.member_growth_24h || 0)
+        )
+      ),
+    }
+
+    const homepageListings = listingsWithGrowth
+      .map((listing) => ({
+        ...listing,
+        ...calculateRankingScore(listing, maxStats),
+      }))
+      .sort((a, b) => {
+        if (b.ranking_score !== a.ranking_score) {
+          return b.ranking_score - a.ranking_score
+        }
+
+        return (
+          new Date(b.created_at).getTime() -
+          new Date(a.created_at).getTime()
+        )
+      })
+      .slice(0, limit)
+
+    return res.json({
+      ok: true,
+      listings: homepageListings,
+    })
+  } catch (err) {
+    console.error("Homepage listings error:", err)
+    return res.status(500).json({
+      error: err.message,
+    })
+  }
+})
+
+
+
 const PORT = process.env.PORT || 3000
 
 
