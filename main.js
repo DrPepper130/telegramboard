@@ -824,8 +824,8 @@ async function buildHomepageListings(limit = 16) {
       last_synced_at
     `)
     .eq("status", "approved")
-    .eq("is_banned", false)
-    .eq("is_nsfw", false)
+    .neq("is_banned", true)
+    .neq("is_nsfw", true)
 
   if (listingsError) throw listingsError
 
@@ -1382,9 +1382,6 @@ app.get("/api/listings/homepage", async (req, res) => {
 
 
 
-const PORT = process.env.PORT || 3000
-
-
 app.get("/api/widgets/preview", async (req, res) => {
   try {
     const link = String(req.query.link || "").trim()
@@ -1429,12 +1426,6 @@ app.get("/api/widgets/preview", async (req, res) => {
 
 
 
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`)
-})
-
-
-
 app.get("/api/telegram/sync-hourly", async (req, res) => {
   try {
     if (req.query.secret !== process.env.CRON_SECRET) {
@@ -1467,9 +1458,33 @@ app.get("/api/telegram/sync-hourly", async (req, res) => {
       }
     }
 
-    res.json({ ok: true, results })
-  } catch (err) {
-    console.error("Hourly sync error:", err)
-    res.status(500).json({ error: err.message })
-  }
+    let homepageCache = null
+
+    try {
+      homepageCache = await updateHomepageListingCache()
+    } catch (cacheErr) {
+      console.error("Homepage cache refresh after sync failed:", cacheErr)
+    }
+
+    res.json({
+      ok: true,
+      results,
+      homepage_cache: homepageCache
+        ? {
+            updated_at: homepageCache.updated_at,
+            count: homepageCache.listings.length,
+          }
+        : null,
+    })
+      } catch (err) {
+        console.error("Hourly sync error:", err)
+        res.status(500).json({ error: err.message })
+      }
+    })
+
+
+const PORT = process.env.PORT || 3000
+
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`)
 })
