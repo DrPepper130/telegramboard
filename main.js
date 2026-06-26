@@ -813,7 +813,6 @@ async function buildHomepageListings(limit = 16) {
       member_count,
       votes_count,
       referral_boost_score,
-      ranking_score,
       paid_rank,
       paid_rank_status,
       is_nsfw,
@@ -822,7 +821,7 @@ async function buildHomepageListings(limit = 16) {
       created_at,
       updated_at,
       last_synced_at
-    `)
+      `)
     .eq("status", "approved")
     .neq("is_banned", true)
     .neq("is_nsfw", true)
