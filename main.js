@@ -794,8 +794,8 @@ function calculateRankingScore(listing, maxStats) {
 }
 
 
-async function buildHomepageListings(limit = 16) {
-  const cleanLimit = Math.min(Math.max(Number(limit) || 16, 1), 30)
+async function buildHomepageListings(limit = 18) {
+  const cleanLimit = Math.min(Math.max(Number(limit) || 18, 1), 30)
 
   const { data: listings, error: listingsError } = await supabaseAdmin
     .from("channel_listings")
@@ -823,8 +823,8 @@ async function buildHomepageListings(limit = 16) {
       last_synced_at
       `)
     .eq("status", "approved")
-    .neq("is_banned", true)
-    .neq("is_nsfw", true)
+    .or("is_banned.is.null,is_banned.eq.false")
+    .or("is_nsfw.is.null,is_nsfw.eq.false")
 
   if (listingsError) throw listingsError
 
@@ -942,13 +942,13 @@ async function buildHomepageListings(limit = 16) {
 }
 
 async function updateHomepageListingCache() {
-  const listings = await buildHomepageListings(16)
+  const listings = await buildHomepageListings(18)
   const updatedAt = new Date().toISOString()
 
   const { error } = await supabaseAdmin
     .from("homepage_listing_cache")
     .upsert({
-      id: "homepage_top_16",
+      id: "homepage_top_18",
       listings,
       updated_at: updatedAt,
     })
@@ -1204,7 +1204,7 @@ app.get("/api/listings/homepage-static", async (req, res) => {
     const { data, error } = await supabaseAdmin
       .from("homepage_listing_cache")
       .select("listings, updated_at")
-      .eq("id", "homepage_top_16")
+      .eq("id", "homepage_top_18")
       .maybeSingle()
 
     if (error) throw error
