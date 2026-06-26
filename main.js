@@ -794,6 +794,174 @@ function calculateRankingScore(listing, maxStats) {
 }
 
 
+async function buildHomepageListings(limit = 16) {
+  const cleanLimit = Math.min(Math.max(Number(limit) || 16, 1), 30)
+
+  const { data: listings, error: listingsError } = await supabaseAdmin
+    .from("channel_listings")
+    .select(`
+      id,
+      slug,
+      channel_name,
+      telegram_title,
+      telegram_username,
+      telegram_link,
+      description,
+      categories,
+      image_url,
+      icon_url,
+      member_count,
+      votes_count,
+      referral_boost_score,
+      ranking_score,
+      paid_rank,
+      paid_rank_status,
+      is_nsfw,
+      is_banned,
+      status,
+      created_at,
+      updated_at,
+      last_synced_at
+    `)
+    .eq("status", "approved")
+    .eq("is_banned", false)
+    .eq("is_nsfw", false)
+
+  if (listingsError) throw listingsError
+
+  const listingIds = (listings || []).map((item) => item.id)
+
+  let snapshots = []
+
+  if (listingIds.length > 0) {
+    const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString()
+
+    const { data: snapshotData, error: snapshotError } = await supabaseAdmin
+      .from("channel_member_snapshots")
+      .select("listing_id, member_count, created_at")
+      .in("listing_id", listingIds)
+      .gte("created_at", since)
+      .order("created_at", { ascending: true })
+
+    if (snapshotError) throw snapshotError
+
+    snapshots = snapshotData || []
+  }
+
+  const snapshotsByListing = {}
+
+  snapshots.forEach((snapshot) => {
+    if (!snapshotsByListing[snapshot.listing_id]) {
+      snapshotsByListing[snapshot.listing_id] = []
+    }
+
+    snapshotsByListing[snapshot.listing_id].push(snapshot)
+  })
+
+  const listingsWithGrowth = (listings || []).map((listing) => {
+    const listingSnapshots = snapshotsByListing[listing.id] || []
+    const firstSnapshot = listingSnapshots[0]
+    const latestSnapshot = listingSnapshots[listingSnapshots.length - 1]
+
+    const oldMembers = Number(
+      firstSnapshot?.member_count || listing.member_count || 0
+    )
+
+    const latestMembers = Number(
+      latestSnapshot?.member_count || listing.member_count || 0
+    )
+
+    const memberGrowth24h = Math.max(0, latestMembers - oldMembers)
+
+    return {
+      ...listing,
+      member_growth_24h: memberGrowth24h,
+    }
+  })
+
+  const maxStats = {
+    maxVotes: Math.max(
+      1,
+      ...listingsWithGrowth.map((item) => Number(item.votes_count || 0))
+    ),
+    maxGrowth: Math.max(
+      1,
+      ...listingsWithGrowth.map((item) =>
+        Number(item.member_growth_24h || 0)
+      )
+    ),
+  }
+
+  function getPaidRankPriority(item) {
+    const rank = String(item.paid_rank || "free").toLowerCase()
+    const status = String(item.paid_rank_status || "inactive").toLowerCase()
+
+    if (status !== "active" && status !== "trialing") return 0
+    if (rank === "sponsor") return 3
+    if (rank === "gold") return 2
+    if (rank === "silver") return 1
+
+    return 0
+  }
+
+  const threeDaysMs = 3 * 24 * 60 * 60 * 1000
+
+  const homepageListings = listingsWithGrowth
+    .map((listing) => {
+      const ranking = calculateRankingScore(listing, maxStats)
+
+      const createdAt = new Date(listing.created_at).getTime()
+      const ageMs = Date.now() - createdAt
+      const isNew = ageMs >= 0 && ageMs < threeDaysMs
+
+      const newnessScore = isNew
+        ? Math.max(0, (threeDaysMs - ageMs) / threeDaysMs) * 1000
+        : 0
+
+      return {
+        ...listing,
+        ...ranking,
+        _paid_priority: getPaidRankPriority(listing),
+        _homepage_score: Number(ranking.ranking_score || 0) + newnessScore,
+      }
+    })
+    .sort((a, b) => {
+      if (b._paid_priority !== a._paid_priority) {
+        return b._paid_priority - a._paid_priority
+      }
+
+      if (b._homepage_score !== a._homepage_score) {
+        return b._homepage_score - a._homepage_score
+      }
+
+      return new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
+    })
+    .slice(0, cleanLimit)
+    .map(({ _paid_priority, _homepage_score, ...item }) => item)
+
+  return homepageListings
+}
+
+async function updateHomepageListingCache() {
+  const listings = await buildHomepageListings(16)
+  const updatedAt = new Date().toISOString()
+
+  const { error } = await supabaseAdmin
+    .from("homepage_listing_cache")
+    .upsert({
+      id: "homepage_top_16",
+      listings,
+      updated_at: updatedAt,
+    })
+
+  if (error) throw error
+
+  return {
+    listings,
+    updated_at: updatedAt,
+  }
+}
+
 
 app.post("/api/telegram/webhook", async (req, res) => {
   console.log("Telegram webhook hit:", JSON.stringify(req.body, null, 2))
