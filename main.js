@@ -1200,6 +1200,58 @@ app.get("/api/listings/ranked", async (req, res) => {
   }
 })
 
+app.get("/api/listings/homepage-static", async (req, res) => {
+  try {
+    const { data, error } = await supabaseAdmin
+      .from("homepage_listing_cache")
+      .select("listings, updated_at")
+      .eq("id", "homepage_top_16")
+      .maybeSingle()
+
+    if (error) throw error
+
+    res.set("Cache-Control", "public, max-age=300, s-maxage=3600")
+
+    return res.json({
+      ok: true,
+      cached: true,
+      listings: data?.listings || [],
+      updated_at: data?.updated_at || null,
+    })
+  } catch (err) {
+    console.error("Homepage static listings error:", err)
+
+    return res.status(500).json({
+      ok: false,
+      error: err.message,
+      listings: [],
+    })
+  }
+})
+
+
+app.get("/api/cron/update-homepage-cache", async (req, res) => {
+  try {
+    if (req.query.secret !== process.env.CRON_SECRET) {
+      return res.status(401).json({ error: "Unauthorized" })
+    }
+
+    const result = await updateHomepageListingCache()
+
+    return res.json({
+      ok: true,
+      count: result.listings.length,
+      updated_at: result.updated_at,
+    })
+  } catch (err) {
+    console.error("Update homepage cache error:", err)
+
+    return res.status(500).json({
+      ok: false,
+      error: err.message,
+    })
+  }
+})
 
 
 app.get("/api/listings/homepage", async (req, res) => {
