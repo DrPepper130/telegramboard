@@ -271,6 +271,12 @@ function cleanUsername(username) {
   return username.startsWith("@") ? username : `@${username}`
 }
 
+function normalizeTelegramType(chatType) {
+  if (chatType === "channel") return "channel"
+  if (chatType === "group" || chatType === "supergroup") return "group"
+  return null
+}
+
 function extractUsernameFromLink(link) {
   if (!link) return null
   const cleaned = link
@@ -322,6 +328,11 @@ async function syncListingTelegramData(listing) {
 
   const chat = await tg("getChat", { chat_id: chatTarget })
   const memberCount = await tg("getChatMemberCount", { chat_id: chat.id })
+  const listingType = normalizeTelegramType(chat.type)
+
+  if (!listingType) {
+    throw new Error("Could not detect whether this Telegram link is a group or channel.")
+  }
 
   let iconUrl = listing.icon_url || null
 
@@ -338,6 +349,7 @@ async function syncListingTelegramData(listing) {
       telegram_description: chat.description || chat.bio || null,
       member_count: memberCount,
       icon_url: iconUrl,
+      listing_type: listingType,
       last_synced_at: new Date().toISOString(),
     })
     .eq("id", listing.id)
@@ -350,7 +362,7 @@ async function syncListingTelegramData(listing) {
     created_at: new Date().toISOString(),
   })
   
-  return { chat, memberCount, iconUrl }
+  return { chat, memberCount, iconUrl, listingType }
 }
 
 app.post("/api/auth/is-admin", async (req, res) => {
@@ -804,6 +816,7 @@ async function buildHomepageListings(limit = 18) {
       slug,
       channel_name,
       telegram_title,
+      listing_type,
       telegram_username,
       telegram_link,
       description,
@@ -1028,6 +1041,7 @@ app.post("/api/telegram/sync-listing/:id", async (req, res) => {
       icon_url: result.iconUrl,
       telegram_title: result.chat.title,
       telegram_username: cleanUsername(result.chat.username),
+      listing_type: result.listingType,
     })
   } catch (err) {
     console.error("Manual sync error:", err)
@@ -1407,6 +1421,14 @@ app.get("/api/widgets/preview", async (req, res) => {
       iconUrl = `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${file.file_path}`
     }
 
+    const listingType = normalizeTelegramType(chat.type)
+
+    if (!listingType) {
+      return res.status(400).json({
+        error: "We could not detect whether this is a Telegram group or channel.",
+      })
+    }
+
     return res.json({
       ok: true,
       title: chat.title || username,
@@ -1415,6 +1437,7 @@ app.get("/api/widgets/preview", async (req, res) => {
       member_count: memberCount,
       icon_url: iconUrl,
       telegram_link: link,
+      listing_type: listingType,
       theme_color: "#229ED9",
     })
   } catch (err) {
