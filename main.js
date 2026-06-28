@@ -35,28 +35,40 @@ const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || "")
 
 
 // ========================================
-// FAKE ONLINE COUNTER
+// ONLINE COUNTER
 // ========================================
 
-let fakeOnlineCount = 151
+// Start blank/hidden until first update happens
+let fakeOnlineCount = null
 
 function updateFakeOnlineCount() {
-    const movement = Math.floor(Math.random() * 7) - 3
-    fakeOnlineCount += movement
+  // First real value: start somewhere between 1,000 and 2,000
+  if (fakeOnlineCount === null) {
+    fakeOnlineCount = Math.floor(Math.random() * 1001) + 1000
+    return
+  }
 
-    if (fakeOnlineCount < 100) fakeOnlineCount = 100
-    if (fakeOnlineCount > 200) fakeOnlineCount = 200
+  // Change by 10–25 users per minute
+  const changeAmount = Math.floor(Math.random() * 16) + 10
+
+  // Randomly go up or down
+  const direction = Math.random() < 0.5 ? -1 : 1
+
+  fakeOnlineCount += changeAmount * direction
+
+  // Keep it between 1,000 and 2,000
+  if (fakeOnlineCount < 1000) fakeOnlineCount = 1000
+  if (fakeOnlineCount > 2000) fakeOnlineCount = 2000
 }
 
 // update once per minute
 setInterval(updateFakeOnlineCount, 60 * 1000)
 
 app.get("/api/stats/online", async (req, res) => {
-    res.json({
-        online: fakeOnlineCount,
-    })
+  res.json({
+    online: fakeOnlineCount,
+  })
 })
-
 
 
 
