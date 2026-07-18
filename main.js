@@ -536,6 +536,476 @@ function cleanReferralCode(value) {
     .replace(/^-+|-+$/g, "")
 }
 
+
+// ========================================
+// FRAMER CMS SYNC v2
+// ========================================
+
+const FRAMER_COLLECTION_NAME = process.env.FRAMER_COLLECTION_NAME || "Channel Listings"
+let framerSyncChain = Promise.resolve()
+
+function queueFramerSync(work) {
+  const next = framerSyncChain.then(work, work)
+  framerSyncChain = next.catch(() => {})
+  return next
+}
+
+function cleanCmsSlug(value) {
+  return String(value || "")
+    .toLowerCase()
+    .trim()
+    .replace(/&/g, " and ")
+    .replace(/[^a-z0-9-]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 80)
+}
+
+function stripTelegramHandle(linkOrUsername) {
+  if (!linkOrUsername) return ""
+  return String(linkOrUsername)
+    .replace("https://t.me/", "")
+    .replace("http://t.me/", "")
+    .replace("t.me/", "")
+    .replace("@", "")
+    .split("?")[0]
+    .split("/")[0]
+    .trim()
+}
+
+function boolValue(value) {
+  return value === true || String(value).toLowerCase() === "true"
+}
+
+function compactCmsString(value, fallback = "") {
+  if (value === null || value === undefined) return fallback
+  return String(value)
+}
+
+function getFieldByName(fields, name) {
+  const target = String(name || "").trim().toLowerCase()
+  return fields.find((field) => String(field.name || "").trim().toLowerCase() === target)
+}
+
+function addCmsField(fieldData, fields, fieldName, value) {
+  const field = getFieldByName(fields, fieldName)
+  if (!field) return
+  if (value === undefined || value === null) return
+
+  const fieldType = field.type || "string"
+  if (fieldType === "unsupported") return
+
+  // Image fields need a real Framer ImageAsset, not a raw URL string.
+  // Use addCmsImageField for image fields.
+  if (fieldType === "image") return
+
+  let finalValue = value
+
+  if (fieldType === "number") {
+    finalValue = Number(value || 0)
+    if (!Number.isFinite(finalValue)) finalValue = 0
+  } else if (fieldType === "boolean") {
+    finalValue = boolValue(value)
+  } else if (fieldType === "date") {
+    try {
+      finalValue = value ? new Date(value).toISOString() : undefined
+      if (!finalValue || finalValue === "Invalid Date") return
+    } catch {
+      return
+    }
+  } else {
+    finalValue = compactCmsString(value)
+  }
+
+  fieldData[field.id] = {
+    type: fieldType,
+    value: finalValue,
+  }
+}
+
+async function addCmsImageField(fieldData, fields, framer, fieldName, imageUrl, altText) {
+  const field = getFieldByName(fields, fieldName)
+  if (!field) return
+  if (!imageUrl) return
+
+  // If this field was created as a URL/text field instead of an Image field,
+  // store the URL directly so the sync does not fail.
+  if (field.type !== "image") {
+    addCmsField(fieldData, fields, fieldName, imageUrl)
+    return
+  }
+
+  try {
+    if (typeof framer.addImage !== "function") {
+      console.warn(`Framer addImage is unavailable; skipping image field ${fieldName}`)
+      return
+    }
+
+    const imageAsset = await framer.addImage({
+      image: imageUrl,
+      name: altText || "TeleHub listing image",
+      altText: altText || "TeleHub listing image",
+    })
+
+    fieldData[field.id] = {
+      type: "image",
+      value: imageAsset,
+    }
+  } catch (err) {
+    console.warn(`Could not upload Framer image for ${fieldName}:`, err.message)
+  }
+}
+
+function buildCmsText(listing) {
+  const name =
+    listing.telegram_title ||
+    listing.channel_name ||
+    "Telegram Listing"
+
+  const listingType = String(listing.listing_type || "channel").toLowerCase()
+  const typeTitle = listingType.charAt(0).toUpperCase() + listingType.slice(1)
+  const categories = Array.isArray(listing.categories)
+    ? listing.categories.filter(Boolean).join(", ")
+    : compactCmsString(listing.categories, "General")
+
+  const description =
+    listing.long_description ||
+    listing.telegram_description ||
+    listing.description ||
+    `${name} is a Telegram ${listingType} listed on TeleHub.`
+
+  const shortDescription =
+    listing.description ||
+    listing.telegram_description ||
+    `View ${name} on TeleHub.`
+
+  const memberCount = Number(listing.member_count || 0)
+  const memberText = memberCount
+    ? memberCount.toLocaleString()
+    : "an updating number of"
+
+  return {
+    name,
+    listingType,
+    typeTitle,
+    categories,
+    description,
+    shortDescription,
+    memberCount,
+    seoTitle: `${name} Telegram ${typeTitle}`,
+    seoDescription: `View ${name} on TeleHub, including its Telegram link, description, category, member count, and listing details.`,
+    introText: `${name} is a Telegram ${listingType} listed on TeleHub. View its description, category, member count, and Telegram join link.`,
+    safetyNote:
+      "TeleHub helps users discover Telegram communities, but users should review each community before joining. Report misleading, unsafe, or inappropriate listings.",
+    faq1Question: `How do I join ${name}?`,
+    faq1Answer: `Click the join button to open ${name} on Telegram.`,
+    faq2Question: `Is ${name} NSFW?`,
+    faq2Answer: boolValue(listing.is_nsfw)
+      ? `Yes, ${name} is marked as NSFW. This means it may contain adult, mature, or sensitive content.`
+      : `No, ${name} is not marked as NSFW. Users should still review the community before joining.`,
+    faq3Question: `What category is ${name} in?`,
+    faq3Answer: `${name} is listed under ${categories || "General"} on TeleHub.`,
+  }
+}
+
+async function ensureUniqueShortInvite(listing) {
+  const displayName = listing.telegram_title || listing.channel_name || "telegram-listing"
+  let base = cleanCmsSlug(listing.short_invite || displayName)
+
+  if (!base) {
+    base = `telegram-listing-${String(listing.id || Date.now()).replace(/[^a-z0-9]/gi, "").slice(0, 8)}`
+  }
+
+  let candidate = base
+  let counter = 2
+
+  while (true) {
+    const { data, error } = await supabaseAdmin
+      .from("channel_listings")
+      .select("id")
+      .eq("short_invite", candidate)
+      .neq("id", listing.id)
+      .maybeSingle()
+
+    if (error) throw error
+    if (!data) break
+
+    candidate = `${base}-${counter}`
+    counter += 1
+  }
+
+  if (candidate !== listing.short_invite) {
+    const { error } = await supabaseAdmin
+      .from("channel_listings")
+      .update({
+        short_invite: candidate,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", listing.id)
+
+    if (error) throw error
+  }
+
+  return candidate
+}
+
+async function getFramerCollection(framer) {
+  const collections = await framer.getCollections()
+  const collection = collections.find(
+    (item) => String(item.name || "").trim().toLowerCase() === FRAMER_COLLECTION_NAME.toLowerCase()
+  )
+
+  if (!collection) {
+    throw new Error(`Framer CMS collection not found: ${FRAMER_COLLECTION_NAME}`)
+  }
+
+  return collection
+}
+
+async function syncListingToFramerCMS(listingId, options = {}) {
+  if (!process.env.FRAMER_API_KEY || !process.env.FRAMER_PROJECT_URL) {
+    throw new Error("Missing FRAMER_API_KEY or FRAMER_PROJECT_URL in Render environment variables.")
+  }
+
+  const { data: existingListing, error: listingError } = await supabaseAdmin
+    .from("channel_listings")
+    .select("*")
+    .eq("id", listingId)
+    .single()
+
+  if (listingError) throw listingError
+  if (!existingListing) throw new Error("Listing not found.")
+  if (existingListing.status !== "approved") {
+    throw new Error("Only approved listings can be synced to Framer CMS.")
+  }
+  if (existingListing.is_banned) {
+    throw new Error("Banned listings cannot be synced to Framer CMS.")
+  }
+
+  await supabaseAdmin
+    .from("channel_listings")
+    .update({
+      framer_sync_status: "syncing",
+      framer_sync_error: null,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", listingId)
+
+  let telegramSyncWarning = null
+
+  try {
+    await syncListingTelegramData(existingListing)
+  } catch (err) {
+    telegramSyncWarning = err.message
+    console.warn("Telegram sync before Framer CMS sync failed:", err.message)
+  }
+
+  const { data: listing, error: freshError } = await supabaseAdmin
+    .from("channel_listings")
+    .select("*")
+    .eq("id", listingId)
+    .single()
+
+  if (freshError) throw freshError
+
+  const cmsSlug = await ensureUniqueShortInvite(listing)
+  const cms = buildCmsText({ ...listing, short_invite: cmsSlug })
+  const telegramUsername =
+    listing.telegram_username ||
+    (stripTelegramHandle(listing.telegram_link)
+      ? `@${stripTelegramHandle(listing.telegram_link)}`
+      : "")
+  const iconImage = listing.icon_url || listing.image_url || ""
+
+  const { connect } = await import("framer-api")
+  const framer = await connect(process.env.FRAMER_PROJECT_URL, process.env.FRAMER_API_KEY)
+
+  try {
+    const collection = await getFramerCollection(framer)
+    const fields = await collection.getFields()
+
+    const fieldData = {}
+
+    addCmsField(fieldData, fields, "Name", cms.name)
+    addCmsField(fieldData, fields, "Supabase Listing ID", String(listing.id))
+    addCmsField(fieldData, fields, "Original App Slug", listing.slug || "")
+    addCmsField(fieldData, fields, "Description", cms.description)
+    addCmsField(fieldData, fields, "Short Description", cms.shortDescription)
+    addCmsField(fieldData, fields, "Telegram URL", listing.telegram_link || "")
+    addCmsField(fieldData, fields, "Telegram Username", telegramUsername)
+    addCmsField(fieldData, fields, "Listing Type", cms.listingType)
+    addCmsField(fieldData, fields, "Category", cms.categories || "General")
+    await addCmsImageField(fieldData, fields, framer, "Icon Image", iconImage, `${cms.name} icon`)
+    addCmsField(fieldData, fields, "Background Image URL", listing.image_url || "")
+    addCmsField(fieldData, fields, "Member Count", cms.memberCount)
+    addCmsField(fieldData, fields, "Votes Count", Number(listing.votes_count || 0))
+    addCmsField(fieldData, fields, "Paid Rank", listing.paid_rank || "free")
+    addCmsField(fieldData, fields, "Status", listing.status || "approved")
+    addCmsField(fieldData, fields, "Is NSFW", boolValue(listing.is_nsfw))
+    addCmsField(fieldData, fields, "Short Invite", cmsSlug)
+    addCmsField(fieldData, fields, "Created At", listing.created_at || new Date().toISOString())
+    addCmsField(fieldData, fields, "Last Synced At", listing.last_synced_at || new Date().toISOString())
+    addCmsField(fieldData, fields, "SEO Title", cms.seoTitle)
+    addCmsField(fieldData, fields, "SEO Description", cms.seoDescription)
+    addCmsField(fieldData, fields, "Intro Text", cms.introText)
+    addCmsField(fieldData, fields, "Safety Note", cms.safetyNote)
+    addCmsField(fieldData, fields, "FAQ 1 Question", cms.faq1Question)
+    addCmsField(fieldData, fields, "FAQ 1 Answer", cms.faq1Answer)
+    addCmsField(fieldData, fields, "FAQ 2 Question", cms.faq2Question)
+    addCmsField(fieldData, fields, "FAQ 2 Answer", cms.faq2Answer)
+    addCmsField(fieldData, fields, "FAQ 3 Question", cms.faq3Question)
+    addCmsField(fieldData, fields, "FAQ 3 Answer", cms.faq3Answer)
+
+    await collection.addItems([
+      {
+        id: String(listing.id),
+        slug: cmsSlug,
+        fieldData,
+      },
+    ])
+
+    let deployed = false
+
+    if (process.env.FRAMER_AUTO_DEPLOY !== "false" && options.publish !== false) {
+      const publication = await framer.publish()
+      await framer.deploy(publication.deployment.id)
+      deployed = true
+    }
+
+    const now = new Date().toISOString()
+
+    await supabaseAdmin
+      .from("channel_listings")
+      .update({
+        short_invite: cmsSlug,
+        framer_cms_item_id: String(listing.id),
+        framer_sync_status: "synced",
+        framer_synced_at: now,
+        framer_sync_error: telegramSyncWarning,
+        updated_at: now,
+      })
+      .eq("id", listing.id)
+
+    return {
+      ok: true,
+      slug: cmsSlug,
+      url: `https://telehub.to/channel/${cmsSlug}`,
+      deployed,
+      telegram_sync_warning: telegramSyncWarning,
+    }
+  } catch (err) {
+    await supabaseAdmin
+      .from("channel_listings")
+      .update({
+        framer_sync_status: "failed",
+        framer_sync_error: err.message,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", listing.id)
+
+    throw err
+  } finally {
+    await framer.disconnect()
+  }
+}
+
+app.post("/api/framer/sync-listing", async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || ""
+    const token = authHeader.replace("Bearer ", "")
+    const { listing_id } = req.body || {}
+
+    if (!token) {
+      return res.status(401).json({ error: "Missing auth token." })
+    }
+
+    if (!listing_id) {
+      return res.status(400).json({ error: "Missing listing_id." })
+    }
+
+    const {
+      data: { user },
+      error: userError,
+    } = await supabaseAdmin.auth.getUser(token)
+
+    if (userError || !user) {
+      return res.status(401).json({ error: "Invalid auth token." })
+    }
+
+    const { data: listing, error: listingError } = await supabaseAdmin
+      .from("channel_listings")
+      .select("id, user_id")
+      .eq("id", listing_id)
+      .single()
+
+    if (listingError || !listing) {
+      return res.status(404).json({ error: "Listing not found." })
+    }
+
+    const email = (user.email || "").toLowerCase()
+    const isAdmin = ADMIN_EMAILS.includes(email)
+
+    if (listing.user_id !== user.id && !isAdmin) {
+      return res.status(403).json({ error: "You do not own this listing." })
+    }
+
+    const result = await queueFramerSync(() => syncListingToFramerCMS(listing_id))
+
+    return res.json(result)
+  } catch (err) {
+    console.error("Framer listing sync error:", err)
+    return res.status(500).json({ error: err.message })
+  }
+})
+
+app.post("/api/framer/sync-all-listings", async (req, res) => {
+  try {
+    if (req.headers.authorization !== `Bearer ${process.env.CRON_SECRET}`) {
+      return res.status(401).json({ error: "Unauthorized" })
+    }
+
+    const { data: listings, error } = await supabaseAdmin
+      .from("channel_listings")
+      .select("id")
+      .eq("status", "approved")
+      .or("is_banned.is.null,is_banned.eq.false")
+
+    if (error) throw error
+
+    const results = []
+
+    for (const listing of listings || []) {
+      try {
+        const result = await queueFramerSync(() =>
+          syncListingToFramerCMS(listing.id, { publish: false })
+        )
+        results.push({ id: listing.id, ok: true, slug: result.slug })
+      } catch (err) {
+        results.push({ id: listing.id, ok: false, error: err.message })
+      }
+    }
+
+    let deployed = false
+
+    if (process.env.FRAMER_AUTO_DEPLOY !== "false") {
+      const { connect } = await import("framer-api")
+      const framer = await connect(process.env.FRAMER_PROJECT_URL, process.env.FRAMER_API_KEY)
+      try {
+        const publication = await framer.publish()
+        await framer.deploy(publication.deployment.id)
+        deployed = true
+      } finally {
+        await framer.disconnect()
+      }
+    }
+
+    return res.json({ ok: true, deployed, count: results.length, results })
+  } catch (err) {
+    console.error("Framer sync-all error:", err)
+    return res.status(500).json({ error: err.message })
+  }
+})
+
 function shouldResetReferralWindow(listing) {
   const now = new Date()
 
@@ -1117,10 +1587,11 @@ app.post("/api/admin/approve-listing/:id", async (req, res) => {
 
     if (error) throw error
 
-    // 🔹 THIS is the important line
+    // Sync Telegram data, then create/update the Framer CMS page.
     await syncListingTelegramData(listing)
+    const framerResult = await queueFramerSync(() => syncListingToFramerCMS(listing.id))
 
-    res.json({ ok: true })
+    res.json({ ok: true, framer: framerResult })
   } catch (err) {
     console.error("Approve listing error:", err)
     res.status(500).json({ error: err.message })
