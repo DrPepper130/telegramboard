@@ -835,7 +835,7 @@ async function syncListingToFramerCMS(listingId, options = {}) {
     addCmsField(fieldData, fields, "Telegram Username", telegramUsername)
     addCmsField(fieldData, fields, "Listing Type", cms.listingType)
     addCmsField(fieldData, fields, "Category", cms.categories || "General")
-    await addCmsImageField(fieldData, fields, framer, "Icon Image", iconImage, `${cms.name} icon`)
+    // await addCmsImageField(fieldData, fields, framer, "Icon Image", iconImage, `${cms.name} icon`)
     addCmsField(fieldData, fields, "Background Image URL", listing.image_url || "")
     addCmsField(fieldData, fields, "Member Count", cms.memberCount)
     addCmsField(fieldData, fields, "Votes Count", Number(listing.votes_count || 0))
