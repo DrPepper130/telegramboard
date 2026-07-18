@@ -856,13 +856,33 @@ async function syncListingToFramerCMS(listingId, options = {}) {
     addCmsField(fieldData, fields, "FAQ 3 Question", cms.faq3Question)
     addCmsField(fieldData, fields, "FAQ 3 Answer", cms.faq3Answer)
 
-    await collection.addItems([
-      {
-        id: String(listing.id),
-        slug: cmsSlug,
-        fieldData,
-      },
-    ])
+    // Framer unmanaged CMS collections create new items when no item id is provided.
+    // Only include an id when we have confirmed that item already exists in Framer.
+    const existingItems = await collection.getItems()
+    const existingCmsItem =
+      existingItems.find((item) => item.slug === cmsSlug) ||
+      (listing.framer_cms_item_id
+        ? existingItems.find((item) => item.id === listing.framer_cms_item_id)
+        : null)
+
+    const itemPayload = {
+      slug: cmsSlug,
+      fieldData,
+    }
+
+    if (existingCmsItem?.id) {
+      itemPayload.id = existingCmsItem.id
+    }
+
+    await collection.addItems([itemPayload])
+
+    let framerCmsItemId = existingCmsItem?.id || null
+
+    if (!framerCmsItemId) {
+      const itemsAfterCreate = await collection.getItems()
+      const createdItem = itemsAfterCreate.find((item) => item.slug === cmsSlug)
+      framerCmsItemId = createdItem?.id || null
+    }
 
     let deployed = false
 
@@ -878,7 +898,7 @@ async function syncListingToFramerCMS(listingId, options = {}) {
       .from("channel_listings")
       .update({
         short_invite: cmsSlug,
-        framer_cms_item_id: String(listing.id),
+        framer_cms_item_id: framerCmsItemId,
         framer_sync_status: "synced",
         framer_synced_at: now,
         framer_sync_error: telegramSyncWarning,
@@ -891,6 +911,7 @@ async function syncListingToFramerCMS(listingId, options = {}) {
       slug: cmsSlug,
       url: `https://telehub.to/channel/${cmsSlug}`,
       deployed,
+      framer_cms_item_id: framerCmsItemId,
       telegram_sync_warning: telegramSyncWarning,
     }
   } catch (err) {
