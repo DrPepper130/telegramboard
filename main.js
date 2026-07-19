@@ -628,8 +628,6 @@ async function addCmsImageField(fieldData, fields, framer, fieldName, imageUrl, 
   if (!field) return
   if (!imageUrl) return
 
-  // If this field was created as a URL/text field instead of an Image field,
-  // store the URL directly so the sync does not fail.
   if (field.type !== "image") {
     addCmsField(fieldData, fields, fieldName, imageUrl)
     return
@@ -647,9 +645,19 @@ async function addCmsImageField(fieldData, fields, framer, fieldName, imageUrl, 
       altText: altText || "TeleHub listing image",
     })
 
+    const imageValue =
+      typeof imageAsset === "string"
+        ? imageAsset
+        : imageAsset?.id || imageAsset?.url || null
+
+    if (!imageValue) {
+      console.warn(`Framer addImage returned no usable value for ${fieldName}`)
+      return
+    }
+
     fieldData[field.id] = {
       type: "image",
-      value: imageAsset,
+      value: String(imageValue),
     }
   } catch (err) {
     console.warn(`Could not upload Framer image for ${fieldName}:`, err.message)
@@ -856,7 +864,26 @@ async function syncListingToFramerCMS(listingId, options = {}) {
     addCmsField(fieldData, fields, "Icon URL", telegramIconUrl)
 
     // This remains the optional image uploaded by the user.
-    addCmsField(fieldData, fields, "Background Image URL", uploadedBackgroundUrl)
+    const telegramIconImage = listing.icon_url || ""
+    const userBackgroundImage = listing.image_url || ""
+
+    await addCmsImageField(
+      fieldData,
+      fields,
+      framer,
+      "Icon Image",
+      telegramIconImage,
+      `${cms.name} Telegram icon`
+    )
+
+    await addCmsImageField(
+      fieldData,
+      fields,
+      framer,
+      "Background Image URL",
+      userBackgroundImage,
+      `${cms.name} background image`
+    )
     addCmsField(fieldData, fields, "Member Count", cms.memberCount)
     addCmsField(fieldData, fields, "Votes Count", Number(listing.votes_count || 0))
     addCmsField(fieldData, fields, "Paid Rank", listing.paid_rank || "free")
