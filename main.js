@@ -815,7 +815,11 @@ async function syncListingToFramerCMS(listingId, options = {}) {
     (stripTelegramHandle(listing.telegram_link)
       ? `@${stripTelegramHandle(listing.telegram_link)}`
       : "")
-  const iconImage = listing.icon_url || listing.image_url || ""
+  // Telegram icon is the actual channel/group avatar pulled from Telegram.
+  // Uploaded user image remains separate as the optional background image.
+  const telegramIconUrl = listing.icon_url || ""
+  const uploadedBackgroundUrl = listing.image_url || ""
+  const iconImage = telegramIconUrl || uploadedBackgroundUrl || ""
 
   const { connect } = await import("framer-api")
   const framer = await connect(process.env.FRAMER_PROJECT_URL, process.env.FRAMER_API_KEY)
@@ -835,8 +839,24 @@ async function syncListingToFramerCMS(listingId, options = {}) {
     addCmsField(fieldData, fields, "Telegram Username", telegramUsername)
     addCmsField(fieldData, fields, "Listing Type", cms.listingType)
     addCmsField(fieldData, fields, "Category", cms.categories || "General")
-    // await addCmsImageField(fieldData, fields, framer, "Icon Image", iconImage, `${cms.name} icon`)
-    addCmsField(fieldData, fields, "Background Image URL", listing.image_url || "")
+
+    // IMPORTANT:
+    // Use the Telegram channel/group icon for the visible listing avatar.
+    // Keep the user-uploaded image separate as the optional background image.
+    //
+    // In Framer CMS, create ONE plain text/URL field named "Icon Image URL"
+    // and bind the CMS page avatar/image layer to that field.
+    //
+    // If you changed the existing "Icon Image" field from Image to URL/Text,
+    // this line will also populate it. If it is still a Framer Image field,
+    // addCmsField safely skips it to avoid the previous ImageAsset type error.
+    addCmsField(fieldData, fields, "Icon Image", telegramIconUrl)
+    addCmsField(fieldData, fields, "Icon Image URL", telegramIconUrl)
+    addCmsField(fieldData, fields, "Telegram Icon URL", telegramIconUrl)
+    addCmsField(fieldData, fields, "Icon URL", telegramIconUrl)
+
+    // This remains the optional image uploaded by the user.
+    addCmsField(fieldData, fields, "Background Image URL", uploadedBackgroundUrl)
     addCmsField(fieldData, fields, "Member Count", cms.memberCount)
     addCmsField(fieldData, fields, "Votes Count", Number(listing.votes_count || 0))
     addCmsField(fieldData, fields, "Paid Rank", listing.paid_rank || "free")
