@@ -2562,7 +2562,9 @@ function fallbackImportContent({ title, username, telegramDescription, memberCou
 
 async function generateAiImportContent(input) {
   const fallback = fallbackImportContent(input)
-
+  const styleAngles = ["direct utility listing", "casual Telegram promo", "clean directory summary", "community-focused listing", "creator/news update listing", "fan/community listing", "short punchy listing", "professional but not corporate listing"]
+  const styleAngle = styleAngles[Math.floor(Math.random() * styleAngles.length)]
+  
   if (!process.env.OPENAI_API_KEY) {
     return {
       ...fallback,
@@ -2570,7 +2572,7 @@ async function generateAiImportContent(input) {
       ai_error: "OPENAI_API_KEY is not set; used fallback content.",
     }
   }
-
+  
   try {
     const prompt = {
       telegram_title: input.title || "",
@@ -2578,6 +2580,7 @@ async function generateAiImportContent(input) {
       telegram_description: input.telegramDescription || "",
       member_count: Number(input.memberCount || 0),
       listing_type: input.listingType || "channel",
+      writing_style: styleAngle,
     }
 
     const response = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -2589,13 +2592,15 @@ async function generateAiImportContent(input) {
       body: JSON.stringify({
         model: OPENAI_IMPORT_MODEL,
         response_format: { type: "json_object" },
-        temperature: 0.35,
-        max_tokens: 650,
+        temperature: 0.95,
+        presence_penalty: 0.6,
+        frequency_penalty: 0.5,
+        max_tokens: 900,
         messages: [
           {
             role: "system",
             content:
-              "You generate realistic, varied listing copy for TeleHub, a Telegram group/channel directory. Return ONLY valid JSON: {\"description\":string,\"long_description\":string,\"categories\":string[],\"is_nsfw\":boolean}. The description must NOT use generic repeated openings like \"Join\", \"Stay updated\", \"Welcome to\", \"Discover\", \"This is\", \"A Telegram\", or \"[Name] is\" unless absolutely necessary. Every listing must use a different sentence structure and tone based on the source: some should sound like a fan/community listing, some like a clean directory summary, some like a direct utility listing, some like a creator/news listing, and some like a casual Telegram promo. Use the Telegram title, username, bio, member count, and listing type as the only source. Rewrite the bio into natural human copy; do not copy the bio word-for-word. Use 0-3 relevant emojis only when they fit the original vibe. Do not invent official status, guarantees, discounts, pricing, safety, verification, or trust claims. Only say official if the source clearly says official. description must be 120-240 characters, punchy, specific, and card-ready. long_description must be 500-1100 characters in 1-3 short paragraphs, explaining what users may find, who it is for, and why someone might join, without sounding corporate or AI-written. categories must be 2-5 short Title Case tags, specific first and broad second. is_nsfw is true only for clearly adult, explicit, sexual, gambling, drugs, or mature content.",
+              "You generate realistic, varied listing copy for TeleHub, a Telegram group/channel directory. Follow the writing_style provided in the user JSON. Return ONLY valid JSON: {\"description\":string,\"long_description\":string,\"categories\":string[],\"is_nsfw\":boolean}. The description must NOT use generic repeated openings like \"Join\", \"Stay updated\", \"Welcome to\", \"Discover\", \"This is\", \"A Telegram\", or \"[Name] is\" unless absolutely necessary. Every listing must use a different sentence structure and tone based on the source: some should sound like a fan/community listing, some like a clean directory summary, some like a direct utility listing, some like a creator/news listing, and some like a casual Telegram promo. Use the Telegram title, username, bio, member count, and listing type as the only source. Rewrite the bio into natural human copy; do not copy the bio word-for-word. Use 0-3 relevant emojis only when they fit the original vibe. Do not invent official status, guarantees, discounts, pricing, safety, verification, or trust claims. Only say official if the source clearly says official. description must be 120-240 characters, punchy, specific, and card-ready. long_description must be 500-1100 characters in 1-3 short paragraphs, explaining what users may find, who it is for, and why someone might join, without sounding corporate or AI-written. categories must be 2-5 short Title Case tags, specific first and broad second. is_nsfw is true only for clearly adult, explicit, sexual, gambling, drugs, or mature content.",
           },
           {
             role: "user",
