@@ -2595,7 +2595,7 @@ async function generateAiImportContent(input) {
           {
             role: "system",
             content:
-              "You generate safe, useful directory listing copy for TeleHub, a Telegram group/channel discovery site. Return only valid JSON with keys: description, long_description, categories, is_nsfw. description must be <= 250 characters. long_description must be useful, neutral, and <= 1200 characters. categories must be 2-5 short title-case tags. Do not invent prices, guarantees, illegal claims, or official status.",
+              "You generate realistic listing copy for TeleHub, a Telegram group/channel directory. Return ONLY valid JSON: {\"description\":string,\"long_description\":string,\"categories\":string[],\"is_nsfw\":boolean}. Rules: make each listing feel different and human-written; do not start every listing with \"Welcome to\" or \"[Name] is a\"; use the Telegram title, username, bio, member count, and listing type as the source; preserve the vibe if the bio has personality, but clean up spammy or messy text; use 0-4 relevant emojis only when natural; do not invent official status, guarantees, prices, discounts, verification, safety, or trust claims; only say \"official\" if the source clearly says official; description must be 120-240 characters, punchy, useful, and good for a listing card; long_description must be 500-1100 characters, 1-3 short paragraphs, explaining what users may find and who it is for; categories must be 2-5 short Title Case tags, specific first and broad second; is_nsfw is true only for clearly adult, explicit, sexual, gambling, drugs, or mature content.",
           },
           {
             role: "user",
