@@ -538,7 +538,7 @@ function cleanReferralCode(value) {
 
 
 // ========================================
-// FRAMER CMS SYNC v7 - clean short invite URLs + direct CMS image URLs
+// FRAMER CMS SYNC v8 - clean URLs, CMS images, and CMS deletion
 // ========================================
 
 const FRAMER_COLLECTION_NAME = process.env.FRAMER_COLLECTION_NAME || "Channel Listings"
@@ -1019,6 +1019,184 @@ async function syncListingToFramerCMS(listingId, options = {}) {
   }
 }
 
+
+function getCmsItemFieldValue(item, fieldId) {
+  if (!item || !fieldId) return null
+  const fieldData = item.fieldData || {}
+  const rawValue = fieldData[fieldId]
+
+  if (rawValue && typeof rawValue === "object" && "value" in rawValue) {
+    return rawValue.value
+  }
+
+  return rawValue ?? null
+}
+
+function uniqueValues(values) {
+  return [...new Set(values.filter((value) => value !== null && value !== undefined && String(value).trim() !== "").map((value) => String(value).trim()))]
+}
+
+async function findFramerCmsItemForListing(collection, fields, listing) {
+  const items = await collection.getItems()
+  const supabaseIdField = getFieldByName(fields, "Supabase Listing ID")
+
+  const possibleIds = uniqueValues([
+    listing.framer_cms_item_id,
+  ])
+
+  const possibleSlugs = uniqueValues([
+    listing.short_invite,
+    cleanCmsSlug(listing.short_invite),
+    listing.slug,
+    cleanCmsSlug(listing.slug),
+  ])
+
+  const possibleSupabaseIds = uniqueValues([
+    listing.id,
+  ])
+
+  const itemById = items.find((item) => possibleIds.includes(String(item.id || "")))
+  if (itemById) return itemById
+
+  const itemBySlug = items.find((item) => possibleSlugs.includes(String(item.slug || "")))
+  if (itemBySlug) return itemBySlug
+
+  if (supabaseIdField?.id) {
+    const itemBySupabaseId = items.find((item) =>
+      possibleSupabaseIds.includes(String(getCmsItemFieldValue(item, supabaseIdField.id) || ""))
+    )
+    if (itemBySupabaseId) return itemBySupabaseId
+  }
+
+  return null
+}
+
+async function publishFramerIfNeeded(framer, options = {}) {
+  if (process.env.FRAMER_AUTO_DEPLOY === "false" || options.publish === false) {
+    return false
+  }
+
+  const publication = await framer.publish()
+  await framer.deploy(publication.deployment.id)
+  return true
+}
+
+async function deleteListingFromFramerCMS(listing, options = {}) {
+  if (!process.env.FRAMER_API_KEY || !process.env.FRAMER_PROJECT_URL) {
+    throw new Error("Missing FRAMER_API_KEY or FRAMER_PROJECT_URL in Render environment variables.")
+  }
+
+  const { connect } = await import("framer-api")
+  const framer = await connect(process.env.FRAMER_PROJECT_URL, process.env.FRAMER_API_KEY)
+
+  try {
+    const collection = await getFramerCollection(framer)
+    const fields = await collection.getFields()
+    const cmsItem = await findFramerCmsItemForListing(collection, fields, listing)
+
+    if (!cmsItem?.id) {
+      console.warn("No matching Framer CMS item found for deleted listing:", {
+        id: listing.id,
+        short_invite: listing.short_invite,
+        slug: listing.slug,
+        framer_cms_item_id: listing.framer_cms_item_id,
+      })
+
+      return {
+        ok: true,
+        found: false,
+        deleted: false,
+        deployed: false,
+        message: "No matching Framer CMS item was found. Supabase listing can still be deleted.",
+      }
+    }
+
+    if (typeof collection.removeItems !== "function") {
+      throw new Error("Framer collection.removeItems is unavailable. Update framer-api or check the collection type.")
+    }
+
+    await collection.removeItems([cmsItem.id])
+    const deployed = await publishFramerIfNeeded(framer, options)
+
+    return {
+      ok: true,
+      found: true,
+      deleted: true,
+      deployed,
+      framer_cms_item_id: cmsItem.id,
+      framer_slug: cmsItem.slug || null,
+    }
+  } finally {
+    await framer.disconnect()
+  }
+}
+
+async function safeDeleteRelatedRows(tableName, listingId) {
+  const { error } = await supabaseAdmin
+    .from(tableName)
+    .delete()
+    .eq("listing_id", listingId)
+
+  if (error) {
+    // Do not make the delete fail just because an optional related table does not exist
+    // or does not use listing_id. The final channel_listings delete will catch real FK problems.
+    if (["42P01", "42703"].includes(error.code)) {
+      console.warn(`Skipping optional related delete for ${tableName}:`, error.message)
+      return { table: tableName, ok: false, skipped: true, error: error.message }
+    }
+
+    throw error
+  }
+
+  return { table: tableName, ok: true }
+}
+
+async function deleteListingEverywhere(listing, options = {}) {
+  const framerResult = await deleteListingFromFramerCMS(listing, options)
+
+  const relatedTables = [
+    "listing_referral_clicks",
+    "channel_member_snapshots",
+    "channel_votes",
+    "channel_listing_changes",
+  ]
+
+  const relatedDeletes = []
+
+  for (const tableName of relatedTables) {
+    relatedDeletes.push(await safeDeleteRelatedRows(tableName, listing.id))
+  }
+
+  const { error: listingDeleteError } = await supabaseAdmin
+    .from("channel_listings")
+    .delete()
+    .eq("id", listing.id)
+
+  if (listingDeleteError) throw listingDeleteError
+
+  let homepageCache = null
+
+  try {
+    homepageCache = await updateHomepageListingCache()
+  } catch (cacheErr) {
+    console.error("Homepage cache refresh after listing delete failed:", cacheErr.message)
+  }
+
+  return {
+    ok: true,
+    listing_id: listing.id,
+    short_invite: listing.short_invite || null,
+    framer: framerResult,
+    related_deletes: relatedDeletes,
+    homepage_cache: homepageCache
+      ? {
+          updated_at: homepageCache.updated_at,
+          count: homepageCache.listings.length,
+        }
+      : null,
+  }
+}
+
 app.post("/api/framer/sync-listing", async (req, res) => {
   try {
     const authHeader = req.headers.authorization || ""
@@ -1064,6 +1242,106 @@ app.post("/api/framer/sync-listing", async (req, res) => {
     return res.json(result)
   } catch (err) {
     console.error("Framer listing sync error:", err)
+    return res.status(500).json({ error: err.message })
+  }
+})
+
+
+app.post("/api/listings/delete", async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || ""
+    const token = authHeader.replace("Bearer ", "")
+    const { listing_id } = req.body || {}
+
+    if (!token) {
+      return res.status(401).json({ error: "Missing auth token." })
+    }
+
+    if (!listing_id) {
+      return res.status(400).json({ error: "Missing listing_id." })
+    }
+
+    const {
+      data: { user },
+      error: userError,
+    } = await supabaseAdmin.auth.getUser(token)
+
+    if (userError || !user) {
+      return res.status(401).json({ error: "Invalid auth token." })
+    }
+
+    const { data: listing, error: listingError } = await supabaseAdmin
+      .from("channel_listings")
+      .select("*")
+      .eq("id", listing_id)
+      .single()
+
+    if (listingError || !listing) {
+      return res.status(404).json({ error: "Listing not found." })
+    }
+
+    const email = (user.email || "").toLowerCase()
+    const isAdmin = ADMIN_EMAILS.includes(email)
+
+    if (listing.user_id !== user.id && !isAdmin) {
+      return res.status(403).json({ error: "You do not own this listing." })
+    }
+
+    const result = await queueFramerSync(() => deleteListingEverywhere(listing))
+
+    return res.json(result)
+  } catch (err) {
+    console.error("Delete listing everywhere error:", err)
+    return res.status(500).json({ error: err.message })
+  }
+})
+
+app.post("/api/framer/delete-listing", async (req, res) => {
+  try {
+    // Backward-compatible alias for the same delete behavior.
+    const authHeader = req.headers.authorization || ""
+    const token = authHeader.replace("Bearer ", "")
+    const { listing_id } = req.body || {}
+
+    if (!token) {
+      return res.status(401).json({ error: "Missing auth token." })
+    }
+
+    if (!listing_id) {
+      return res.status(400).json({ error: "Missing listing_id." })
+    }
+
+    const {
+      data: { user },
+      error: userError,
+    } = await supabaseAdmin.auth.getUser(token)
+
+    if (userError || !user) {
+      return res.status(401).json({ error: "Invalid auth token." })
+    }
+
+    const { data: listing, error: listingError } = await supabaseAdmin
+      .from("channel_listings")
+      .select("*")
+      .eq("id", listing_id)
+      .single()
+
+    if (listingError || !listing) {
+      return res.status(404).json({ error: "Listing not found." })
+    }
+
+    const email = (user.email || "").toLowerCase()
+    const isAdmin = ADMIN_EMAILS.includes(email)
+
+    if (listing.user_id !== user.id && !isAdmin) {
+      return res.status(403).json({ error: "You do not own this listing." })
+    }
+
+    const result = await queueFramerSync(() => deleteListingEverywhere(listing))
+
+    return res.json(result)
+  } catch (err) {
+    console.error("Framer delete listing error:", err)
     return res.status(500).json({ error: err.message })
   }
 })
