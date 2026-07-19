@@ -538,7 +538,7 @@ function cleanReferralCode(value) {
 
 
 // ========================================
-// FRAMER CMS SYNC v2
+// FRAMER CMS SYNC v7 - clean short invite URLs + direct CMS image URLs
 // ========================================
 
 const FRAMER_COLLECTION_NAME = process.env.FRAMER_COLLECTION_NAME || "Channel Listings"
@@ -595,8 +595,7 @@ function addCmsField(fieldData, fields, fieldName, value) {
   const fieldType = field.type || "string"
   if (fieldType === "unsupported") return
 
-  // Image fields need a real Framer ImageAsset, not a raw URL string.
-  // Use addCmsImageField for image fields.
+  // Image fields must be handled by addCmsImageField so the typed CMS value is correct.
   if (fieldType === "image") return
 
   let finalValue = value
@@ -623,44 +622,67 @@ function addCmsField(fieldData, fields, fieldName, value) {
   }
 }
 
-async function addCmsImageField(fieldData, fields, framer, fieldName, imageUrl, altText) {
+async function addCmsImageField(fieldData, fields, framer, fieldName, imageUrl, altText, options = {}) {
+  const required = options.required === true
   const field = getFieldByName(fields, fieldName)
-  if (!field) return
-  if (!imageUrl) return
 
+  if (!field) {
+    const message = `Framer image field not found: ${fieldName}`
+    console.warn(message)
+    return { ok: false, skipped: !required, error: message }
+  }
+
+  if (!imageUrl) {
+    const message = `No image URL provided for ${fieldName}`
+
+    // Optional fields like Background Image can be blank without failing the sync.
+    if (required) console.warn(message)
+
+    // Clear image fields when there is no optional image instead of leaving stale data.
+    if (field.type === "image" && !required) {
+      fieldData[field.id] = {
+        type: "image",
+        value: null,
+      }
+    }
+
+    return { ok: false, skipped: !required, error: message }
+  }
+
+  const cleanImageUrl = String(imageUrl).trim()
+
+  if (!/^https?:\/\//i.test(cleanImageUrl)) {
+    const message = `Invalid image URL for ${fieldName}: ${cleanImageUrl}`
+    console.warn(message)
+    return { ok: false, skipped: !required, error: message }
+  }
+
+  // If this CMS field is URL/text instead of Image, save the URL normally.
   if (field.type !== "image") {
-    addCmsField(fieldData, fields, fieldName, imageUrl)
-    return
+    addCmsField(fieldData, fields, fieldName, cleanImageUrl)
+    return {
+      ok: true,
+      warning: `${fieldName} is ${field.type}, so the image URL was saved as text/URL.`,
+      value: cleanImageUrl,
+    }
   }
 
   try {
-    if (typeof framer.addImage !== "function") {
-      console.warn(`Framer addImage is unavailable; skipping image field ${fieldName}`)
-      return
-    }
-
-    const imageAsset = await framer.addImage({
-      image: imageUrl,
-      name: altText || "TeleHub listing image",
-      altText: altText || "TeleHub listing image",
-    })
-
-    const imageValue =
-      typeof imageAsset === "string"
-        ? imageAsset
-        : imageAsset?.id || imageAsset?.url || null
-
-    if (!imageValue) {
-      console.warn(`Framer addImage returned no usable value for ${fieldName}`)
-      return
-    }
-
+    // Framer CMS image fields currently expect the typed value to be null or a string.
+    // Sending the full ImageAsset object causes the typia "expect null | string" error.
+    // The Supabase Storage URL is public, so pass the public URL string directly.
     fieldData[field.id] = {
       type: "image",
-      value: String(imageValue),
+      value: cleanImageUrl,
     }
+
+    console.log(`Prepared Framer image field ${fieldName}:`, cleanImageUrl)
+
+    return { ok: true, value: cleanImageUrl }
   } catch (err) {
-    console.warn(`Could not upload Framer image for ${fieldName}:`, err.message)
+    const message = `Could not prepare Framer image for ${fieldName}: ${err.message}`
+    console.error(message, err)
+    return { ok: false, skipped: !required, error: message }
   }
 }
 
@@ -824,10 +846,9 @@ async function syncListingToFramerCMS(listingId, options = {}) {
       ? `@${stripTelegramHandle(listing.telegram_link)}`
       : "")
   // Telegram icon is the actual channel/group avatar pulled from Telegram.
-  // Uploaded user image remains separate as the optional background image.
-  const telegramIconUrl = listing.icon_url || ""
-  const uploadedBackgroundUrl = listing.image_url || ""
-  const iconImage = telegramIconUrl || uploadedBackgroundUrl || ""
+  // Uploaded user image remains separate as the optional background/banner image.
+  const telegramIconUrl = String(listing.icon_url || "").trim()
+  const uploadedBackgroundUrl = String(listing.image_url || "").trim()
 
   const { connect } = await import("framer-api")
   const framer = await connect(process.env.FRAMER_PROJECT_URL, process.env.FRAMER_API_KEY)
@@ -835,6 +856,17 @@ async function syncListingToFramerCMS(listingId, options = {}) {
   try {
     const collection = await getFramerCollection(framer)
     const fields = await collection.getFields()
+
+    console.log(
+      "FRAMER CMS FIELDS:",
+      fields.map((field) => ({
+        id: field.id,
+        name: field.name,
+        type: field.type,
+      }))
+    )
+    console.log("TELEGRAM ICON URL FOR CMS:", telegramIconUrl)
+    console.log("BACKGROUND IMAGE URL FOR CMS:", uploadedBackgroundUrl)
 
     const fieldData = {}
 
@@ -849,41 +881,35 @@ async function syncListingToFramerCMS(listingId, options = {}) {
     addCmsField(fieldData, fields, "Category", cms.categories || "General")
 
     // IMPORTANT:
-    // Use the Telegram channel/group icon for the visible listing avatar.
-    // Keep the user-uploaded image separate as the optional background image.
-    //
-    // In Framer CMS, create ONE plain text/URL field named "Icon Image URL"
-    // and bind the CMS page avatar/image layer to that field.
-    //
-    // If you changed the existing "Icon Image" field from Image to URL/Text,
-    // this line will also populate it. If it is still a Framer Image field,
-    // addCmsField safely skips it to avoid the previous ImageAsset type error.
-    addCmsField(fieldData, fields, "Icon Image", telegramIconUrl)
-    addCmsField(fieldData, fields, "Icon Image URL", telegramIconUrl)
-    addCmsField(fieldData, fields, "Telegram Icon URL", telegramIconUrl)
-    addCmsField(fieldData, fields, "Icon URL", telegramIconUrl)
-
-    // This remains the optional image uploaded by the user.
-    const telegramIconImage = listing.icon_url || ""
-    const userBackgroundImage = listing.image_url || ""
-
-    await addCmsImageField(
+    // Icon Image = Telegram channel/group avatar from listing.icon_url.
+    // Background Image URL = optional user-uploaded background/banner from listing.image_url.
+    // Both can be Framer Image fields. For Image fields, we pass the public image URL string.
+    const iconImageResult = await addCmsImageField(
       fieldData,
       fields,
       framer,
       "Icon Image",
-      telegramIconImage,
-      `${cms.name} Telegram icon`
+      telegramIconUrl,
+      `${cms.name} Telegram icon`,
+      { required: true }
     )
 
-    await addCmsImageField(
+    const backgroundImageResult = await addCmsImageField(
       fieldData,
       fields,
       framer,
       "Background Image URL",
-      userBackgroundImage,
-      `${cms.name} background image`
+      uploadedBackgroundUrl,
+      `${cms.name} background image`,
+      { required: false }
     )
+
+    // Extra URL/text fallbacks if those fields exist in your CMS.
+    addCmsField(fieldData, fields, "Icon Image URL", telegramIconUrl)
+    addCmsField(fieldData, fields, "Telegram Icon URL", telegramIconUrl)
+    addCmsField(fieldData, fields, "Icon URL", telegramIconUrl)
+    addCmsField(fieldData, fields, "Background Image URL Text", uploadedBackgroundUrl)
+
     addCmsField(fieldData, fields, "Member Count", cms.memberCount)
     addCmsField(fieldData, fields, "Votes Count", Number(listing.votes_count || 0))
     addCmsField(fieldData, fields, "Paid Rank", listing.paid_rank || "free")
@@ -940,6 +966,19 @@ async function syncListingToFramerCMS(listingId, options = {}) {
     }
 
     const now = new Date().toISOString()
+    const framerWarnings = []
+
+    if (telegramSyncWarning) {
+      framerWarnings.push(`Telegram sync warning: ${telegramSyncWarning}`)
+    }
+
+    if (!iconImageResult.ok) {
+      framerWarnings.push(`Icon Image warning: ${iconImageResult.error}`)
+    }
+
+    if (!backgroundImageResult.ok && !backgroundImageResult.skipped) {
+      framerWarnings.push(`Background Image warning: ${backgroundImageResult.error}`)
+    }
 
     await supabaseAdmin
       .from("channel_listings")
@@ -948,7 +987,7 @@ async function syncListingToFramerCMS(listingId, options = {}) {
         framer_cms_item_id: framerCmsItemId,
         framer_sync_status: "synced",
         framer_synced_at: now,
-        framer_sync_error: telegramSyncWarning,
+        framer_sync_error: framerWarnings.length ? framerWarnings.join(" | ") : null,
         updated_at: now,
       })
       .eq("id", listing.id)
@@ -959,6 +998,9 @@ async function syncListingToFramerCMS(listingId, options = {}) {
       url: `https://telehub.to/channel/${cmsSlug}`,
       deployed,
       framer_cms_item_id: framerCmsItemId,
+      icon_image: iconImageResult,
+      background_image: backgroundImageResult,
+      framer_sync_warning: framerWarnings.length ? framerWarnings.join(" | ") : null,
       telegram_sync_warning: telegramSyncWarning,
     }
   } catch (err) {
