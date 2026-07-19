@@ -2376,6 +2376,542 @@ app.get("/api/telegram/sync-hourly", async (req, res) => {
     })
 
 
+
+
+// ========================================
+// ADMIN AI TELEGRAM LISTING IMPORT
+// ========================================
+
+const DEFAULT_ADMIN_IMPORT_LIMIT = 25
+const MAX_ADMIN_IMPORT_LIMIT = 50
+const OPENAI_IMPORT_MODEL = process.env.OPENAI_IMPORT_MODEL || "gpt-4o-mini"
+const IMPORT_CATEGORY_FALLBACKS = [
+  "Crypto",
+  "Gaming",
+  "Technology",
+  "Trading",
+  "Finance",
+  "Education",
+  "Startups",
+  "News",
+  "Business",
+  "Community",
+  "Investing",
+  "AI",
+  "Marketing",
+  "Entertainment",
+  "Sports",
+]
+
+const ADMIN_USER_IDS = (process.env.ADMIN_USER_IDS || "0a908330-be3d-44ad-af73-c7113fa1e41d,f63dca60-e46c-494d-9909-a4554b2ae904,eb65ec8c-ced2-4f25-807e-6a733aa75f08")
+  .split(",")
+  .map((id) => id.trim())
+  .filter(Boolean)
+
+function isBackendAdminUser(user) {
+  if (!user) return false
+  const email = String(user.email || "").toLowerCase()
+  return ADMIN_EMAILS.includes(email) || ADMIN_USER_IDS.includes(user.id)
+}
+
+function cleanImportTelegramLink(value) {
+  let trimmed = String(value || "").trim()
+
+  if (!trimmed) return ""
+
+  // Allow users to paste links with commas, bullets, or extra spaces.
+  trimmed = trimmed
+    .replace(/^[-*•]+\s*/, "")
+    .replace(/[),.;]+$/g, "")
+    .trim()
+
+  if (trimmed.startsWith("@")) {
+    trimmed = `https://t.me/${trimmed.replace("@", "")}`
+  }
+
+  if (trimmed.startsWith("t.me/")) {
+    trimmed = `https://${trimmed}`
+  }
+
+  trimmed = trimmed
+    .replace("http://t.me/", "https://t.me/")
+    .replace("https://telegram.me/", "https://t.me/")
+    .replace("http://telegram.me/", "https://t.me/")
+    .replace("https://t.me/s/", "https://t.me/")
+    .replace(/\/+$/g, "")
+
+  return trimmed
+}
+
+function parseTelegramImportLinks(value) {
+  const rawItems = Array.isArray(value)
+    ? value
+    : String(value || "")
+        .split(/[\n,]+/g)
+        .map((item) => item.trim())
+
+  return uniqueValues(rawItems.map(cleanImportTelegramLink))
+}
+
+function slugifyImportValue(value) {
+  return cleanCmsSlug(value || "telegram-listing") || "telegram-listing"
+}
+
+async function generateUniqueShortInviteFromBase(baseValue) {
+  const base = slugifyImportValue(baseValue).slice(0, 24) || "telegram-listing"
+  let candidate = base
+  let counter = 2
+
+  while (true) {
+    const { data, error } = await supabaseAdmin
+      .from("channel_listings")
+      .select("id")
+      .eq("short_invite", candidate)
+      .maybeSingle()
+
+    if (error) throw error
+    if (!data) return candidate
+
+    const suffix = `-${counter}`
+    candidate = `${base.slice(0, 24 - suffix.length)}${suffix}`
+    counter += 1
+  }
+}
+
+function makeImportFallbackCategories(text, listingType) {
+  const lower = String(text || "").toLowerCase()
+  const matches = []
+
+  const tests = [
+    ["Crypto", ["crypto", "bitcoin", "ethereum", "solana", "memecoin", "airdrop", "web3", "token", "coin"]],
+    ["Trading", ["trading", "forex", "stocks", "signals", "options", "market", "invest"]],
+    ["Gaming", ["gaming", "game", "minecraft", "valorant", "cs2", "fortnite", "roblox", "xbox", "playstation"]],
+    ["Technology", ["tech", "software", "app", "android", "ios", "developer", "coding"]],
+    ["AI", ["ai", "artificial intelligence", "chatgpt", "bot", "automation"]],
+    ["Education", ["learn", "education", "course", "study", "school", "language"]],
+    ["Marketing", ["marketing", "smm", "growth", "promotion", "traffic"]],
+    ["Business", ["business", "startup", "entrepreneur", "sales", "ecommerce"]],
+    ["News", ["news", "updates", "announcements"]],
+    ["Entertainment", ["movie", "music", "anime", "memes", "fun", "media"]],
+  ]
+
+  for (const [category, keywords] of tests) {
+    if (keywords.some((keyword) => lower.includes(keyword))) {
+      matches.push(category)
+    }
+  }
+
+  if (!matches.length) matches.push(listingType === "group" ? "Community" : "News")
+  if (!matches.includes("Telegram")) matches.push("Telegram")
+
+  return matches.slice(0, 5)
+}
+
+function sanitizeAiImportContent(raw, fallback) {
+  const source = raw && typeof raw === "object" ? raw : {}
+
+  let description = String(source.description || fallback.description || "").trim()
+  let longDescription = String(source.long_description || source.longDescription || fallback.long_description || "").trim()
+  let categories = Array.isArray(source.categories) ? source.categories : fallback.categories
+
+  categories = uniqueValues(
+    (categories || [])
+      .map((cat) => String(cat || "").trim())
+      .filter(Boolean)
+      .map((cat) => cat.charAt(0).toUpperCase() + cat.slice(1))
+  ).slice(0, 5)
+
+  if (!categories.length) categories = fallback.categories
+
+  if (!description) description = fallback.description
+  if (!longDescription) longDescription = fallback.long_description
+
+  description = description.slice(0, 250)
+  longDescription = longDescription.slice(0, 2000)
+
+  return {
+    description,
+    long_description: longDescription,
+    categories,
+    is_nsfw: source.is_nsfw === true,
+  }
+}
+
+function fallbackImportContent({ title, username, telegramDescription, memberCount, listingType }) {
+  const typeLabel = listingType === "group" ? "group" : "channel"
+  const name = title || username || "This Telegram community"
+  const baseText = [title, username, telegramDescription].filter(Boolean).join(" ")
+  const categories = makeImportFallbackCategories(baseText, listingType)
+  const memberText = memberCount ? `${Number(memberCount).toLocaleString()} members` : "an active audience"
+
+  const description = telegramDescription
+    ? String(telegramDescription).slice(0, 240)
+    : `${name} is a Telegram ${typeLabel} listed on TeleHub with ${memberText}.`
+
+  const long_description = telegramDescription
+    ? `${telegramDescription}\n\n${name} is listed on TeleHub so users can discover its Telegram link, category, member count, and community details.`
+    : `${name} is a Telegram ${typeLabel} listed on TeleHub. Explore this listing to view its Telegram link, member count, category, and community details before joining.`
+
+  return {
+    description: description.slice(0, 250),
+    long_description: long_description.slice(0, 2000),
+    categories,
+    is_nsfw: false,
+  }
+}
+
+async function generateAiImportContent(input) {
+  const fallback = fallbackImportContent(input)
+
+  if (!process.env.OPENAI_API_KEY) {
+    return {
+      ...fallback,
+      ai_used: false,
+      ai_error: "OPENAI_API_KEY is not set; used fallback content.",
+    }
+  }
+
+  try {
+    const prompt = {
+      telegram_title: input.title || "",
+      telegram_username: input.username || "",
+      telegram_description: input.telegramDescription || "",
+      member_count: Number(input.memberCount || 0),
+      listing_type: input.listingType || "channel",
+    }
+
+    const response = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: OPENAI_IMPORT_MODEL,
+        response_format: { type: "json_object" },
+        temperature: 0.35,
+        max_tokens: 650,
+        messages: [
+          {
+            role: "system",
+            content:
+              "You generate safe, useful directory listing copy for TeleHub, a Telegram group/channel discovery site. Return only valid JSON with keys: description, long_description, categories, is_nsfw. description must be <= 250 characters. long_description must be useful, neutral, and <= 1200 characters. categories must be 2-5 short title-case tags. Do not invent prices, guarantees, illegal claims, or official status.",
+          },
+          {
+            role: "user",
+            content: JSON.stringify(prompt),
+          },
+        ],
+      }),
+    })
+
+    const json = await response.json()
+
+    if (!response.ok) {
+      throw new Error(json?.error?.message || "OpenAI request failed")
+    }
+
+    const content = json?.choices?.[0]?.message?.content || "{}"
+    const parsed = JSON.parse(content)
+    const sanitized = sanitizeAiImportContent(parsed, fallback)
+
+    return {
+      ...sanitized,
+      ai_used: true,
+      ai_error: null,
+    }
+  } catch (err) {
+    console.error("AI import content generation failed:", err.message)
+    return {
+      ...fallback,
+      ai_used: false,
+      ai_error: err.message,
+    }
+  }
+}
+
+async function findDuplicateImportListing({ telegramChatId, telegramUsername, telegramLink }) {
+  const checks = []
+
+  if (telegramChatId) checks.push(["telegram_chat_id", String(telegramChatId)])
+  if (telegramUsername) checks.push(["telegram_username", telegramUsername])
+  if (telegramLink) checks.push(["telegram_link", telegramLink])
+
+  for (const [field, value] of checks) {
+    const { data, error } = await supabaseAdmin
+      .from("channel_listings")
+      .select("id, channel_name, short_invite, telegram_link, telegram_username, telegram_chat_id")
+      .eq(field, value)
+      .limit(1)
+      .maybeSingle()
+
+    if (error) throw error
+    if (data) return data
+  }
+
+  return null
+}
+
+async function importSingleTelegramListing(link, options, adminUser) {
+  const telegramLink = cleanImportTelegramLink(link)
+
+  if (!telegramLink) {
+    return { ok: false, link, error: "Empty link." }
+  }
+
+  const username = extractUsernameFromLink(telegramLink)
+
+  if (!username) {
+    return {
+      ok: false,
+      link: telegramLink,
+      error: "Only public t.me usernames can be imported automatically.",
+    }
+  }
+
+  const chat = await tg("getChat", { chat_id: username })
+  const listingType = normalizeTelegramType(chat.type)
+
+  if (!listingType) {
+    return {
+      ok: false,
+      link: telegramLink,
+      error: "Could not detect whether this Telegram link is a group or channel.",
+    }
+  }
+
+  const telegramUsername = cleanUsername(chat.username) || username
+  const normalizedTelegramLink = chat.username
+    ? `https://t.me/${chat.username}`
+    : telegramLink
+
+  const duplicate = await findDuplicateImportListing({
+    telegramChatId: String(chat.id),
+    telegramUsername,
+    telegramLink: normalizedTelegramLink,
+  })
+
+  if (duplicate) {
+    return {
+      ok: true,
+      skipped: true,
+      reason: "duplicate",
+      link: normalizedTelegramLink,
+      existing_listing_id: duplicate.id,
+      existing_name: duplicate.channel_name,
+      existing_short_invite: duplicate.short_invite,
+    }
+  }
+
+  const memberCount = await tg("getChatMemberCount", { chat_id: chat.id })
+  const telegramDescription = chat.description || chat.bio || ""
+
+  const aiContent = await generateAiImportContent({
+    title: chat.title || telegramUsername,
+    username: telegramUsername,
+    telegramDescription,
+    memberCount,
+    listingType,
+  })
+
+  const shortInviteBase = stripTelegramHandle(telegramUsername) || chat.title || "telegram-listing"
+  const shortInvite = await generateUniqueShortInviteFromBase(shortInviteBase)
+
+  const insertPayload = {
+    user_id: adminUser.id,
+    listing_type: listingType,
+    channel_name: chat.title || stripTelegramHandle(telegramUsername) || "Telegram Listing",
+    telegram_link: normalizedTelegramLink,
+    description: aiContent.description,
+    long_description: aiContent.long_description,
+    categories: aiContent.categories,
+    is_nsfw: aiContent.is_nsfw,
+    short_invite: shortInvite,
+    slug: `${listingType}-${slugifyImportValue(chat.title || telegramUsername)}-${Date.now().toString().slice(-6)}`,
+    status: "approved",
+    admin_reviewed: false,
+    telegram_chat_id: String(chat.id),
+    telegram_username: telegramUsername,
+    telegram_title: chat.title || null,
+    telegram_description: telegramDescription || null,
+    member_count: memberCount,
+    votes_count: 0,
+    last_synced_at: new Date().toISOString(),
+    framer_sync_status: options.syncToFramer ? "not_synced" : null,
+  }
+
+  const { data: inserted, error: insertError } = await supabaseAdmin
+    .from("channel_listings")
+    .insert(insertPayload)
+    .select("id, short_invite")
+    .single()
+
+  if (insertError) throw insertError
+
+  let iconUrl = null
+  let iconError = null
+
+  if (chat.photo?.big_file_id) {
+    try {
+      iconUrl = await uploadTelegramPhoto(chat.photo.big_file_id, inserted.id)
+    } catch (err) {
+      iconError = err.message
+      console.error("Auto import icon upload failed:", err.message)
+    }
+  }
+
+  if (iconUrl) {
+    const { error: imageUpdateError } = await supabaseAdmin
+      .from("channel_listings")
+      .update({
+        icon_url: iconUrl,
+        image_url: options.useIconAsBackground ? iconUrl : null,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", inserted.id)
+
+    if (imageUpdateError) throw imageUpdateError
+  }
+
+  let framerResult = null
+  let framerError = null
+
+  if (options.syncToFramer) {
+    try {
+      framerResult = await queueFramerSync(() =>
+        syncListingToFramerCMS(inserted.id, { publish: false })
+      )
+    } catch (err) {
+      framerError = err.message
+      console.error("Auto import Framer sync failed:", err.message)
+    }
+  }
+
+  return {
+    ok: true,
+    created: true,
+    link: normalizedTelegramLink,
+    listing_id: inserted.id,
+    channel_name: insertPayload.channel_name,
+    short_invite: inserted.short_invite,
+    url: `https://telehub.to/channel/${inserted.short_invite}`,
+    listing_type: listingType,
+    member_count: memberCount,
+    categories: aiContent.categories,
+    ai_used: aiContent.ai_used,
+    ai_error: aiContent.ai_error,
+    icon_url: iconUrl,
+    icon_error: iconError,
+    framer_synced: !!framerResult?.ok,
+    framer_error: framerError,
+  }
+}
+
+app.post("/api/admin/import-telegram-listings", async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || ""
+    const token = authHeader.replace("Bearer ", "")
+
+    if (!token) {
+      return res.status(401).json({ error: "Missing auth token." })
+    }
+
+    const {
+      data: { user },
+      error: userError,
+    } = await supabaseAdmin.auth.getUser(token)
+
+    if (userError || !user || !isBackendAdminUser(user)) {
+      return res.status(403).json({ error: "Admin access required." })
+    }
+
+    const links = parseTelegramImportLinks(req.body?.links || req.body?.links_text || "")
+    const requestedLimit = Number(req.body?.limit || DEFAULT_ADMIN_IMPORT_LIMIT)
+    const limit = Math.min(Math.max(requestedLimit || DEFAULT_ADMIN_IMPORT_LIMIT, 1), MAX_ADMIN_IMPORT_LIMIT)
+    const linksToImport = links.slice(0, limit)
+
+    if (!linksToImport.length) {
+      return res.status(400).json({ error: "Paste at least one public Telegram link." })
+    }
+
+    const options = {
+      syncToFramer: req.body?.sync_to_framer !== false,
+      useIconAsBackground: req.body?.use_icon_as_background !== false,
+    }
+
+    const results = []
+
+    for (const link of linksToImport) {
+      try {
+        const result = await importSingleTelegramListing(link, options, user)
+        results.push(result)
+      } catch (err) {
+        console.error("Auto import listing failed:", link, err)
+        results.push({
+          ok: false,
+          link,
+          error: err.message || "Import failed.",
+        })
+      }
+    }
+
+    let deployed = false
+
+    if (options.syncToFramer && process.env.FRAMER_AUTO_DEPLOY !== "false") {
+      const createdNeedingDeploy = results.some((item) => item.created && item.framer_synced)
+
+      if (createdNeedingDeploy) {
+        const { connect } = await import("framer-api")
+        const framer = await connect(process.env.FRAMER_PROJECT_URL, process.env.FRAMER_API_KEY)
+
+        try {
+          const publication = await framer.publish()
+          await framer.deploy(publication.deployment.id)
+          deployed = true
+        } finally {
+          await framer.disconnect()
+        }
+      }
+    }
+
+    let homepageCache = null
+
+    try {
+      homepageCache = await updateHomepageListingCache()
+    } catch (cacheErr) {
+      console.error("Homepage cache refresh after auto import failed:", cacheErr.message)
+    }
+
+    const summary = {
+      total_received: links.length,
+      processed: linksToImport.length,
+      created: results.filter((item) => item.created).length,
+      duplicates: results.filter((item) => item.skipped).length,
+      failed: results.filter((item) => item.ok === false).length,
+      framer_synced: results.filter((item) => item.framer_synced).length,
+      deployed,
+    }
+
+    return res.json({
+      ok: true,
+      ...summary,
+      limit,
+      remaining_not_processed: Math.max(0, links.length - linksToImport.length),
+      results,
+      homepage_cache: homepageCache
+        ? {
+            updated_at: homepageCache.updated_at,
+            count: homepageCache.listings.length,
+          }
+        : null,
+    })
+  } catch (err) {
+    console.error("Admin Telegram import error:", err)
+    return res.status(500).json({ error: err.message })
+  }
+})
+
+
 const PORT = process.env.PORT || 3000
 
 app.listen(PORT, () => {
