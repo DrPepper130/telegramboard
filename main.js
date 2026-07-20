@@ -1996,33 +1996,20 @@ async function getTemplateConnectedChat(sessionId, connectedChatId) {
 
 async function createMtProtoClient(encryptedSession = "") {
   assertMtProtoConfigured()
-
   const { TelegramClient } = require("telegram")
   const { StringSession } = require("telegram/sessions")
-
-  const stringSession = encryptedSession
-    ? decryptTemplateSecret(encryptedSession)
-    : ""
-
+  const stringSession = encryptedSession ? decryptTemplateSecret(encryptedSession) : ""
   const client = new TelegramClient(
     new StringSession(stringSession),
     TELEGRAM_MT_API_ID,
     TELEGRAM_MT_API_HASH,
     {
-      connectionRetries: 2,
-      requestRetries: 2,
+      connectionRetries: 5,
+      requestRetries: 3,
       floodSleepThreshold: 10,
       autoReconnect: false,
-      retryDelay: 500,
     }
   )
-
-  // GramJS 2.26.x can keep a background updates loop alive after
-  // disconnecting. Silence its internal timeout logger.
-  if (typeof client.setLogLevel === "function") {
-    client.setLogLevel("none")
-  }
-
   await client.connect()
   return client
 }
@@ -2030,46 +2017,23 @@ async function createMtProtoClient(encryptedSession = "") {
 async function safelyDisconnectMt(client) {
   if (!client) return
 
-  // GramJS's update loop checks this private flag. In some 2.26.x
-  // builds, disconnect() and destroy() do not set it early enough,
-  // causing repeated TIMEOUT logs forever.
-  try {
-    client._destroyed = true
-  } catch (_) {}
-
-  try {
-    if (typeof client.setLogLevel === "function") {
-      client.setLogLevel("none")
-    }
-  } catch (_) {}
-
-  try {
-    // Stop borrowed media/download senders first when they exist.
-    if (client._borrowedSenderPromises instanceof Map) {
-      for (const senderPromise of client._borrowedSenderPromises.values()) {
-        try {
-          const sender = await senderPromise
-          if (sender && typeof sender.disconnect === "function") {
-            await sender.disconnect()
-          }
-        } catch (_) {}
-      }
-
-      client._borrowedSenderPromises.clear()
-    }
-  } catch (_) {}
-
-  try {
-    if (typeof client.disconnect === "function") {
-      await client.disconnect()
-    }
-  } catch (_) {}
-
   try {
     if (typeof client.destroy === "function") {
       await client.destroy()
+      return
     }
-  } catch (_) {}
+  } catch (destroyError) {
+    console.warn("MTProto destroy warning:", destroyError.message)
+  }
+
+  try {
+    await client.disconnect()
+  } catch (disconnectError) {
+    console.warn(
+      "MTProto disconnect warning:",
+      disconnectError.message
+    )
+  }
 }
 
 
@@ -2133,7 +2097,8 @@ function telegramCloneAdminRights(entity) {
       rights.banUsers === true,
     can_manage_topics:
       entity?.creator === true ||
-      rights.manageTopics === true,
+      rights.manageTopics === true ||
+      rights.changeInfo === true,
   }
 }
 
@@ -2212,6 +2177,260 @@ async function resolveTelegramCloneEntity(client, reference, label) {
   return entity
 }
 
+
+function normalizeTelegramForumTopic(topic) {
+  if (!topic || topic.className !== "ForumTopic") return null
+
+  return {
+    id: Number(topic.id),
+    title: String(topic.title || "Topic"),
+    icon_color:
+      topic.iconColor === null || topic.iconColor === undefined
+        ? null
+        : Number(topic.iconColor),
+    icon_emoji_id:
+      topic.iconEmojiId === null || topic.iconEmojiId === undefined
+        ? null
+        : String(topic.iconEmojiId),
+    pinned: topic.pinned === true,
+    closed: topic.closed === true,
+    hidden: topic.hidden === true,
+    is_general: Number(topic.id) === 1,
+  }
+}
+
+async function getAllTelegramForumTopics(client, channelInput) {
+  const { Api } = require("telegram")
+  const topics = []
+  const seen = new Set()
+
+  let offsetDate = 0
+  let offsetId = 0
+  let offsetTopic = 0
+
+  for (let page = 0; page < 10; page += 1) {
+    const result = await client.invoke(
+      new Api.channels.GetForumTopics({
+        channel: channelInput,
+        q: "",
+        offsetDate,
+        offsetId,
+        offsetTopic,
+        limit: 100,
+      })
+    )
+
+    const pageTopics = (result.topics || [])
+      .map(normalizeTelegramForumTopic)
+      .filter(Boolean)
+
+    for (const topic of pageTopics) {
+      if (!seen.has(topic.id)) {
+        seen.add(topic.id)
+        topics.push(topic)
+      }
+    }
+
+    if (pageTopics.length < 100) break
+
+    const lastTopic = pageTopics[pageTopics.length - 1]
+    offsetTopic = Number(lastTopic.id || 0)
+
+    const lastMessage = (result.messages || []).find(
+      (message) => Number(message.id) === Number(lastTopic.id)
+    )
+
+    offsetId = Number(lastMessage?.id || 0)
+    offsetDate = Number(lastMessage?.date || 0)
+
+    if (!offsetTopic) break
+  }
+
+  return topics
+}
+
+function extractCreatedForumTopicId(updates) {
+  const updateList = updates?.updates || []
+
+  for (const update of updateList) {
+    const message = update?.message
+    const action = message?.action
+
+    if (
+      message?.id &&
+      action &&
+      (
+        action.className === "MessageActionTopicCreate" ||
+        action.className === "MessageActionTopicEdit"
+      )
+    ) {
+      return Number(message.id)
+    }
+  }
+
+  return null
+}
+
+async function ensureDestinationForumEnabled(
+  client,
+  destinationInput,
+  destinationEntity
+) {
+  const { Api } = require("telegram")
+
+  if (destinationEntity.forum === true) {
+    return { enabled: false, already_enabled: true }
+  }
+
+  await client.invoke(
+    new Api.channels.ToggleForum({
+      channel: destinationInput,
+      enabled: true,
+    })
+  )
+
+  return { enabled: true, already_enabled: false }
+}
+
+async function cloneTelegramForumTopics(
+  client,
+  destinationInput,
+  sourceTopics
+) {
+  const { Api } = require("telegram")
+
+  const results = []
+  const createdTopicIds = []
+  const pinnedCreatedIds = []
+
+  const generalTopic = (sourceTopics || []).find(
+    (topic) => topic.is_general
+  )
+
+  if (generalTopic && generalTopic.title !== "General") {
+    try {
+      await client.invoke(
+        new Api.channels.EditForumTopic({
+          channel: destinationInput,
+          topicId: 1,
+          title: generalTopic.title,
+          iconEmojiId: generalTopic.icon_emoji_id
+            ? BigInt(generalTopic.icon_emoji_id)
+            : undefined,
+        })
+      )
+
+      results.push({
+        key: "topic_general",
+        label: generalTopic.title,
+        ok: true,
+        general: true,
+      })
+    } catch (error) {
+      results.push({
+        key: "topic_general",
+        label: generalTopic.title,
+        ok: false,
+        general: true,
+        message: error.message,
+      })
+    }
+  }
+
+  for (const topic of sourceTopics || []) {
+    if (topic.is_general) continue
+
+    try {
+      const createResult = await client.invoke(
+        new Api.channels.CreateForumTopic({
+          channel: destinationInput,
+          title: topic.title,
+          iconColor:
+            topic.icon_color === null
+              ? undefined
+              : topic.icon_color,
+          iconEmojiId: topic.icon_emoji_id
+            ? BigInt(topic.icon_emoji_id)
+            : undefined,
+          randomId: BigInt(
+            "0x" + crypto.randomBytes(8).toString("hex")
+          ),
+        })
+      )
+
+      const createdId = extractCreatedForumTopicId(createResult)
+
+      if (createdId) {
+        createdTopicIds.push(createdId)
+        if (topic.pinned) pinnedCreatedIds.push(createdId)
+      }
+
+      results.push({
+        key: `topic_${topic.id}`,
+        label: topic.title,
+        ok: true,
+        topic_id: createdId,
+      })
+
+      if (createdId && topic.closed) {
+        try {
+          await client.invoke(
+            new Api.channels.EditForumTopic({
+              channel: destinationInput,
+              topicId: createdId,
+              closed: true,
+            })
+          )
+        } catch (closeError) {
+          results.push({
+            key: `topic_close_${topic.id}`,
+            label: `${topic.title} closed state`,
+            ok: false,
+            message: closeError.message,
+          })
+        }
+      }
+    } catch (error) {
+      results.push({
+        key: `topic_${topic.id}`,
+        label: topic.title,
+        ok: false,
+        message: error.message,
+      })
+    }
+  }
+
+  if (pinnedCreatedIds.length > 0) {
+    try {
+      await client.invoke(
+        new Api.channels.ReorderPinnedForumTopics({
+          channel: destinationInput,
+          force: true,
+          order: pinnedCreatedIds,
+        })
+      )
+
+      results.push({
+        key: "topic_pinned_order",
+        label: "Pinned topic order",
+        ok: true,
+      })
+    } catch (error) {
+      results.push({
+        key: "topic_pinned_order",
+        label: "Pinned topic order",
+        ok: false,
+        message: error.message,
+      })
+    }
+  }
+
+  return {
+    results,
+    created_topic_ids: createdTopicIds,
+  }
+}
+
 async function inspectTelegramCloneEntity(client, entity, includePhoto = false) {
   const { Api } = require("telegram")
 
@@ -2247,6 +2466,19 @@ async function inspectTelegramCloneEntity(client, entity, includePhoto = false) 
 
   const type = telegramCloneType(chat)
 
+  let topics = []
+
+  if (type === "supergroup" && chat.forum === true) {
+    try {
+      topics = await getAllTelegramForumTopics(client, input)
+    } catch (topicError) {
+      console.warn(
+        "Telegram clone source-topic inspection warning:",
+        topicError.message
+      )
+    }
+  }
+
   return {
     entity: chat,
     input,
@@ -2263,6 +2495,7 @@ async function inspectTelegramCloneEntity(client, entity, includePhoto = false) 
         ? mtAllowedPermissions(chat.defaultBannedRights)
         : null,
     default_banned_rights: chat.defaultBannedRights || null,
+    topics,
     settings: {
       slow_mode_seconds: Number(full.slowmodeSeconds || 0),
       protected_content: chat.noforwards === true,
@@ -2332,6 +2565,22 @@ function buildTelegramClonePreview(source, destination) {
       source_value: source.permissions,
       destination_value: destination.permissions,
     })
+
+    automatic.push({
+      key: "topics",
+      label: "Forum topics",
+      supported:
+        source.settings.forum_mode === true &&
+        destination.rights.can_manage_topics === true,
+      source_value:
+        source.settings.forum_mode === true
+          ? `${source.topics.length} topics detected`
+          : "Source does not use topics",
+      destination_value:
+        destination.settings.forum_mode === true
+          ? `${destination.topics.length} existing topics`
+          : "Topics disabled",
+    })
   }
 
   return {
@@ -2349,6 +2598,7 @@ function buildTelegramClonePreview(source, destination) {
       rights: destination.rights,
     },
     automatic,
+    topics: source.topics || [],
     manual: [
       {
         key: "slow_mode",
@@ -2742,6 +2992,55 @@ app.post("/api/telegram-clone/apply", async (req, res) => {
         } catch (error) {
           results.push({
             key: "permissions",
+            ok: false,
+            message: error.message,
+          })
+        }
+      }
+    }
+
+
+    if (
+      sourceInspection.type === "supergroup" &&
+      sourceInspection.settings.forum_mode === true &&
+      copy.topics !== false
+    ) {
+      if (!destinationInspection.rights.can_manage_topics) {
+        results.push({
+          key: "topics",
+          ok: false,
+          skipped: true,
+          message:
+            "Missing permission to manage Topics in the destination.",
+        })
+      } else {
+        try {
+          const forumResult =
+            await ensureDestinationForumEnabled(
+              client,
+              destinationInput,
+              destinationInspection.entity
+            )
+
+          results.push({
+            key: "forum_mode",
+            ok: true,
+            message: forumResult.already_enabled
+              ? "Topics were already enabled."
+              : "Topics enabled on destination.",
+          })
+
+          const topicCloneResult =
+            await cloneTelegramForumTopics(
+              client,
+              destinationInput,
+              sourceInspection.topics
+            )
+
+          results.push(...topicCloneResult.results)
+        } catch (error) {
+          results.push({
+            key: "topics",
             ok: false,
             message: error.message,
           })
