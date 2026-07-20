@@ -1996,20 +1996,33 @@ async function getTemplateConnectedChat(sessionId, connectedChatId) {
 
 async function createMtProtoClient(encryptedSession = "") {
   assertMtProtoConfigured()
+
   const { TelegramClient } = require("telegram")
   const { StringSession } = require("telegram/sessions")
-  const stringSession = encryptedSession ? decryptTemplateSecret(encryptedSession) : ""
+
+  const stringSession = encryptedSession
+    ? decryptTemplateSecret(encryptedSession)
+    : ""
+
   const client = new TelegramClient(
     new StringSession(stringSession),
     TELEGRAM_MT_API_ID,
     TELEGRAM_MT_API_HASH,
     {
-      connectionRetries: 5,
-      requestRetries: 3,
+      connectionRetries: 2,
+      requestRetries: 2,
       floodSleepThreshold: 10,
       autoReconnect: false,
+      retryDelay: 500,
     }
   )
+
+  // GramJS 2.26.x can keep a background updates loop alive after
+  // disconnecting. Silence its internal timeout logger.
+  if (typeof client.setLogLevel === "function") {
+    client.setLogLevel("none")
+  }
+
   await client.connect()
   return client
 }
@@ -2017,23 +2030,46 @@ async function createMtProtoClient(encryptedSession = "") {
 async function safelyDisconnectMt(client) {
   if (!client) return
 
+  // GramJS's update loop checks this private flag. In some 2.26.x
+  // builds, disconnect() and destroy() do not set it early enough,
+  // causing repeated TIMEOUT logs forever.
+  try {
+    client._destroyed = true
+  } catch (_) {}
+
+  try {
+    if (typeof client.setLogLevel === "function") {
+      client.setLogLevel("none")
+    }
+  } catch (_) {}
+
+  try {
+    // Stop borrowed media/download senders first when they exist.
+    if (client._borrowedSenderPromises instanceof Map) {
+      for (const senderPromise of client._borrowedSenderPromises.values()) {
+        try {
+          const sender = await senderPromise
+          if (sender && typeof sender.disconnect === "function") {
+            await sender.disconnect()
+          }
+        } catch (_) {}
+      }
+
+      client._borrowedSenderPromises.clear()
+    }
+  } catch (_) {}
+
+  try {
+    if (typeof client.disconnect === "function") {
+      await client.disconnect()
+    }
+  } catch (_) {}
+
   try {
     if (typeof client.destroy === "function") {
       await client.destroy()
-      return
     }
-  } catch (destroyError) {
-    console.warn("MTProto destroy warning:", destroyError.message)
-  }
-
-  try {
-    await client.disconnect()
-  } catch (disconnectError) {
-    console.warn(
-      "MTProto disconnect warning:",
-      disconnectError.message
-    )
-  }
+  } catch (_) {}
 }
 
 
