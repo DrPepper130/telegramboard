@@ -6,7 +6,7 @@ const app = express()
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "https://telehub.to")
   res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Template-Session")
 
   if (req.method === "OPTIONS") {
     return res.sendStatus(200)
@@ -1845,12 +1845,588 @@ async function updateHomepageListingCache() {
 }
 
 
-app.post("/api/telegram/webhook", async (req, res) => {
-  console.log("Telegram webhook hit:", JSON.stringify(req.body, null, 2))
-  
-  try {
-    const update = req.body
+// ========================================
+// TELEGRAM TEMPLATE COPIER
+// Copies supported channel/supergroup settings only.
+// No messages, members, usernames, or administrators are transferred.
+// ========================================
 
+const TELEGRAM_TEMPLATE_SESSION_TTL_HOURS = 24
+let telegramBotIdentity = null
+
+function hashTemplateToken(value) {
+  return crypto.createHash("sha256").update(String(value || "")).digest("hex")
+}
+
+function createTemplateToken(bytes = 32) {
+  return crypto.randomBytes(bytes).toString("hex")
+}
+
+function createTemplateConnectionCode() {
+  return `TH-${crypto.randomInt(100000, 1000000)}`
+}
+
+function normalizeTemplateChatType(type) {
+  if (type === "channel") return "channel"
+  if (type === "supergroup") return "supergroup"
+  return null
+}
+
+function serializeBotPermissions(member) {
+  if (!member || member.status !== "administrator") return {}
+
+  const keys = [
+    "can_manage_chat",
+    "can_change_info",
+    "can_delete_messages",
+    "can_invite_users",
+    "can_restrict_members",
+    "can_pin_messages",
+    "can_manage_topics",
+    "can_promote_members",
+    "can_post_messages",
+    "can_edit_messages",
+    "can_manage_video_chats",
+  ]
+
+  return Object.fromEntries(keys.map((key) => [key, member[key] === true]))
+}
+
+async function getTelegramBotIdentity() {
+  if (!telegramBotIdentity) telegramBotIdentity = await tg("getMe")
+  return telegramBotIdentity
+}
+
+async function requireTemplateSession(req) {
+  const rawToken = String(req.headers["x-template-session"] || "").trim()
+  if (!rawToken) {
+    const error = new Error("Missing template session.")
+    error.statusCode = 401
+    throw error
+  }
+
+  const tokenHash = hashTemplateToken(rawToken)
+  const now = new Date().toISOString()
+
+  const { data: session, error } = await supabaseAdmin
+    .from("telegram_template_sessions")
+    .select("*")
+    .eq("session_token_hash", tokenHash)
+    .gt("expires_at", now)
+    .maybeSingle()
+
+  if (error) throw error
+  if (!session) {
+    const authError = new Error("Template session expired. Refresh the page to start again.")
+    authError.statusCode = 401
+    throw authError
+  }
+
+  await supabaseAdmin
+    .from("telegram_template_sessions")
+    .update({ last_used_at: now })
+    .eq("id", session.id)
+
+  return session
+}
+
+async function getTemplateConnectedChat(sessionId, connectedChatId) {
+  const { data, error } = await supabaseAdmin
+    .from("telegram_template_chats")
+    .select("*")
+    .eq("id", connectedChatId)
+    .eq("session_id", sessionId)
+    .maybeSingle()
+
+  if (error) throw error
+  return data
+}
+
+async function inspectTemplateChat(chatId) {
+  const bot = await getTelegramBotIdentity()
+  const [chat, botMember, admins] = await Promise.all([
+    tg("getChat", { chat_id: chatId }),
+    tg("getChatMember", { chat_id: chatId, user_id: bot.id }),
+    tg("getChatAdministrators", { chat_id: chatId }),
+  ])
+
+  const chatType = normalizeTemplateChatType(chat.type)
+  if (!chatType) throw new Error("Only Telegram channels and supergroups are supported.")
+  if (botMember.status !== "administrator") {
+    throw new Error("@teleg_sync_bot must be an administrator in this chat.")
+  }
+
+  const adminPresets = (admins || [])
+    .filter((item) => item.status === "administrator")
+    .map((item) => ({
+      custom_title: item.custom_title || "Administrator",
+      is_anonymous: item.is_anonymous === true,
+      rights: {
+        can_manage_chat: item.can_manage_chat === true,
+        can_change_info: item.can_change_info === true,
+        can_delete_messages: item.can_delete_messages === true,
+        can_invite_users: item.can_invite_users === true,
+        can_restrict_members: item.can_restrict_members === true,
+        can_pin_messages: item.can_pin_messages === true,
+        can_manage_topics: item.can_manage_topics === true,
+        can_promote_members: item.can_promote_members === true,
+        can_post_messages: item.can_post_messages === true,
+        can_edit_messages: item.can_edit_messages === true,
+        can_manage_video_chats: item.can_manage_video_chats === true,
+      },
+    }))
+
+  return {
+    chat,
+    chat_type: chatType,
+    bot_member: botMember,
+    bot_permissions: serializeBotPermissions(botMember),
+    admin_presets: adminPresets,
+  }
+}
+
+function buildTemplatePreview(sourceInspection, destinationInspection) {
+  const source = sourceInspection.chat
+  const destination = destinationInspection.chat
+
+  if (sourceInspection.chat_type !== destinationInspection.chat_type) {
+    throw new Error("Source and destination must both be channels or both be supergroups.")
+  }
+
+  const automatic = [
+    {
+      key: "title",
+      label: "Name",
+      supported: destinationInspection.bot_permissions.can_change_info === true,
+      source_value: source.title || "",
+      destination_value: destination.title || "",
+    },
+    {
+      key: "description",
+      label: "Description",
+      supported: destinationInspection.bot_permissions.can_change_info === true,
+      source_value: source.description || "",
+      destination_value: destination.description || "",
+    },
+    {
+      key: "photo",
+      label: "Profile photo",
+      supported:
+        destinationInspection.bot_permissions.can_change_info === true &&
+        Boolean(source.photo?.big_file_id),
+      source_value: source.photo?.big_file_id ? "Source photo detected" : "No source photo",
+      destination_value: destination.photo?.big_file_id ? "Destination has a photo" : "No destination photo",
+    },
+  ]
+
+  if (sourceInspection.chat_type === "supergroup") {
+    automatic.push({
+      key: "permissions",
+      label: "Default member permissions",
+      supported:
+        destinationInspection.bot_permissions.can_restrict_members === true &&
+        Boolean(source.permissions),
+      source_value: source.permissions || null,
+      destination_value: destination.permissions || null,
+    })
+  }
+
+  const manual = [
+    { key: "slow_mode", label: "Slow mode", value: source.slow_mode_delay || 0 },
+    { key: "protected_content", label: "Content protection", value: source.has_protected_content === true },
+    { key: "forum_mode", label: "Forum/topics mode", value: source.is_forum === true },
+    { key: "linked_chat", label: "Linked discussion chat", value: source.linked_chat_id || null },
+    { key: "visible_history", label: "History visible to new members", value: source.has_visible_history === true },
+    { key: "anti_spam", label: "Aggressive anti-spam", value: source.has_aggressive_anti_spam_enabled === true },
+    { key: "auto_delete", label: "Message auto-delete", value: source.message_auto_delete_time || 0 },
+  ]
+
+  return {
+    source: {
+      id: String(source.id),
+      title: source.title,
+      username: source.username || null,
+      type: sourceInspection.chat_type,
+    },
+    destination: {
+      id: String(destination.id),
+      title: destination.title,
+      username: destination.username || null,
+      type: destinationInspection.chat_type,
+    },
+    automatic,
+    admin_presets: sourceInspection.admin_presets,
+    manual,
+  }
+}
+
+async function copyTemplatePhoto(sourceChat, destinationChatId) {
+  if (!sourceChat.photo?.big_file_id) {
+    return { ok: false, skipped: true, reason: "Source has no profile photo." }
+  }
+
+  const file = await tg("getFile", { file_id: sourceChat.photo.big_file_id })
+  const fileUrl = `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${file.file_path}`
+  const imageResponse = await fetch(fileUrl)
+
+  if (!imageResponse.ok) throw new Error("Could not download the source profile photo.")
+
+  const imageBuffer = await imageResponse.arrayBuffer()
+  const contentType = imageResponse.headers.get("content-type") || "image/jpeg"
+  const extension = String(file.file_path || "photo.jpg").split(".").pop() || "jpg"
+
+  const form = new FormData()
+  form.append("chat_id", String(destinationChatId))
+  form.append("photo", new Blob([imageBuffer], { type: contentType }), `telegram-photo.${extension}`)
+
+  const response = await fetch(`${TELEGRAM_API}/setChatPhoto`, {
+    method: "POST",
+    body: form,
+  })
+  const json = await response.json()
+
+  if (!json.ok) throw new Error(json.description || "Could not copy the profile photo.")
+  return { ok: true }
+}
+
+function filterChatPermissions(permissions) {
+  if (!permissions || typeof permissions !== "object") return null
+
+  const keys = [
+    "can_send_messages",
+    "can_send_audios",
+    "can_send_documents",
+    "can_send_photos",
+    "can_send_videos",
+    "can_send_video_notes",
+    "can_send_voice_notes",
+    "can_send_polls",
+    "can_send_other_messages",
+    "can_add_web_page_previews",
+    "can_change_info",
+    "can_invite_users",
+    "can_pin_messages",
+    "can_manage_topics",
+  ]
+
+  return Object.fromEntries(keys.map((key) => [key, permissions[key] === true]))
+}
+
+app.post("/api/telegram-template/session", async (req, res) => {
+  try {
+    const rawToken = createTemplateToken()
+    const tokenHash = hashTemplateToken(rawToken)
+    let connectionCode = createTemplateConnectionCode()
+
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const { data: existing } = await supabaseAdmin
+        .from("telegram_template_sessions")
+        .select("id")
+        .eq("connection_code", connectionCode)
+        .maybeSingle()
+
+      if (!existing) break
+      connectionCode = createTemplateConnectionCode()
+    }
+
+    const expiresAt = new Date(
+      Date.now() + TELEGRAM_TEMPLATE_SESSION_TTL_HOURS * 60 * 60 * 1000
+    ).toISOString()
+
+    const { data: session, error } = await supabaseAdmin
+      .from("telegram_template_sessions")
+      .insert({
+        session_token_hash: tokenHash,
+        connection_code: connectionCode,
+        expires_at: expiresAt,
+      })
+      .select("id, connection_code, expires_at")
+      .single()
+
+    if (error) throw error
+
+    return res.json({
+      ok: true,
+      session_token: rawToken,
+      connection_code: session.connection_code,
+      expires_at: session.expires_at,
+      bot_username: "teleg_sync_bot",
+    })
+  } catch (err) {
+    console.error("Telegram template session error:", err)
+    return res.status(500).json({ error: err.message })
+  }
+})
+
+app.get("/api/telegram-template/chats", async (req, res) => {
+  try {
+    const session = await requireTemplateSession(req)
+
+    const { data: chats, error } = await supabaseAdmin
+      .from("telegram_template_chats")
+      .select("*")
+      .eq("session_id", session.id)
+      .order("connected_at", { ascending: true })
+
+    if (error) throw error
+
+    const verifiedChats = []
+
+    for (const savedChat of chats || []) {
+      try {
+        const inspection = await inspectTemplateChat(savedChat.telegram_chat_id)
+        const now = new Date().toISOString()
+
+        await supabaseAdmin
+          .from("telegram_template_chats")
+          .update({
+            title: inspection.chat.title || savedChat.title,
+            username: inspection.chat.username || null,
+            chat_type: inspection.chat_type,
+            bot_status: inspection.bot_member.status,
+            bot_permissions: inspection.bot_permissions,
+            last_verified_at: now,
+          })
+          .eq("id", savedChat.id)
+
+        verifiedChats.push({
+          ...savedChat,
+          title: inspection.chat.title || savedChat.title,
+          username: inspection.chat.username || null,
+          chat_type: inspection.chat_type,
+          bot_status: inspection.bot_member.status,
+          bot_permissions: inspection.bot_permissions,
+          last_verified_at: now,
+        })
+      } catch (chatError) {
+        verifiedChats.push({
+          ...savedChat,
+          bot_status: "unavailable",
+          verification_error: chatError.message,
+        })
+      }
+    }
+
+    return res.json({
+      ok: true,
+      connection_code: session.connection_code,
+      expires_at: session.expires_at,
+      chats: verifiedChats,
+    })
+  } catch (err) {
+    return res.status(err.statusCode || 500).json({ error: err.message })
+  }
+})
+
+app.post("/api/telegram-template/preview", async (req, res) => {
+  try {
+    const session = await requireTemplateSession(req)
+    const { source_chat_id, destination_chat_id } = req.body || {}
+
+    if (!source_chat_id || !destination_chat_id) {
+      return res.status(400).json({ error: "Choose a source and destination." })
+    }
+    if (source_chat_id === destination_chat_id) {
+      return res.status(400).json({ error: "Source and destination must be different." })
+    }
+
+    const [sourceSaved, destinationSaved] = await Promise.all([
+      getTemplateConnectedChat(session.id, source_chat_id),
+      getTemplateConnectedChat(session.id, destination_chat_id),
+    ])
+
+    if (!sourceSaved || !destinationSaved) {
+      return res.status(404).json({ error: "One of the connected chats was not found." })
+    }
+
+    const [sourceInspection, destinationInspection] = await Promise.all([
+      inspectTemplateChat(sourceSaved.telegram_chat_id),
+      inspectTemplateChat(destinationSaved.telegram_chat_id),
+    ])
+
+    const preview = buildTemplatePreview(sourceInspection, destinationInspection)
+    return res.json({ ok: true, preview })
+  } catch (err) {
+    console.error("Telegram template preview error:", err)
+    return res.status(err.statusCode || 500).json({ error: err.message })
+  }
+})
+
+app.post("/api/telegram-template/apply", async (req, res) => {
+  try {
+    const session = await requireTemplateSession(req)
+    const { source_chat_id, destination_chat_id } = req.body || {}
+
+    if (!source_chat_id || !destination_chat_id) {
+      return res.status(400).json({ error: "Choose a source and destination." })
+    }
+    if (source_chat_id === destination_chat_id) {
+      return res.status(400).json({ error: "Source and destination must be different." })
+    }
+
+    const [sourceSaved, destinationSaved] = await Promise.all([
+      getTemplateConnectedChat(session.id, source_chat_id),
+      getTemplateConnectedChat(session.id, destination_chat_id),
+    ])
+
+    if (!sourceSaved || !destinationSaved) {
+      return res.status(404).json({ error: "One of the connected chats was not found." })
+    }
+
+    const [sourceInspection, destinationInspection] = await Promise.all([
+      inspectTemplateChat(sourceSaved.telegram_chat_id),
+      inspectTemplateChat(destinationSaved.telegram_chat_id),
+    ])
+
+    const preview = buildTemplatePreview(sourceInspection, destinationInspection)
+    const source = sourceInspection.chat
+    const destinationId = destinationInspection.chat.id
+    const results = []
+
+    async function runSetting(key, label, work) {
+      try {
+        await work()
+        results.push({ key, label, ok: true })
+      } catch (settingError) {
+        results.push({ key, label, ok: false, error: settingError.message })
+      }
+    }
+
+    if (destinationInspection.bot_permissions.can_change_info) {
+      await runSetting("title", "Name", () =>
+        tg("setChatTitle", { chat_id: destinationId, title: source.title })
+      )
+
+      await runSetting("description", "Description", () =>
+        tg("setChatDescription", {
+          chat_id: destinationId,
+          description: source.description || "",
+        })
+      )
+
+      if (source.photo?.big_file_id) {
+        await runSetting("photo", "Profile photo", () =>
+          copyTemplatePhoto(source, destinationId)
+        )
+      } else {
+        results.push({ key: "photo", label: "Profile photo", ok: false, skipped: true, error: "Source has no profile photo." })
+      }
+    } else {
+      results.push({ key: "title", label: "Name", ok: false, skipped: true, error: "Bot needs permission to change chat information." })
+      results.push({ key: "description", label: "Description", ok: false, skipped: true, error: "Bot needs permission to change chat information." })
+      results.push({ key: "photo", label: "Profile photo", ok: false, skipped: true, error: "Bot needs permission to change chat information." })
+    }
+
+    if (sourceInspection.chat_type === "supergroup" && source.permissions) {
+      if (destinationInspection.bot_permissions.can_restrict_members) {
+        await runSetting("permissions", "Default member permissions", () =>
+          tg("setChatPermissions", {
+            chat_id: destinationId,
+            permissions: filterChatPermissions(source.permissions),
+            use_independent_chat_permissions: true,
+          })
+        )
+      } else {
+        results.push({ key: "permissions", label: "Default member permissions", ok: false, skipped: true, error: "Bot needs permission to restrict members." })
+      }
+    }
+
+    const successful = results.filter((item) => item.ok).length
+    const failed = results.filter((item) => !item.ok && !item.skipped).length
+    const skipped = results.filter((item) => item.skipped).length
+
+    return res.json({
+      ok: failed === 0,
+      successful,
+      failed,
+      skipped,
+      results,
+      admin_presets: preview.admin_presets,
+      manual: preview.manual,
+    })
+  } catch (err) {
+    console.error("Telegram template apply error:", err)
+    return res.status(err.statusCode || 500).json({ error: err.message })
+  }
+})
+
+async function handleTelegramTemplateConnection(update) {
+  const message = update.message || update.channel_post
+  const chat = update.my_chat_member?.chat || message?.chat
+  if (!chat) return false
+
+  const normalizedType = normalizeTemplateChatType(chat.type)
+  if (!normalizedType) return false
+
+  const text = String(message?.text || message?.caption || "").trim()
+  const codeMatch = text.match(/(?:^|\s)(TH-\d{6})(?:\s|$)/i)
+  if (!codeMatch) return false
+
+  const connectionCode = codeMatch[1].toUpperCase()
+  const now = new Date().toISOString()
+
+  const { data: session, error: sessionError } = await supabaseAdmin
+    .from("telegram_template_sessions")
+    .select("*")
+    .eq("connection_code", connectionCode)
+    .gt("expires_at", now)
+    .maybeSingle()
+
+  if (sessionError) throw sessionError
+  if (!session) return false
+
+  const inspection = await inspectTemplateChat(chat.id)
+
+  const { error: upsertError } = await supabaseAdmin
+    .from("telegram_template_chats")
+    .upsert(
+      {
+        session_id: session.id,
+        telegram_chat_id: String(chat.id),
+        title: inspection.chat.title || chat.title || "Telegram Community",
+        username: inspection.chat.username || chat.username || null,
+        chat_type: inspection.chat_type,
+        bot_status: inspection.bot_member.status,
+        bot_permissions: inspection.bot_permissions,
+        connected_by_telegram_user_id: message?.from?.id ? String(message.from.id) : null,
+        connected_at: now,
+        last_verified_at: now,
+      },
+      { onConflict: "session_id,telegram_chat_id" }
+    )
+
+  if (upsertError) throw upsertError
+
+  if (message?.message_id && inspection.bot_permissions.can_delete_messages) {
+    try {
+      await tg("deleteMessage", { chat_id: chat.id, message_id: message.message_id })
+    } catch (deleteError) {
+      console.warn("Could not remove Telegram template verification message:", deleteError.message)
+    }
+  }
+
+  return true
+}
+
+app.post("/api/telegram/webhook", async (req, res) => {
+  try {
+    const configuredSecret = String(process.env.TELEGRAM_WEBHOOK_SECRET || "").trim()
+    const receivedSecret = String(req.headers["x-telegram-bot-api-secret-token"] || "")
+
+    if (configuredSecret && receivedSecret !== configuredSecret) {
+      return res.status(401).json({ error: "Invalid Telegram webhook secret." })
+    }
+
+    const update = req.body || {}
+
+    try {
+      const connected = await handleTelegramTemplateConnection(update)
+      if (connected) return res.json({ ok: true, template_connected: true })
+    } catch (templateError) {
+      console.error("Telegram template connection error:", templateError)
+    }
+
+    // Preserve the existing TeleHub listing-sync behavior.
     const chat =
       update.my_chat_member?.chat ||
       update.message?.chat ||
@@ -1859,20 +2435,14 @@ app.post("/api/telegram/webhook", async (req, res) => {
     if (!chat) return res.json({ ok: true })
 
     const username = cleanUsername(chat.username)
-
     if (!username) {
-      return res.json({
-        ok: true,
-        message: "Bot detected chat, but no public username found.",
-      })
+      return res.json({ ok: true, message: "Bot detected chat, but no public username found." })
     }
 
     const { data: listings } = await supabaseAdmin
       .from("channel_listings")
       .select("*")
-      .or(
-        `telegram_username.eq.${username},telegram_link.ilike.%${username.replace("@", "")}%`
-      )
+      .or(`telegram_username.eq.${username},telegram_link.ilike.%${username.replace("@", "")}%`)
 
     for (const listing of listings || []) {
       await syncListingTelegramData({
@@ -1882,10 +2452,10 @@ app.post("/api/telegram/webhook", async (req, res) => {
       })
     }
 
-    res.json({ ok: true })
+    return res.json({ ok: true })
   } catch (err) {
     console.error("Telegram webhook error:", err)
-    res.status(500).json({ error: err.message })
+    return res.status(500).json({ error: err.message })
   }
 })
 
