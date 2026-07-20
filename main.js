@@ -5,7 +5,7 @@ const app = express()
 
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "https://telehub.to")
-  res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+  res.header("Access-Control-Allow-Methods","GET, POST, DELETE, OPTIONS")
   res.header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Template-Session")
 
   if (req.method === "OPTIONS") {
@@ -2446,6 +2446,394 @@ app.post("/api/telegram-template/auth/disconnect", async (req, res) => {
     await safelyDisconnectMt(client)
   }
 })
+
+
+
+async function requireTelehubUser(req) {
+  const token = String(req.headers.authorization || "").replace(/^Bearer\s+/i, "").trim()
+  if (!token) {
+    const error = new Error("Sign in to continue.")
+    error.statusCode = 401
+    throw error
+  }
+
+  const { data: { user }, error } = await supabaseAdmin.auth.getUser(token)
+  if (error || !user) {
+    const authError = new Error("Your session is invalid or expired.")
+    authError.statusCode = 401
+    throw authError
+  }
+  return user
+}
+
+async function getTelegramAccountConnection(userId) {
+  const { data, error } = await supabaseAdmin
+    .from("telegram_account_connections")
+    .select("*")
+    .eq("user_id", userId)
+    .maybeSingle()
+  if (error) throw error
+  return data
+}
+
+async function upsertTelegramAccountConnection(userId, values) {
+  const now = new Date().toISOString()
+  const { data, error } = await supabaseAdmin
+    .from("telegram_account_connections")
+    .upsert({ user_id: userId, ...values, updated_at: now, last_used_at: now }, { onConflict: "user_id" })
+    .select("*")
+    .single()
+  if (error) throw error
+  return data
+}
+
+function publicTelegramConnection(connection) {
+  return {
+    connected: connection?.auth_status === "connected",
+    status: connection?.auth_status || "disconnected",
+    telegram_user: connection?.auth_status === "connected" ? {
+      id: connection.telegram_user_id || null,
+      username: connection.telegram_username || null,
+      first_name: connection.telegram_first_name || null,
+      last_name: connection.telegram_last_name || null,
+    } : null,
+  }
+}
+
+app.get("/api/profile", async (req, res) => {
+  try {
+    const user = await requireTelehubUser(req)
+    const { data: existing, error: readError } = await supabaseAdmin
+      .from("profiles")
+      .select("*")
+      .eq("id", user.id)
+      .maybeSingle()
+    if (readError) throw readError
+
+    let profile = existing
+    if (!profile) {
+      const suggested = String(user.user_metadata?.username || "")
+        .replace(/[^A-Za-z0-9_]/g, "")
+        .slice(0, 30)
+      const { data, error } = await supabaseAdmin
+        .from("profiles")
+        .insert({ id: user.id, username: suggested.length >= 3 ? suggested : null })
+        .select("*")
+        .single()
+      if (error) throw error
+      profile = data
+    }
+
+    return res.json({
+      ok: true,
+      profile: { ...profile, email: user.email || null },
+    })
+  } catch (err) {
+    return res.status(err.statusCode || 500).json({ error: err.message })
+  }
+})
+
+app.post("/api/profile/username", async (req, res) => {
+  try {
+    const user = await requireTelehubUser(req)
+    const username = String(req.body?.username || "").trim()
+    if (!/^[A-Za-z0-9_]{3,30}$/.test(username)) {
+      return res.status(400).json({ error: "Username must be 3–30 letters, numbers, or underscores." })
+    }
+
+    const { data: taken, error: takenError } = await supabaseAdmin
+      .from("profiles")
+      .select("id")
+      .ilike("username", username)
+      .neq("id", user.id)
+      .maybeSingle()
+    if (takenError) throw takenError
+    if (taken) return res.status(409).json({ error: "That username is already taken." })
+
+    const now = new Date().toISOString()
+    const { data: profile, error } = await supabaseAdmin
+      .from("profiles")
+      .upsert({ id: user.id, username, updated_at: now }, { onConflict: "id" })
+      .select("*")
+      .single()
+    if (error) throw error
+
+    await supabaseAdmin.auth.admin.updateUserById(user.id, {
+      user_metadata: { ...(user.user_metadata || {}), username },
+    })
+
+    return res.json({ ok: true, profile: { ...profile, email: user.email || null } })
+  } catch (err) {
+    return res.status(err.statusCode || 500).json({ error: err.message })
+  }
+})
+
+app.get("/api/profile/favorites", async (req, res) => {
+  try {
+    const user = await requireTelehubUser(req)
+    const { data, error } = await supabaseAdmin
+      .from("listing_favorites")
+      .select(`
+        listing_id,
+        created_at,
+        listing:channel_listings (
+          id,
+          channel_name,
+          telegram_title,
+          description,
+          telegram_description,
+          icon_url,
+          image_url,
+          telegram_link,
+          listing_type,
+          member_count,
+          votes_count,
+          short_invite,
+          categories,
+          paid_rank,
+          status,
+          is_banned
+        )
+      `)
+      .eq("user_id", user.id)
+      .order("created_at", { ascending: false })
+    if (error) throw error
+
+    const favorites = (data || []).filter((item) => item.listing && item.listing.status === "approved" && !item.listing.is_banned)
+    return res.json({ ok: true, favorites })
+  } catch (err) {
+    return res.status(err.statusCode || 500).json({ error: err.message })
+  }
+})
+
+app.post("/api/profile/favorites/toggle", async (req, res) => {
+  try {
+    const user = await requireTelehubUser(req)
+    const listingId = String(req.body?.listing_id || "").trim()
+    if (!listingId) return res.status(400).json({ error: "Missing listing_id." })
+
+    const { data: listing, error: listingError } = await supabaseAdmin
+      .from("channel_listings")
+      .select("id, status, is_banned")
+      .eq("id", listingId)
+      .maybeSingle()
+    if (listingError) throw listingError
+    if (!listing || listing.status !== "approved" || listing.is_banned) {
+      return res.status(404).json({ error: "Listing not found." })
+    }
+
+    const { data: existing, error: existingError } = await supabaseAdmin
+      .from("listing_favorites")
+      .select("id")
+      .eq("user_id", user.id)
+      .eq("listing_id", listingId)
+      .maybeSingle()
+    if (existingError) throw existingError
+
+    if (existing) {
+      const { error } = await supabaseAdmin.from("listing_favorites").delete().eq("id", existing.id)
+      if (error) throw error
+      return res.json({ ok: true, favorited: false })
+    }
+
+    const { error } = await supabaseAdmin
+      .from("listing_favorites")
+      .insert({ user_id: user.id, listing_id: listingId })
+    if (error) throw error
+    return res.json({ ok: true, favorited: true })
+  } catch (err) {
+    return res.status(err.statusCode || 500).json({ error: err.message })
+  }
+})
+
+app.delete("/api/profile/favorites/:listingId", async (req, res) => {
+  try {
+    const user = await requireTelehubUser(req)
+    const { error } = await supabaseAdmin
+      .from("listing_favorites")
+      .delete()
+      .eq("user_id", user.id)
+      .eq("listing_id", req.params.listingId)
+    if (error) throw error
+    return res.json({ ok: true })
+  } catch (err) {
+    return res.status(err.statusCode || 500).json({ error: err.message })
+  }
+})
+
+app.get("/api/telegram-account/status", async (req, res) => {
+  try {
+    const user = await requireTelehubUser(req)
+    const connection = await getTelegramAccountConnection(user.id)
+    return res.json({ ok: true, ...publicTelegramConnection(connection) })
+  } catch (err) {
+    return res.status(err.statusCode || 500).json({ error: err.message })
+  }
+})
+
+app.post("/api/telegram-account/send-code", async (req, res) => {
+  let client
+  try {
+    const user = await requireTelehubUser(req)
+    const phoneNumber = String(req.body?.phone_number || "").trim()
+    if (!/^\+[1-9]\d{6,14}$/.test(phoneNumber)) {
+      return res.status(400).json({ error: "Enter a valid international phone number, such as +16025551234." })
+    }
+
+    client = await createMtProtoClient("")
+    const sent = await client.sendCode(
+      { apiId: TELEGRAM_MT_API_ID, apiHash: TELEGRAM_MT_API_HASH },
+      phoneNumber
+    )
+
+    await upsertTelegramAccountConnection(user.id, {
+      encrypted_mtproto_session: encryptTemplateSecret(client.session.save()),
+      encrypted_phone_number: encryptTemplateSecret(phoneNumber),
+      encrypted_phone_code_hash: encryptTemplateSecret(sent.phoneCodeHash),
+      auth_status: "code_sent",
+      telegram_user_id: null,
+      telegram_username: null,
+      telegram_first_name: null,
+      telegram_last_name: null,
+      connected_at: null,
+    })
+
+    return res.json({ ok: true, status: "code_sent" })
+  } catch (err) {
+    console.error("Persistent Telegram send-code error:", err)
+    return res.status(err.statusCode || 500).json({ error: err.message })
+  } finally {
+    await safelyDisconnectMt(client)
+  }
+})
+
+app.post("/api/telegram-account/verify-code", async (req, res) => {
+  let client
+  try {
+    const { Api } = require("telegram")
+    const user = await requireTelehubUser(req)
+    const connection = await getTelegramAccountConnection(user.id)
+    const phoneCode = String(req.body?.code || "").replace(/\s+/g, "").trim()
+    if (!phoneCode) return res.status(400).json({ error: "Enter the Telegram login code." })
+    if (!connection?.encrypted_mtproto_session || !connection?.encrypted_phone_number || !connection?.encrypted_phone_code_hash) {
+      return res.status(400).json({ error: "Request a new Telegram login code first." })
+    }
+
+    client = await createMtProtoClient(connection.encrypted_mtproto_session)
+    try {
+      await client.invoke(new Api.auth.SignIn({
+        phoneNumber: decryptTemplateSecret(connection.encrypted_phone_number),
+        phoneCodeHash: decryptTemplateSecret(connection.encrypted_phone_code_hash),
+        phoneCode,
+      }))
+    } catch (signInError) {
+      const message = String(signInError?.errorMessage || signInError?.message || "")
+      if (message.includes("SESSION_PASSWORD_NEEDED")) {
+        await upsertTelegramAccountConnection(user.id, {
+          encrypted_mtproto_session: encryptTemplateSecret(client.session.save()),
+          auth_status: "password_needed",
+        })
+        return res.json({ ok: true, status: "password_needed", password_needed: true })
+      }
+      throw signInError
+    }
+
+    const me = await client.getMe()
+    const connectionData = await upsertTelegramAccountConnection(user.id, {
+      encrypted_mtproto_session: encryptTemplateSecret(client.session.save()),
+      encrypted_phone_code_hash: null,
+      auth_status: "connected",
+      telegram_user_id: String(me.id),
+      telegram_username: me.username || null,
+      telegram_first_name: me.firstName || null,
+      telegram_last_name: me.lastName || null,
+      connected_at: new Date().toISOString(),
+    })
+
+    return res.json({ ok: true, ...publicTelegramConnection(connectionData) })
+  } catch (err) {
+    console.error("Persistent Telegram verify-code error:", err)
+    return res.status(err.statusCode || 500).json({ error: err.message })
+  } finally {
+    await safelyDisconnectMt(client)
+  }
+})
+
+app.post("/api/telegram-account/verify-password", async (req, res) => {
+  let client
+  try {
+    const user = await requireTelehubUser(req)
+    const connection = await getTelegramAccountConnection(user.id)
+    const password = String(req.body?.password || "")
+    if (!password) return res.status(400).json({ error: "Enter your Telegram two-step verification password." })
+    if (!connection?.encrypted_mtproto_session) return res.status(400).json({ error: "Telegram login session not found." })
+
+    client = await createMtProtoClient(connection.encrypted_mtproto_session)
+    await client.signInWithPassword(
+      { apiId: TELEGRAM_MT_API_ID, apiHash: TELEGRAM_MT_API_HASH },
+      { password: async () => password, onError: async (error) => { throw error } }
+    )
+
+    const me = await client.getMe()
+    const connectionData = await upsertTelegramAccountConnection(user.id, {
+      encrypted_mtproto_session: encryptTemplateSecret(client.session.save()),
+      encrypted_phone_code_hash: null,
+      auth_status: "connected",
+      telegram_user_id: String(me.id),
+      telegram_username: me.username || null,
+      telegram_first_name: me.firstName || null,
+      telegram_last_name: me.lastName || null,
+      connected_at: new Date().toISOString(),
+    })
+
+    return res.json({ ok: true, ...publicTelegramConnection(connectionData) })
+  } catch (err) {
+    console.error("Persistent Telegram verify-password error:", err)
+    return res.status(err.statusCode || 500).json({ error: err.message })
+  } finally {
+    await safelyDisconnectMt(client)
+  }
+})
+
+app.post("/api/telegram-account/disconnect", async (req, res) => {
+  let client
+  try {
+    const user = await requireTelehubUser(req)
+    const connection = await getTelegramAccountConnection(user.id)
+
+    if (connection?.encrypted_mtproto_session) {
+      try {
+        client = await createMtProtoClient(connection.encrypted_mtproto_session)
+        if (await client.checkAuthorization()) {
+          const { Api } = require("telegram")
+          await client.invoke(new Api.auth.LogOut({}))
+        }
+      } catch (logoutError) {
+        console.warn("Persistent Telegram logout warning:", logoutError.message)
+      }
+    }
+
+    await upsertTelegramAccountConnection(user.id, {
+      encrypted_mtproto_session: null,
+      encrypted_phone_number: null,
+      encrypted_phone_code_hash: null,
+      auth_status: "disconnected",
+      telegram_user_id: null,
+      telegram_username: null,
+      telegram_first_name: null,
+      telegram_last_name: null,
+      connected_at: null,
+    })
+
+    return res.json({ ok: true, connected: false, status: "disconnected" })
+  } catch (err) {
+    return res.status(err.statusCode || 500).json({ error: err.message })
+  } finally {
+    await safelyDisconnectMt(client)
+  }
+})
+
+
 
 app.get("/api/telegram-template/chats", async (req, res) => {
   try {
