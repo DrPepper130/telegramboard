@@ -2016,12 +2016,27 @@ async function createMtProtoClient(encryptedSession = "") {
 
 async function safelyDisconnectMt(client) {
   if (!client) return
+
+  try {
+    if (typeof client.destroy === "function") {
+      await client.destroy()
+      return
+    }
+  } catch (destroyError) {
+    console.warn("MTProto destroy warning:", destroyError.message)
+  }
+
   try {
     await client.disconnect()
-  } catch (err) {
-    console.warn("MTProto disconnect warning:", err.message)
+  } catch (disconnectError) {
+    console.warn(
+      "MTProto disconnect warning:",
+      disconnectError.message
+    )
   }
 }
+
+
 
 function cleanTelegramSourceReference(value) {
   const raw = String(value || "").trim()
