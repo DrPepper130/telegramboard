@@ -2468,14 +2468,26 @@ async function inspectTelegramCloneEntity(client, entity, includePhoto = false) 
 
   let topics = []
 
-  if (type === "supergroup" && chat.forum === true) {
+  // GramJS does not always populate chat.forum reliably on the entity
+  // returned by GetFullChannel. Try reading forum topics for every
+  // supergroup and treat a successful non-empty result as forum mode.
+  if (type === "supergroup") {
     try {
       topics = await getAllTelegramForumTopics(client, input)
     } catch (topicError) {
-      console.warn(
-        "Telegram clone source-topic inspection warning:",
-        topicError.message
-      )
+      const message = String(topicError?.message || topicError || "")
+
+      // A normal non-forum supergroup can reject GetForumTopics. That is
+      // expected and should not make the whole preview fail.
+      if (
+        !message.includes("CHAT_NOT_FORUM") &&
+        !message.includes("CHANNEL_FORUM_MISSING")
+      ) {
+        console.warn(
+          "Telegram clone source-topic inspection warning:",
+          message
+        )
+      }
     }
   }
 
@@ -2499,7 +2511,7 @@ async function inspectTelegramCloneEntity(client, entity, includePhoto = false) 
     settings: {
       slow_mode_seconds: Number(full.slowmodeSeconds || 0),
       protected_content: chat.noforwards === true,
-      forum_mode: chat.forum === true,
+      forum_mode: chat.forum === true || topics.length > 0,
       linked_chat_id: full.linkedChatId
         ? String(full.linkedChatId)
         : null,
@@ -2570,12 +2582,14 @@ function buildTelegramClonePreview(source, destination) {
       key: "topics",
       label: "Forum topics",
       supported:
-        source.settings.forum_mode === true &&
+        (source.settings.forum_mode === true || source.topics.length > 0) &&
         destination.rights.can_manage_topics === true,
       source_value:
-        source.settings.forum_mode === true
+        source.topics.length > 0
           ? `${source.topics.length} topics detected`
-          : "Source does not use topics",
+          : source.settings.forum_mode === true
+            ? "Forum enabled, but no named topics were returned"
+            : "Source does not use topics",
       destination_value:
         destination.settings.forum_mode === true
           ? `${destination.topics.length} existing topics`
@@ -3002,7 +3016,8 @@ app.post("/api/telegram-clone/apply", async (req, res) => {
 
     if (
       sourceInspection.type === "supergroup" &&
-      sourceInspection.settings.forum_mode === true &&
+      (sourceInspection.settings.forum_mode === true ||
+        sourceInspection.topics.length > 0) &&
       copy.topics !== false
     ) {
       if (!destinationInspection.rights.can_manage_topics) {
