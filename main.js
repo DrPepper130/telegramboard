@@ -2058,6 +2058,663 @@ function mtAllowedPermissions(defaultBannedRights) {
   }
 }
 
+
+function telegramCloneError(message, statusCode = 400) {
+  const error = new Error(message)
+  error.statusCode = statusCode
+  return error
+}
+
+function telegramCloneType(entity) {
+  if (!entity || entity.className !== "Channel") return null
+  return entity.broadcast ? "channel" : "supergroup"
+}
+
+function telegramCloneAdminRights(entity) {
+  const rights = entity?.adminRights || {}
+  return {
+    is_creator: entity?.creator === true,
+    can_change_info:
+      entity?.creator === true ||
+      rights.changeInfo === true,
+    can_ban_users:
+      entity?.creator === true ||
+      rights.banUsers === true,
+    can_manage_topics:
+      entity?.creator === true ||
+      rights.manageTopics === true,
+  }
+}
+
+function telegramCloneCanManageDestination(entity) {
+  const rights = telegramCloneAdminRights(entity)
+  return rights.is_creator || rights.can_change_info
+}
+
+function telegramClonePublicEntity(entity) {
+  const type = telegramCloneType(entity)
+  const rights = telegramCloneAdminRights(entity)
+
+  return {
+    id: String(entity.id),
+    title: entity.title || "Telegram Community",
+    username: entity.username || null,
+    type,
+    creator: rights.is_creator,
+    admin_rights: rights,
+  }
+}
+
+async function requireLinkedTelegramClient(req) {
+  const user = await requireTelehubUser(req)
+  const connection = await getTelegramAccountConnection(user.id)
+
+  if (
+    !connection ||
+    connection.auth_status !== "connected" ||
+    !connection.encrypted_mtproto_session
+  ) {
+    throw telegramCloneError(
+      "Link your Telegram account from your TeleHub profile first.",
+      401
+    )
+  }
+
+  const client = await createMtProtoClient(
+    connection.encrypted_mtproto_session
+  )
+
+  if (!(await client.checkAuthorization())) {
+    await safelyDisconnectMt(client)
+    throw telegramCloneError(
+      "Your Telegram connection expired. Reconnect it from your profile.",
+      401
+    )
+  }
+
+  return { user, connection, client }
+}
+
+async function resolveTelegramCloneEntity(client, reference, label) {
+  const cleanReference = cleanTelegramSourceReference(reference)
+
+  if (!cleanReference) {
+    throw telegramCloneError(`Enter a ${label} Telegram link or username.`)
+  }
+
+  let entity
+
+  try {
+    entity = await client.getEntity(cleanReference)
+  } catch (error) {
+    throw telegramCloneError(
+      `Could not access the ${label}. Make sure it is public or joined by your linked Telegram account.`
+    )
+  }
+
+  if (!telegramCloneType(entity)) {
+    throw telegramCloneError(
+      `The ${label} must be a Telegram channel or supergroup.`
+    )
+  }
+
+  return entity
+}
+
+async function inspectTelegramCloneEntity(client, entity, includePhoto = false) {
+  const { Api } = require("telegram")
+
+  const input = await client.getInputEntity(entity)
+  const fullResult = await client.invoke(
+    new Api.channels.GetFullChannel({ channel: input })
+  )
+
+  const full = fullResult.fullChat || {}
+  const chat =
+    (fullResult.chats || []).find(
+      (item) => String(item.id) === String(entity.id)
+    ) || entity
+
+  let photoBuffer = null
+
+  if (
+    includePhoto &&
+    chat.photo &&
+    chat.photo.className !== "ChatPhotoEmpty"
+  ) {
+    try {
+      photoBuffer = await client.downloadProfilePhoto(chat, {
+        isBig: true,
+      })
+    } catch (error) {
+      console.warn(
+        "Telegram clone source-photo download warning:",
+        error.message
+      )
+    }
+  }
+
+  const type = telegramCloneType(chat)
+
+  return {
+    entity: chat,
+    input,
+    type,
+    title: chat.title || "Telegram Community",
+    username: chat.username || null,
+    description: full.about || "",
+    photo_available:
+      Boolean(chat.photo) &&
+      chat.photo.className !== "ChatPhotoEmpty",
+    photo_buffer: photoBuffer,
+    permissions:
+      type === "supergroup"
+        ? mtAllowedPermissions(chat.defaultBannedRights)
+        : null,
+    default_banned_rights: chat.defaultBannedRights || null,
+    settings: {
+      slow_mode_seconds: Number(full.slowmodeSeconds || 0),
+      protected_content: chat.noforwards === true,
+      forum_mode: chat.forum === true,
+      linked_chat_id: full.linkedChatId
+        ? String(full.linkedChatId)
+        : null,
+      history_hidden:
+        chat.defaultBannedRights?.viewMessages === true,
+      anti_spam: full.antispam === true,
+      auto_delete_seconds: Number(full.ttlPeriod || 0),
+    },
+    rights: telegramCloneAdminRights(chat),
+  }
+}
+
+function buildTelegramClonePreview(source, destination) {
+  if (source.type !== destination.type) {
+    throw telegramCloneError(
+      "Source and destination must both be channels or both be supergroups."
+    )
+  }
+
+  if (!telegramCloneCanManageDestination(destination.entity)) {
+    throw telegramCloneError(
+      "Your linked Telegram account must be an administrator with permission to change the destination."
+    )
+  }
+
+  const automatic = [
+    {
+      key: "title",
+      label: "Name",
+      supported: destination.rights.can_change_info,
+      source_value: source.title,
+      destination_value: destination.title,
+    },
+    {
+      key: "description",
+      label: "Description",
+      supported: destination.rights.can_change_info,
+      source_value: source.description,
+      destination_value: destination.description,
+    },
+    {
+      key: "photo",
+      label: "Profile photo",
+      supported:
+        destination.rights.can_change_info &&
+        source.photo_available,
+      source_value: source.photo_available
+        ? "Source photo detected"
+        : "No source photo",
+      destination_value: destination.photo_available
+        ? "Destination has a photo"
+        : "No destination photo",
+    },
+  ]
+
+  if (source.type === "supergroup") {
+    automatic.push({
+      key: "permissions",
+      label: "Default member permissions",
+      supported:
+        destination.rights.can_ban_users &&
+        Boolean(source.default_banned_rights),
+      source_value: source.permissions,
+      destination_value: destination.permissions,
+    })
+  }
+
+  return {
+    source: {
+      id: String(source.entity.id),
+      title: source.title,
+      username: source.username,
+      type: source.type,
+    },
+    destination: {
+      id: String(destination.entity.id),
+      title: destination.title,
+      username: destination.username,
+      type: destination.type,
+      rights: destination.rights,
+    },
+    automatic,
+    manual: [
+      {
+        key: "slow_mode",
+        label: "Slow mode",
+        value: source.settings.slow_mode_seconds,
+      },
+      {
+        key: "protected_content",
+        label: "Content protection",
+        value: source.settings.protected_content,
+      },
+      {
+        key: "forum_mode",
+        label: "Forum/topics mode",
+        value: source.settings.forum_mode,
+      },
+      {
+        key: "linked_chat",
+        label: "Linked discussion chat",
+        value: source.settings.linked_chat_id,
+      },
+      {
+        key: "anti_spam",
+        label: "Aggressive anti-spam",
+        value: source.settings.anti_spam,
+      },
+      {
+        key: "auto_delete",
+        label: "Message auto-delete",
+        value: source.settings.auto_delete_seconds,
+      },
+    ],
+  }
+}
+
+async function applyTelegramClonePhoto(
+  client,
+  destinationInput,
+  photoBuffer
+) {
+  if (!photoBuffer || !photoBuffer.length) {
+    return {
+      ok: false,
+      skipped: true,
+      message: "Source profile photo could not be downloaded.",
+    }
+  }
+
+  const { Api } = require("telegram")
+  const { CustomFile } = require("telegram/client/uploads")
+
+  const file = new CustomFile(
+    `telehub-clone-${Date.now()}.jpg`,
+    photoBuffer.length,
+    "",
+    photoBuffer
+  )
+
+  const uploadedFile = await client.uploadFile({
+    file,
+    workers: 1,
+  })
+
+  await client.invoke(
+    new Api.channels.EditPhoto({
+      channel: destinationInput,
+      photo: new Api.InputChatUploadedPhoto({
+        file: uploadedFile,
+      }),
+    })
+  )
+
+  return { ok: true }
+}
+
+async function applyTelegramClonePermissions(
+  client,
+  destinationInput,
+  bannedRights
+) {
+  if (!bannedRights) {
+    return {
+      ok: false,
+      skipped: true,
+      message: "No source permissions were available.",
+    }
+  }
+
+  const { Api } = require("telegram")
+
+  await client.invoke(
+    new Api.messages.EditChatDefaultBannedRights({
+      peer: destinationInput,
+      bannedRights,
+    })
+  )
+
+  return { ok: true }
+}
+
+app.get("/api/telegram-clone/status", async (req, res) => {
+  try {
+    const user = await requireTelehubUser(req)
+    const connection = await getTelegramAccountConnection(user.id)
+
+    return res.json({
+      ok: true,
+      connected:
+        connection?.auth_status === "connected" &&
+        Boolean(connection?.encrypted_mtproto_session),
+      telegram: connection
+        ? {
+            username: connection.telegram_username || null,
+            first_name: connection.telegram_first_name || null,
+            last_name: connection.telegram_last_name || null,
+          }
+        : null,
+    })
+  } catch (error) {
+    return res
+      .status(error.statusCode || 500)
+      .json({ error: error.message })
+  }
+})
+
+app.get("/api/telegram-clone/destinations", async (req, res) => {
+  let client
+
+  try {
+    const linked = await requireLinkedTelegramClient(req)
+    client = linked.client
+
+    const dialogs = await client.getDialogs({ limit: 200 })
+    const destinations = []
+    const seen = new Set()
+
+    for (const dialog of dialogs || []) {
+      const entity = dialog.entity
+      const type = telegramCloneType(entity)
+
+      if (!type || !telegramCloneCanManageDestination(entity)) {
+        continue
+      }
+
+      const id = String(entity.id)
+      if (seen.has(id)) continue
+      seen.add(id)
+
+      destinations.push(telegramClonePublicEntity(entity))
+    }
+
+    destinations.sort((a, b) =>
+      String(a.title).localeCompare(String(b.title))
+    )
+
+    return res.json({
+      ok: true,
+      destinations,
+    })
+  } catch (error) {
+    console.error(
+      "Telegram clone destinations error:",
+      error
+    )
+    return res
+      .status(error.statusCode || 500)
+      .json({ error: error.message })
+  } finally {
+    await safelyDisconnectMt(client)
+  }
+})
+
+app.post("/api/telegram-clone/preview", async (req, res) => {
+  let client
+
+  try {
+    const linked = await requireLinkedTelegramClient(req)
+    client = linked.client
+
+    const { source, destination } = req.body || {}
+
+    const sourceEntity = await resolveTelegramCloneEntity(
+      client,
+      source,
+      "source"
+    )
+    const destinationEntity =
+      await resolveTelegramCloneEntity(
+        client,
+        destination,
+        "destination"
+      )
+
+    const [sourceInspection, destinationInspection] =
+      await Promise.all([
+        inspectTelegramCloneEntity(
+          client,
+          sourceEntity,
+          false
+        ),
+        inspectTelegramCloneEntity(
+          client,
+          destinationEntity,
+          false
+        ),
+      ])
+
+    const preview = buildTelegramClonePreview(
+      sourceInspection,
+      destinationInspection
+    )
+
+    return res.json({ ok: true, preview })
+  } catch (error) {
+    console.error("Telegram clone preview error:", error)
+    return res
+      .status(error.statusCode || 500)
+      .json({ error: error.message })
+  } finally {
+    await safelyDisconnectMt(client)
+  }
+})
+
+app.post("/api/telegram-clone/apply", async (req, res) => {
+  let client
+
+  try {
+    const linked = await requireLinkedTelegramClient(req)
+    client = linked.client
+
+    const {
+      source,
+      destination,
+      copy = {},
+    } = req.body || {}
+
+    const sourceEntity = await resolveTelegramCloneEntity(
+      client,
+      source,
+      "source"
+    )
+    const destinationEntity =
+      await resolveTelegramCloneEntity(
+        client,
+        destination,
+        "destination"
+      )
+
+    const [sourceInspection, destinationInspection] =
+      await Promise.all([
+        inspectTelegramCloneEntity(
+          client,
+          sourceEntity,
+          copy.photo !== false
+        ),
+        inspectTelegramCloneEntity(
+          client,
+          destinationEntity,
+          false
+        ),
+      ])
+
+    const preview = buildTelegramClonePreview(
+      sourceInspection,
+      destinationInspection
+    )
+
+    const { Api } = require("telegram")
+    const destinationInput =
+      await client.getInputEntity(destinationEntity)
+
+    const results = []
+
+    if (copy.title !== false) {
+      if (!destinationInspection.rights.can_change_info) {
+        results.push({
+          key: "title",
+          ok: false,
+          skipped: true,
+          message: "Missing permission to change destination information.",
+        })
+      } else {
+        try {
+          await client.invoke(
+            new Api.channels.EditTitle({
+              channel: destinationInput,
+              title: sourceInspection.title,
+            })
+          )
+          results.push({ key: "title", ok: true })
+        } catch (error) {
+          results.push({
+            key: "title",
+            ok: false,
+            message: error.message,
+          })
+        }
+      }
+    }
+
+    if (copy.description !== false) {
+      if (!destinationInspection.rights.can_change_info) {
+        results.push({
+          key: "description",
+          ok: false,
+          skipped: true,
+          message: "Missing permission to change destination information.",
+        })
+      } else {
+        try {
+          await client.invoke(
+            new Api.channels.EditAbout({
+              channel: destinationInput,
+              about: sourceInspection.description || "",
+            })
+          )
+          results.push({
+            key: "description",
+            ok: true,
+          })
+        } catch (error) {
+          results.push({
+            key: "description",
+            ok: false,
+            message: error.message,
+          })
+        }
+      }
+    }
+
+    if (copy.photo !== false) {
+      if (!destinationInspection.rights.can_change_info) {
+        results.push({
+          key: "photo",
+          ok: false,
+          skipped: true,
+          message: "Missing permission to change destination information.",
+        })
+      } else if (!sourceInspection.photo_available) {
+        results.push({
+          key: "photo",
+          ok: false,
+          skipped: true,
+          message: "The source has no profile photo.",
+        })
+      } else {
+        try {
+          const photoResult =
+            await applyTelegramClonePhoto(
+              client,
+              destinationInput,
+              sourceInspection.photo_buffer
+            )
+          results.push({
+            key: "photo",
+            ...photoResult,
+          })
+        } catch (error) {
+          results.push({
+            key: "photo",
+            ok: false,
+            message: error.message,
+          })
+        }
+      }
+    }
+
+    if (
+      sourceInspection.type === "supergroup" &&
+      copy.permissions !== false
+    ) {
+      if (!destinationInspection.rights.can_ban_users) {
+        results.push({
+          key: "permissions",
+          ok: false,
+          skipped: true,
+          message: "Missing permission to manage destination member permissions.",
+        })
+      } else {
+        try {
+          const permissionResult =
+            await applyTelegramClonePermissions(
+              client,
+              destinationInput,
+              sourceInspection.default_banned_rights
+            )
+          results.push({
+            key: "permissions",
+            ...permissionResult,
+          })
+        } catch (error) {
+          results.push({
+            key: "permissions",
+            ok: false,
+            message: error.message,
+          })
+        }
+      }
+    }
+
+    return res.json({
+      ok: results.some((item) => item.ok),
+      preview,
+      results,
+    })
+  } catch (error) {
+    console.error("Telegram clone apply error:", error)
+    return res
+      .status(error.statusCode || 500)
+      .json({ error: error.message })
+  } finally {
+    await safelyDisconnectMt(client)
+  }
+})
+
+
+
 async function inspectMtProtoSource(session, sourceReference, options = {}) {
   const { Api } = require("telegram")
   const client = await createMtProtoClient(session.mtproto_session_encrypted)
