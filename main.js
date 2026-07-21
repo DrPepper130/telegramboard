@@ -331,50 +331,130 @@ async function uploadTelegramPhoto(fileId, listingId) {
 }
 
 async function syncListingTelegramData(listing) {
-  const chatTarget =
-    listing.telegram_chat_id ||
-    listing.telegram_username ||
-    extractUsernameFromLink(listing.telegram_link)
+  const possibleTargets = [
+    listing.telegram_chat_id
+      ? String(listing.telegram_chat_id).trim()
+      : null,
 
-  if (!chatTarget) throw new Error("No Telegram username or chat ID found")
+    listing.telegram_username
+      ? cleanUsername(listing.telegram_username)
+      : null,
 
-  const chat = await tg("getChat", { chat_id: chatTarget })
-  const memberCount = await tg("getChatMemberCount", { chat_id: chat.id })
+    extractUsernameFromLink(listing.telegram_link),
+  ].filter(Boolean)
+
+  const uniqueTargets = [...new Set(possibleTargets)]
+
+  if (uniqueTargets.length === 0) {
+    throw new Error("No Telegram username, chat ID, or public link found")
+  }
+
+  let chat = null
+  let successfulTarget = null
+  let lastError = null
+
+  for (const target of uniqueTargets) {
+    try {
+      chat = await tg("getChat", {
+        chat_id: target,
+      })
+
+      successfulTarget = target
+      break
+    } catch (err) {
+      lastError = err
+
+      console.warn("Telegram getChat failed, trying fallback:", {
+        listing_id: listing.id,
+        channel_name: listing.channel_name,
+        target,
+        error: err.message,
+      })
+    }
+  }
+
+  if (!chat) {
+    throw new Error(
+      lastError?.message ||
+        "Telegram chat could not be found using any stored identifier."
+    )
+  }
+
+  const memberCount = await tg("getChatMemberCount", {
+    chat_id: chat.id,
+  })
+
   const listingType = normalizeTelegramType(chat.type)
 
   if (!listingType) {
-    throw new Error("Could not detect whether this Telegram link is a group or channel.")
+    throw new Error(
+      `Could not detect whether this Telegram link is a group or channel. Telegram type: ${chat.type || "unknown"}`
+    )
   }
 
   let iconUrl = listing.icon_url || null
 
   if (chat.photo?.big_file_id) {
-    iconUrl = await uploadTelegramPhoto(chat.photo.big_file_id, listing.id)
+    try {
+      iconUrl = await uploadTelegramPhoto(
+        chat.photo.big_file_id,
+        listing.id
+      )
+    } catch (photoErr) {
+      console.warn("Telegram photo upload failed:", {
+        listing_id: listing.id,
+        error: photoErr.message,
+      })
+    }
   }
 
-  const { error } = await supabaseAdmin
+  const now = new Date().toISOString()
+
+  const normalizedUsername = cleanUsername(chat.username)
+
+  const { error: updateError } = await supabaseAdmin
     .from("channel_listings")
     .update({
       telegram_chat_id: String(chat.id),
-      telegram_username: cleanUsername(chat.username),
+      telegram_username: normalizedUsername,
       telegram_title: chat.title || null,
-      telegram_description: chat.description || chat.bio || null,
+      telegram_description:
+        chat.description ||
+        chat.bio ||
+        listing.telegram_description ||
+        null,
       member_count: memberCount,
       icon_url: iconUrl,
       listing_type: listingType,
-      last_synced_at: new Date().toISOString(),
+      last_synced_at: now,
+      updated_at: now,
     })
     .eq("id", listing.id)
 
-  if (error) throw error
+  if (updateError) throw updateError
 
-  await supabaseAdmin.from("channel_member_snapshots").insert({
-    listing_id: listing.id,
-    member_count: memberCount,
-    created_at: new Date().toISOString(),
-  })
-  
-  return { chat, memberCount, iconUrl, listingType }
+  const { error: snapshotError } = await supabaseAdmin
+    .from("channel_member_snapshots")
+    .insert({
+      listing_id: listing.id,
+      member_count: memberCount,
+      created_at: now,
+    })
+
+  if (snapshotError) {
+    console.warn("Member snapshot insert failed:", {
+      listing_id: listing.id,
+      error: snapshotError.message,
+    })
+  }
+
+  return {
+    chat,
+    memberCount,
+    iconUrl,
+    listingType,
+    successfulTarget,
+  }
 }
 
 app.post("/api/auth/is-admin", async (req, res) => {
