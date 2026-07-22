@@ -457,6 +457,212 @@ async function syncListingTelegramData(listing) {
   }
 }
 
+const TELEGRAM_SYNC_CONCURRENCY = Math.max(
+  1,
+  Math.min(Number(process.env.TELEGRAM_SYNC_CONCURRENCY || 6), 12)
+)
+
+async function runWithConcurrency(items, limit, worker) {
+  const results = new Array(items.length)
+  let nextIndex = 0
+
+  async function runWorker() {
+    while (true) {
+      const index = nextIndex++
+      if (index >= items.length) return
+
+      try {
+        results[index] = {
+          ok: true,
+          value: await worker(items[index], index),
+        }
+      } catch (err) {
+        results[index] = {
+          ok: false,
+          error: err.message || "Unknown sync error",
+        }
+      }
+    }
+  }
+
+  await Promise.all(
+    Array.from(
+      { length: Math.min(limit, Math.max(items.length, 1)) },
+      () => runWorker()
+    )
+  )
+
+  return results
+}
+
+// Lightweight hourly path:
+// - Uses the saved Telegram chat ID whenever available.
+// - Fetches only the member count.
+// - Does not fetch metadata or avatars.
+// - Does not connect to Framer.
+// - Inserts the hourly member snapshot.
+async function syncListingMemberCountFast(listing) {
+  const possibleTargets = [
+    listing.telegram_chat_id
+      ? String(listing.telegram_chat_id).trim()
+      : null,
+    listing.telegram_username
+      ? cleanUsername(listing.telegram_username)
+      : null,
+    extractUsernameFromLink(listing.telegram_link),
+  ].filter(Boolean)
+
+  const uniqueTargets = [...new Set(possibleTargets)]
+
+  if (!uniqueTargets.length) {
+    throw new Error("No Telegram chat ID, username, or public link found")
+  }
+
+  let memberCount = null
+  let successfulTarget = null
+  let lastError = null
+
+  for (const target of uniqueTargets) {
+    try {
+      memberCount = await tg("getChatMemberCount", {
+        chat_id: target,
+      })
+      successfulTarget = target
+      break
+    } catch (err) {
+      lastError = err
+    }
+  }
+
+  if (memberCount === null) {
+    throw new Error(
+      lastError?.message ||
+        "Telegram member count could not be loaded using any stored identifier."
+    )
+  }
+
+  const now = new Date().toISOString()
+  const updatePayload = {
+    member_count: memberCount,
+    last_synced_at: now,
+  }
+
+  // If a username fallback succeeded because the stored chat ID was missing,
+  // resolve getChat only once so future hourly runs can use the stable chat ID.
+  if (!listing.telegram_chat_id && successfulTarget) {
+    try {
+      const chat = await tg("getChat", { chat_id: successfulTarget })
+      updatePayload.telegram_chat_id = String(chat.id)
+      updatePayload.telegram_username = cleanUsername(chat.username)
+      updatePayload.telegram_title = chat.title || listing.telegram_title || null
+      updatePayload.telegram_description =
+        chat.description ||
+        chat.bio ||
+        listing.telegram_description ||
+        null
+
+      const detectedType = normalizeTelegramType(chat.type)
+      if (detectedType) updatePayload.listing_type = detectedType
+    } catch (err) {
+      console.warn("Could not backfill Telegram chat ID during fast sync:", {
+        listing_id: listing.id,
+        error: err.message,
+      })
+    }
+  }
+
+  const { error: updateError } = await supabaseAdmin
+    .from("channel_listings")
+    .update(updatePayload)
+    .eq("id", listing.id)
+
+  if (updateError) throw updateError
+
+  const { error: snapshotError } = await supabaseAdmin
+    .from("channel_member_snapshots")
+    .insert({
+      listing_id: listing.id,
+      member_count: memberCount,
+      created_at: now,
+    })
+
+  if (snapshotError) {
+    console.warn("Member snapshot insert failed:", {
+      listing_id: listing.id,
+      error: snapshotError.message,
+    })
+  }
+
+  return {
+    listingId: listing.id,
+    memberCount,
+    successfulTarget,
+  }
+}
+
+async function runHourlyTelegramSync() {
+  const startedAt = Date.now()
+
+  const { data: listings, error } = await supabaseAdmin
+    .from("channel_listings")
+    .select(
+      "id, telegram_chat_id, telegram_username, telegram_link, telegram_title, telegram_description, listing_type, member_count"
+    )
+    .eq("status", "approved")
+    .or("is_banned.is.null,is_banned.eq.false")
+
+  if (error) throw error
+
+  const workerResults = await runWithConcurrency(
+    listings || [],
+    TELEGRAM_SYNC_CONCURRENCY,
+    (listing) => syncListingMemberCountFast(listing)
+  )
+
+  const results = workerResults.map((result, index) => {
+    const listing = listings[index]
+
+    if (result.ok) {
+      return {
+        id: listing.id,
+        ok: true,
+        member_count: result.value.memberCount,
+      }
+    }
+
+    return {
+      id: listing.id,
+      ok: false,
+      error: result.error,
+    }
+  })
+
+  let homepageCache = null
+
+  try {
+    homepageCache = await updateHomepageListingCache()
+  } catch (cacheErr) {
+    console.error("Homepage cache refresh after hourly sync failed:", cacheErr)
+  }
+
+  return {
+    ok: true,
+    count: results.length,
+    succeeded: results.filter((item) => item.ok).length,
+    failed: results.filter((item) => !item.ok).length,
+    concurrency: TELEGRAM_SYNC_CONCURRENCY,
+    duration_ms: Date.now() - startedAt,
+    results,
+    homepage_cache: homepageCache
+      ? {
+          updated_at: homepageCache.updated_at,
+          count: homepageCache.listings.length,
+        }
+      : null,
+  }
+}
+
+
 app.post("/api/auth/is-admin", async (req, res) => {
   try {
     const authHeader = req.headers.authorization || ""
@@ -628,6 +834,31 @@ function queueFramerSync(work) {
   const next = framerSyncChain.then(work, work)
   framerSyncChain = next.catch(() => {})
   return next
+}
+
+
+const FRAMER_CONTENT_FIELDS = new Set([
+  "channel_name",
+  "telegram_title",
+  "description",
+  "long_description",
+  "telegram_description",
+  "categories",
+  "image_url",
+  "icon_url",
+  "telegram_username",
+  "telegram_link",
+  "listing_type",
+  "is_nsfw",
+  "paid_rank",
+  "paid_rank_status",
+  "status",
+])
+
+function shouldSyncFramerForChangedFields(changedFields) {
+  return (changedFields || []).some((field) =>
+    FRAMER_CONTENT_FIELDS.has(String(field || "").trim())
+  )
 }
 
 function cleanCmsSlug(value) {
@@ -1327,6 +1558,87 @@ app.post("/api/framer/sync-listing", async (req, res) => {
 })
 
 
+// Call this after an existing listing edit is saved.
+// It skips Framer when only dynamic values such as member_count or votes_count changed.
+app.post("/api/framer/sync-content-change", async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || ""
+    const token = authHeader.replace("Bearer ", "")
+    const { listing_id, changed_fields } = req.body || {}
+
+    if (!token) {
+      return res.status(401).json({ error: "Missing auth token." })
+    }
+
+    if (!listing_id) {
+      return res.status(400).json({ error: "Missing listing_id." })
+    }
+
+    const {
+      data: { user },
+      error: userError,
+    } = await supabaseAdmin.auth.getUser(token)
+
+    if (userError || !user) {
+      return res.status(401).json({ error: "Invalid auth token." })
+    }
+
+    const { data: listing, error: listingError } = await supabaseAdmin
+      .from("channel_listings")
+      .select("id, user_id, status, is_banned")
+      .eq("id", listing_id)
+      .single()
+
+    if (listingError || !listing) {
+      return res.status(404).json({ error: "Listing not found." })
+    }
+
+    const email = (user.email || "").toLowerCase()
+    const isAdmin = ADMIN_EMAILS.includes(email)
+
+    if (listing.user_id !== user.id && !isAdmin) {
+      return res.status(403).json({ error: "You do not own this listing." })
+    }
+
+    const cleanChangedFields = Array.isArray(changed_fields)
+      ? changed_fields.map((field) => String(field || "").trim()).filter(Boolean)
+      : []
+
+    if (!shouldSyncFramerForChangedFields(cleanChangedFields)) {
+      return res.json({
+        ok: true,
+        synced: false,
+        reason: "No Framer-visible listing fields changed.",
+        changed_fields: cleanChangedFields,
+      })
+    }
+
+    if (listing.status !== "approved" || listing.is_banned) {
+      return res.json({
+        ok: true,
+        synced: false,
+        reason: "Listing is not currently eligible for Framer CMS sync.",
+        changed_fields: cleanChangedFields,
+      })
+    }
+
+    const result = await queueFramerSync(() =>
+      syncListingToFramerCMS(listing_id)
+    )
+
+    return res.json({
+      ok: true,
+      synced: true,
+      changed_fields: cleanChangedFields,
+      framer: result,
+    })
+  } catch (err) {
+    console.error("Framer content-change sync error:", err)
+    return res.status(500).json({ error: err.message })
+  }
+})
+
+
 app.post("/api/listings/delete", async (req, res) => {
   try {
     const authHeader = req.headers.authorization || ""
@@ -1473,6 +1785,95 @@ app.post("/api/framer/sync-all-listings", async (req, res) => {
     return res.status(500).json({ error: err.message })
   }
 })
+
+// Schedule this endpoint once per day at midnight.
+// It performs the intentionally expensive full Telegram metadata + Framer CMS refresh.
+app.get("/api/cron/daily-full-sync", async (req, res) => {
+  try {
+    if (req.query.secret !== process.env.CRON_SECRET) {
+      return res.status(401).json({ error: "Unauthorized" })
+    }
+
+    const { data: listings, error } = await supabaseAdmin
+      .from("channel_listings")
+      .select("id")
+      .eq("status", "approved")
+      .or("is_banned.is.null,is_banned.eq.false")
+
+    if (error) throw error
+
+    const startedAt = Date.now()
+    const results = []
+
+    // Keep Framer work serialized for safety. This job runs only once per day.
+    for (const listing of listings || []) {
+      try {
+        const result = await queueFramerSync(() =>
+          syncListingToFramerCMS(listing.id, { publish: false })
+        )
+
+        results.push({
+          id: listing.id,
+          ok: true,
+          slug: result.slug,
+        })
+      } catch (err) {
+        results.push({
+          id: listing.id,
+          ok: false,
+          error: err.message,
+        })
+      }
+    }
+
+    let deployed = false
+
+    if (process.env.FRAMER_AUTO_DEPLOY !== "false") {
+      const { connect } = await import("framer-api")
+      const framer = await connect(
+        process.env.FRAMER_PROJECT_URL,
+        process.env.FRAMER_API_KEY
+      )
+
+      try {
+        const publication = await framer.publish()
+        await framer.deploy(publication.deployment.id)
+        deployed = true
+      } finally {
+        await framer.disconnect()
+      }
+    }
+
+    let homepageCache = null
+
+    try {
+      homepageCache = await updateHomepageListingCache()
+    } catch (cacheErr) {
+      console.error("Homepage cache refresh after daily full sync failed:", cacheErr)
+    }
+
+    return res.json({
+      ok: true,
+      full_sync: true,
+      deployed,
+      count: results.length,
+      succeeded: results.filter((item) => item.ok).length,
+      failed: results.filter((item) => !item.ok).length,
+      duration_ms: Date.now() - startedAt,
+      results,
+      homepage_cache: homepageCache
+        ? {
+            updated_at: homepageCache.updated_at,
+            count: homepageCache.listings.length,
+          }
+        : null,
+    })
+  } catch (err) {
+    console.error("Daily full sync error:", err)
+    return res.status(500).json({ error: err.message })
+  }
+})
+
 
 function shouldResetReferralWindow(listing) {
   const now = new Date()
@@ -4227,36 +4628,11 @@ app.post("/api/telegram/sync-hourly", async (req, res) => {
       return res.status(401).json({ error: "Unauthorized" })
     }
 
-    const { data: listings, error } = await supabaseAdmin
-      .from("channel_listings")
-      .select("*")
-      .eq("status", "approved")
-
-    if (error) throw error
-
-    const results = []
-
-    for (const listing of listings || []) {
-      try {
-        const synced = await syncListingTelegramData(listing)
-        results.push({
-          id: listing.id,
-          ok: true,
-          member_count: synced.memberCount,
-        })
-      } catch (err) {
-        results.push({
-          id: listing.id,
-          ok: false,
-          error: err.message,
-        })
-      }
-    }
-
-    res.json({ ok: true, results })
+    const result = await runHourlyTelegramSync()
+    return res.json(result)
   } catch (err) {
     console.error("Hourly sync error:", err)
-    res.status(500).json({ error: err.message })
+    return res.status(500).json({ error: err.message })
   }
 })
 
@@ -4624,23 +5000,13 @@ app.get("/api/telegram/sync-hourly", async (req, res) => {
       return res.status(401).json({ error: "Unauthorized" })
     }
 
-    const { data: listings, error } = await supabaseAdmin
-      .from("channel_listings")
-      .select("*")
-      .eq("status", "approved")
-
-    if (error) throw error
-
-    const results = []
-
-    for (const listing of listings || []) {
-      try {
-        const synced = await syncListingTelegramData(listing)
-        results.push({
-          id: listing.id,
-          ok: true,
-          member_count: synced.memberCount,
-        })
+    const result = await runHourlyTelegramSync()
+    return res.json(result)
+  } catch (err) {
+    console.error("Hourly sync error:", err)
+    return res.status(500).json({ error: err.message })
+  }
+})
       } catch (err) {
         results.push({
           id: listing.id,
