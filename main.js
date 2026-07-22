@@ -997,13 +997,19 @@ async function addCmsImageField(fieldData, fields, framer, fieldName, imageUrl, 
   }
 }
 
-const name =
-  listing.channel_name ||
-  listing.telegram_title ||
-  "Telegram Listing"
+function buildCmsText(listing) {
+  const name =
+    listing.channel_name ||
+    listing.telegram_title ||
+    "Telegram Listing"
 
-  const listingType = String(listing.listing_type || "channel").toLowerCase()
-  const typeTitle = listingType.charAt(0).toUpperCase() + listingType.slice(1)
+  const listingType = String(
+    listing.listing_type || "channel"
+  ).toLowerCase()
+
+  const typeTitle =
+    listingType.charAt(0).toUpperCase() + listingType.slice(1)
+
   const categories = Array.isArray(listing.categories)
     ? listing.categories.filter(Boolean).join(", ")
     : compactCmsString(listing.categories, "General")
@@ -1020,9 +1026,6 @@ const name =
     `View ${name} on TeleHub.`
 
   const memberCount = Number(listing.member_count || 0)
-  const memberText = memberCount
-    ? memberCount.toLocaleString()
-    : "an updating number of"
 
   return {
     name,
@@ -1044,10 +1047,11 @@ const name =
       ? `Yes, ${name} is marked as NSFW. This means it may contain adult, mature, or sensitive content.`
       : `No, ${name} is not marked as NSFW. Users should still review the community before joining.`,
     faq3Question: `What category is ${name} in?`,
-    faq3Answer: `${name} is listed under ${categories || "General"} on TeleHub.`,
+    faq3Answer: `${name} is listed under ${
+      categories || "General"
+    } on TeleHub.`,
   }
 }
-
 async function ensureUniqueShortInvite(listing) {
   const displayName = listing.telegram_title || listing.channel_name || "telegram-listing"
   let base = cleanCmsSlug(listing.short_invite || displayName)
