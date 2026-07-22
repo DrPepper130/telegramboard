@@ -1,5560 +1,2560 @@
-const express = require("express")
-const { createClient } = require("@supabase/supabase-js")
-const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY)
-const app = express()
+import * as React from "react"
+import { addPropertyControls, ControlType } from "framer"
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2"
 
-app.use((req, res, next) => {
-  res.header("Access-Control-Allow-Origin", "https://telehub.to")
-  res.header("Access-Control-Allow-Methods","GET, POST, DELETE, OPTIONS")
-  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Template-Session")
-
-  if (req.method === "OPTIONS") {
-    return res.sendStatus(200)
-  }
-
-  next()
-})
-
-app.get("/", (req, res) => {
-  res.status(200).send("Telegram sync backend running")
-})
-
-const supabaseAdmin = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
+const supabase = createClient(
+    "https://mbifjgsfuzsnkuwllrjy.supabase.co",
+    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im1iaWZqZ3NmdXpzbmt1d2xscmp5Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzY5ODE4NTAsImV4cCI6MjA5MjU1Nzg1MH0.OT6jH27KuGl3sgTcdce0gBR_rz2WPIivg-jGi52sKR8"
 )
 
-const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN
-const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`
-
-
-const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || "")
-  .split(",")
-  .map((email) => email.trim().toLowerCase())
-  .filter(Boolean)
-
-
-// ========================================
-// ONLINE COUNTER
-// ========================================
-
-// Start blank/hidden until first update happens
-let fakeOnlineCount = null
-
-function updateFakeOnlineCount() {
-  // First real value: start somewhere between 1,000 and 2,000
-  if (fakeOnlineCount === null) {
-    fakeOnlineCount = Math.floor(Math.random() * 1001) + 1000
-    return
-  }
-
-  // Change by 10–25 users per minute
-  const changeAmount = Math.floor(Math.random() * 16) + 10
-
-  // Randomly go up or down
-  const direction = Math.random() < 0.5 ? -1 : 1
-
-  fakeOnlineCount += changeAmount * direction
-
-  // Keep it between 1,000 and 2,000
-  if (fakeOnlineCount < 1000) fakeOnlineCount = 1000
-  if (fakeOnlineCount > 2000) fakeOnlineCount = 2000
-}
-
-// update once per minute
-setInterval(updateFakeOnlineCount, 60 * 1000)
-
-app.get("/api/stats/online", async (req, res) => {
-  res.json({
-    online: fakeOnlineCount,
-  })
-})
-
-
-
-app.post(
-  "/api/stripe/webhook",
-  express.raw({ type: "application/json" }),
-  async (req, res) => {
-    const sig = req.headers["stripe-signature"]
-
-    let event
-
-    try {
-      event = stripe.webhooks.constructEvent(
-        req.body,
-        sig,
-        process.env.STRIPE_WEBHOOK_SECRET
-      )
-    } catch (err) {
-      console.error("Stripe webhook signature error:", err.message)
-      return res.status(400).send(`Webhook Error: ${err.message}`)
-    }
-
-    try {
-      if (event.type === "checkout.session.completed") {
-        const session = event.data.object
-
-        const listingId = session.metadata?.listing_id
-        const userId = session.metadata?.user_id
-        const rank = session.metadata?.rank
-        const subscriptionId = session.subscription
-        const customerId = session.customer
-
-        if (listingId && userId && rank && subscriptionId) {
-          const subscription =
-            await stripe.subscriptions.retrieve(subscriptionId)
-
-          await supabaseAdmin
-            .from("channel_listings")
-            .update({
-              paid_rank: rank,
-              paid_rank_status: subscription.status,
-              stripe_customer_id: customerId,
-              stripe_subscription_id: subscriptionId,
-              paid_rank_current_period_end:
-                subscription.items?.data?.[0]?.current_period_end
-                  ? new Date(
-                    subscription.items.data[0].current_period_end * 1000
-                  ).toISOString()
-                : null,
-              updated_at: new Date().toISOString(),
-            })
-            .eq("id", listingId)
-            .eq("user_id", userId)
-        }
-      }
-
-      if (
-        event.type === "customer.subscription.updated" ||
-        event.type === "customer.subscription.deleted"
-      ) {
-        const subscription = event.data.object
-
-        const listingId = subscription.metadata?.listing_id
-        const userId = subscription.metadata?.user_id
-        const rank = subscription.metadata?.rank
-
-        const activeStatuses = ["active", "trialing"]
-        const isActive = activeStatuses.includes(subscription.status)
-
-        if (listingId && userId) {
-          await supabaseAdmin
-            .from("channel_listings")
-            .update({
-              paid_rank: isActive ? rank : "free",
-              paid_rank_status: subscription.status,
-              stripe_subscription_id: subscription.id,
-              paid_rank_current_period_end:
-                subscription.items?.data?.[0]?.current_period_end
-                  ? new Date(
-                    subscription.items.data[0].current_period_end * 1000
-                  ).toISOString()
-                : null,
-              updated_at: new Date().toISOString(),
-            })
-            .eq("id", listingId)
-            .eq("user_id", userId)
-        }
-      }
-
-      if (event.type === "invoice.payment_failed") {
-        const invoice = event.data.object
-        const subscriptionId = invoice.subscription
-
-        if (subscriptionId) {
-          await supabaseAdmin
-            .from("channel_listings")
-            .update({
-              paid_rank_status: "payment_failed",
-              updated_at: new Date().toISOString(),
-            })
-            .eq("stripe_subscription_id", subscriptionId)
-        }
-      }
-
-      return res.json({ received: true })
-    } catch (err) {
-      console.error("Stripe webhook handling error:", err)
-      return res.status(500).json({ error: err.message })
-    }
-  }
-)
-
-app.use(express.json())
-const RANK_PRICE_IDS = {
-  silver: "price_1TWUrs7OqwgduKJFky8xGosP",
-  gold: "price_1TWUtJ7OqwgduKJFU5ghC6Md",
-  sponsor: "price_1TWUuW7OqwgduKJF8FK40UYG",
-}
-
-
-app.post("/api/stripe/create-billing-portal", async (req, res) => {
-  try {
-    const { listing_id, user_id } = req.body
-
-    const { data: listing, error } = await supabaseAdmin
-      .from("channel_listings")
-      .select("id, user_id, stripe_customer_id")
-      .eq("id", listing_id)
-      .eq("user_id", user_id)
-      .single()
-
-    if (error || !listing?.stripe_customer_id) {
-      return res.status(400).json({ error: "No Stripe customer found." })
-    }
-
-    const session = await stripe.billingPortal.sessions.create({
-      customer: listing.stripe_customer_id,
-      return_url: "https://telehub.to/dashboard",
-    })
-
-    res.json({ url: session.url })
-  } catch (err) {
-    console.error("Billing portal error:", err)
-    res.status(500).json({ error: err.message })
-  }
-})
-
-
-app.post("/api/stripe/create-rank-checkout", async (req, res) => {
-  try {
-    const { listing_id, rank, user_id } = req.body
-
-    const cleanRank = String(rank || "").toLowerCase()
-    const priceId = RANK_PRICE_IDS[cleanRank]
-
-    if (!listing_id || !user_id || !priceId) {
-      return res.status(400).json({ error: "Missing listing, user, or rank." })
-    }
-
-    const { data: listing, error } = await supabaseAdmin
-      .from("channel_listings")
-      .select("id, user_id, channel_name")
-      .eq("id", listing_id)
-      .eq("user_id", user_id)
-      .single()
-
-    if (error || !listing) {
-      return res.status(403).json({ error: "Listing not found or not yours." })
-    }
-
-    const session = await stripe.checkout.sessions.create({
-      mode: "subscription",
-      payment_method_types: ["card"],
-      line_items: [{ price: priceId, quantity: 1 }],
-      success_url: "https://telehub.to/dashboard?payment=success",
-      cancel_url: "https://telehub.to/dashboard?payment=cancelled",
-      metadata: {
-        listing_id,
-        user_id,
-        rank: cleanRank,
-      },
-      subscription_data: {
-        metadata: {
-          listing_id,
-          user_id,
-          rank: cleanRank,
-        },
-      },
-    })
-
-    return res.json({ url: session.url })
-  } catch (err) {
-    console.error("Stripe checkout error:", err)
-    return res.status(500).json({ error: err.message })
-  }
-})
-
-async function tg(method, body) {
-  const res = await fetch(`${TELEGRAM_API}/${method}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body || {}),
-  })
-
-  const json = await res.json()
-  if (!json.ok) throw new Error(json.description || "Telegram API error")
-  return json.result
-}
-
-function cleanUsername(username) {
-  if (!username) return null
-  return username.startsWith("@") ? username : `@${username}`
-}
-
-function normalizeTelegramType(chatType) {
-  if (chatType === "channel") return "channel"
-  if (chatType === "group" || chatType === "supergroup") return "group"
-  return null
-}
-
-function extractUsernameFromLink(link) {
-  if (!link) return null
-  const cleaned = link
-    .replace("https://t.me/", "")
-    .replace("http://t.me/", "")
-    .replace("@", "")
-    .split("?")[0]
-    .split("/")[0]
-    .trim()
-
-  if (!cleaned || cleaned.startsWith("+")) return null
-  return `@${cleaned}`
-}
-
-async function uploadTelegramPhoto(fileId, listingId) {
-  const file = await tg("getFile", { file_id: fileId })
-
-  const fileUrl = `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${file.file_path}`
-  const imageRes = await fetch(fileUrl)
-  const arrayBuffer = await imageRes.arrayBuffer()
-  const buffer = Buffer.from(arrayBuffer)
-
-  const ext = file.file_path.split(".").pop() || "jpg"
-  const path = `telegram-icons/${listingId}-${Date.now()}.${ext}`
-
-  const { error } = await supabaseAdmin.storage
-    .from("listing-images")
-    .upload(path, buffer, {
-      contentType: imageRes.headers.get("content-type") || "image/jpeg",
-      upsert: true,
-    })
-
-  if (error) throw error
-
-  const { data } = supabaseAdmin.storage
-    .from("listing-images")
-    .getPublicUrl(path)
-
-  return data.publicUrl
-}
-
-async function syncListingTelegramData(listing) {
-  const possibleTargets = [
-    listing.telegram_chat_id
-      ? String(listing.telegram_chat_id).trim()
-      : null,
-
-    listing.telegram_username
-      ? cleanUsername(listing.telegram_username)
-      : null,
-
-    extractUsernameFromLink(listing.telegram_link),
-  ].filter(Boolean)
-
-  const uniqueTargets = [...new Set(possibleTargets)]
-
-  if (uniqueTargets.length === 0) {
-    throw new Error("No Telegram username, chat ID, or public link found")
-  }
-
-  let chat = null
-  let successfulTarget = null
-  let lastError = null
-
-  for (const target of uniqueTargets) {
-    try {
-      chat = await tg("getChat", {
-        chat_id: target,
-      })
-
-      successfulTarget = target
-      break
-    } catch (err) {
-      lastError = err
-
-      console.warn("Telegram getChat failed, trying fallback:", {
-        listing_id: listing.id,
-        channel_name: listing.channel_name,
-        target,
-        error: err.message,
-      })
-    }
-  }
-
-  if (!chat) {
-    throw new Error(
-      lastError?.message ||
-        "Telegram chat could not be found using any stored identifier."
-    )
-  }
-
-  const memberCount = await tg("getChatMemberCount", {
-    chat_id: chat.id,
-  })
-
-  const listingType = normalizeTelegramType(chat.type)
-
-  if (!listingType) {
-    throw new Error(
-      `Could not detect whether this Telegram link is a group or channel. Telegram type: ${chat.type || "unknown"}`
-    )
-  }
-
-  let iconUrl = listing.icon_url || null
-
-  if (chat.photo?.big_file_id) {
-    try {
-      iconUrl = await uploadTelegramPhoto(
-        chat.photo.big_file_id,
-        listing.id
-      )
-    } catch (photoErr) {
-      console.warn("Telegram photo upload failed:", {
-        listing_id: listing.id,
-        error: photoErr.message,
-      })
-    }
-  }
-
-  const now = new Date().toISOString()
-
-  const normalizedUsername = cleanUsername(chat.username)
-
-  const { error: updateError } = await supabaseAdmin
-    .from("channel_listings")
-    .update({
-      telegram_chat_id: String(chat.id),
-      telegram_username: normalizedUsername,
-      telegram_title: chat.title || null,
-      telegram_description:
-        chat.description ||
-        chat.bio ||
-        listing.telegram_description ||
-        null,
-      member_count: memberCount,
-      icon_url: iconUrl,
-      listing_type: listingType,
-      last_synced_at: now,
-      updated_at: now,
-    })
-    .eq("id", listing.id)
-
-  if (updateError) throw updateError
-
-  const { error: snapshotError } = await supabaseAdmin
-    .from("channel_member_snapshots")
-    .insert({
-      listing_id: listing.id,
-      member_count: memberCount,
-      created_at: now,
-    })
-
-  if (snapshotError) {
-    console.warn("Member snapshot insert failed:", {
-      listing_id: listing.id,
-      error: snapshotError.message,
-    })
-  }
-
-  return {
-    chat,
-    memberCount,
-    iconUrl,
-    listingType,
-    successfulTarget,
-  }
-}
-
-const TELEGRAM_SYNC_CONCURRENCY = Math.max(
-  1,
-  Math.min(Number(process.env.TELEGRAM_SYNC_CONCURRENCY || 6), 12)
-)
-
-async function runWithConcurrency(items, limit, worker) {
-  const results = new Array(items.length)
-  let nextIndex = 0
-
-  async function runWorker() {
-    while (true) {
-      const index = nextIndex++
-      if (index >= items.length) return
-
-      try {
-        results[index] = {
-          ok: true,
-          value: await worker(items[index], index),
-        }
-      } catch (err) {
-        results[index] = {
-          ok: false,
-          error: err.message || "Unknown sync error",
-        }
-      }
-    }
-  }
-
-  await Promise.all(
-    Array.from(
-      { length: Math.min(limit, Math.max(items.length, 1)) },
-      () => runWorker()
-    )
-  )
-
-  return results
-}
-
-// Lightweight hourly path:
-// - Uses the saved Telegram chat ID whenever available.
-// - Fetches only the member count.
-// - Does not fetch metadata or avatars.
-// - Does not connect to Framer.
-// - Inserts the hourly member snapshot.
-async function syncListingMemberCountFast(listing) {
-  const possibleTargets = [
-    listing.telegram_chat_id
-      ? String(listing.telegram_chat_id).trim()
-      : null,
-    listing.telegram_username
-      ? cleanUsername(listing.telegram_username)
-      : null,
-    extractUsernameFromLink(listing.telegram_link),
-  ].filter(Boolean)
-
-  const uniqueTargets = [...new Set(possibleTargets)]
-
-  if (!uniqueTargets.length) {
-    throw new Error("No Telegram chat ID, username, or public link found")
-  }
-
-  let memberCount = null
-  let successfulTarget = null
-  let lastError = null
-
-  for (const target of uniqueTargets) {
-    try {
-      memberCount = await tg("getChatMemberCount", {
-        chat_id: target,
-      })
-      successfulTarget = target
-      break
-    } catch (err) {
-      lastError = err
-    }
-  }
-
-  if (memberCount === null) {
-    throw new Error(
-      lastError?.message ||
-        "Telegram member count could not be loaded using any stored identifier."
-    )
-  }
-
-  const now = new Date().toISOString()
-  const updatePayload = {
-    member_count: memberCount,
-    last_synced_at: now,
-  }
-
-  // If a username fallback succeeded because the stored chat ID was missing,
-  // resolve getChat only once so future hourly runs can use the stable chat ID.
-  if (!listing.telegram_chat_id && successfulTarget) {
-    try {
-      const chat = await tg("getChat", { chat_id: successfulTarget })
-      updatePayload.telegram_chat_id = String(chat.id)
-      updatePayload.telegram_username = cleanUsername(chat.username)
-      updatePayload.telegram_title = chat.title || listing.telegram_title || null
-      updatePayload.telegram_description =
-        chat.description ||
-        chat.bio ||
-        listing.telegram_description ||
-        null
-
-      const detectedType = normalizeTelegramType(chat.type)
-      if (detectedType) updatePayload.listing_type = detectedType
-    } catch (err) {
-      console.warn("Could not backfill Telegram chat ID during fast sync:", {
-        listing_id: listing.id,
-        error: err.message,
-      })
-    }
-  }
-
-  const { error: updateError } = await supabaseAdmin
-    .from("channel_listings")
-    .update(updatePayload)
-    .eq("id", listing.id)
-
-  if (updateError) throw updateError
-
-  const { error: snapshotError } = await supabaseAdmin
-    .from("channel_member_snapshots")
-    .insert({
-      listing_id: listing.id,
-      member_count: memberCount,
-      created_at: now,
-    })
-
-  if (snapshotError) {
-    console.warn("Member snapshot insert failed:", {
-      listing_id: listing.id,
-      error: snapshotError.message,
-    })
-  }
-
-  return {
-    listingId: listing.id,
-    memberCount,
-    successfulTarget,
-  }
-}
-
-async function runHourlyTelegramSync() {
-  const startedAt = Date.now()
-
-  const { data: listings, error } = await supabaseAdmin
-    .from("channel_listings")
-    .select(
-      "id, telegram_chat_id, telegram_username, telegram_link, telegram_title, telegram_description, listing_type, member_count"
-    )
-    .eq("status", "approved")
-    .or("is_banned.is.null,is_banned.eq.false")
-
-  if (error) throw error
-
-  const workerResults = await runWithConcurrency(
-    listings || [],
-    TELEGRAM_SYNC_CONCURRENCY,
-    (listing) => syncListingMemberCountFast(listing)
-  )
-
-  const results = workerResults.map((result, index) => {
-    const listing = listings[index]
-
-    if (result.ok) {
-      return {
-        id: listing.id,
-        ok: true,
-        member_count: result.value.memberCount,
-      }
-    }
-
-    return {
-      id: listing.id,
-      ok: false,
-      error: result.error,
-    }
-  })
-
-  let homepageCache = null
-
-  try {
-    homepageCache = await updateHomepageListingCache()
-  } catch (cacheErr) {
-    console.error("Homepage cache refresh after hourly sync failed:", cacheErr)
-  }
-
-  return {
-    ok: true,
-    count: results.length,
-    succeeded: results.filter((item) => item.ok).length,
-    failed: results.filter((item) => !item.ok).length,
-    concurrency: TELEGRAM_SYNC_CONCURRENCY,
-    duration_ms: Date.now() - startedAt,
-    results,
-    homepage_cache: homepageCache
-      ? {
-          updated_at: homepageCache.updated_at,
-          count: homepageCache.listings.length,
-        }
-      : null,
-  }
-}
-
-
-app.post("/api/auth/is-admin", async (req, res) => {
-  try {
-    const authHeader = req.headers.authorization || ""
-    const token = authHeader.replace("Bearer ", "")
-
-    if (!token) {
-      return res.status(401).json({ isAdmin: false })
-    }
-
-    const {
-      data: { user },
-      error,
-    } = await supabaseAdmin.auth.getUser(token)
-
-    if (error || !user) {
-      return res.status(401).json({ isAdmin: false })
-    }
-
-    const email = (user.email || "").toLowerCase()
-    const isAdmin = ADMIN_EMAILS.includes(email)
-
-    return res.json({ isAdmin })
-  } catch (err) {
-    console.error("Admin check error:", err)
-    return res.status(500).json({ isAdmin: false })
-  }
-})
-
-app.post("/api/discord/vote-feed", async (req, res) => {
-  console.log("Discord vote feed route hit:", req.body)
-
-  try {
-    const webhookUrl = process.env.DISCORD_VOTE_WEBHOOK_URL
-
-    if (!webhookUrl) {
-      console.log("Missing DISCORD_VOTE_WEBHOOK_URL")
-      return res.status(500).json({ error: "Missing Discord webhook URL" })
-    }
-
-    const {
-      title,
-      description,
-      telegram_link,
-      listing_url,
-      icon_url,
-      image_url,
-      votes_count,
-      member_count,
-      categories,
-    } = req.body
-
-    const safeTelegramLink = telegram_link?.startsWith("http")
-      ? telegram_link
-      : `https://${telegram_link}`
-
-    const safeListingUrl = listing_url?.startsWith("http")
-      ? listing_url
-      : `https://telehub.to${listing_url}`
-
-    const payload = {
-      username: "TeleHub",
-      content: `🔥 **${title || "A Telegram channel"}** was just voted on TeleHub!`,
-      embeds: [
-        {
-          title: title || "Telegram Channel",
-          url: safeListingUrl,
-          description:
-            (description || "A Telegram community was recently voted on TeleHub.").slice(0, 250),
-          color: 2260697,
-          image: image_url ? { url: image_url } : undefined,
-          fields: [
-            {
-              name: "Votes",
-              value: String(votes_count || 0),
-              inline: true,
-            },
-            {
-              name: "Members",
-              value: member_count
-                ? Number(member_count).toLocaleString()
-                : "Updating",
-              inline: true,
-            },
-            {
-              name: "Categories",
-              value:
-                Array.isArray(categories) && categories.length
-                  ? categories.slice(0, 5).join(", ")
-                  : "General",
-              inline: false,
-            },
-          ],
-          footer: {
-            text: "Recently voted on TeleHub",
-          },
-          timestamp: new Date().toISOString(),
-        },
-      ],
-      components: [
-        {
-          type: 1,
-          components: [
-            {
-              type: 2,
-              style: 5,
-              label: "View on TeleHub",
-              url: safeListingUrl,
-            },
-            {
-              type: 2,
-              style: 5,
-              label: "Join Telegram",
-              url: safeTelegramLink,
-            },
-          ],
-        },
-      ],
-    }
-
-    console.log("Sending payload to Discord...")
-
-    const response = await fetch(webhookUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(payload),
-    })
-
-    const text = await response.text()
-
-    console.log("Discord webhook status:", response.status)
-    console.log("Discord webhook response:", text)
-
-    if (!response.ok) {
-      return res.status(500).json({ error: text })
-    }
-
-    return res.json({ ok: true })
-  } catch (err) {
-    console.error("Discord vote feed error:", err)
-    return res.status(500).json({ error: err.message })
-  }
-})
-
-const crypto = require("crypto")
-
-const REFERRAL_DAILY_CAP = 50
-const REFERRAL_WINDOW_HOURS = 24
-
-function cleanReferralCode(value) {
-  return String(value || "")
-    .toLowerCase()
-    .trim()
-    .replace(/[^a-z0-9-]+/g, "-")
-    .replace(/-+/g, "-")
-    .replace(/^-+|-+$/g, "")
-}
-
-
-// ========================================
-// FRAMER CMS SYNC v8 - clean URLs, CMS images, and CMS deletion
-// ========================================
-
-const FRAMER_COLLECTION_NAME = process.env.FRAMER_COLLECTION_NAME || "Channel Listings"
-let framerSyncChain = Promise.resolve()
-
-function queueFramerSync(work) {
-  const next = framerSyncChain.then(work, work)
-  framerSyncChain = next.catch(() => {})
-  return next
-}
-
-
-const FRAMER_CONTENT_FIELDS = new Set([
-  "channel_name",
-  "telegram_title",
-  "description",
-  "long_description",
-  "telegram_description",
-  "categories",
-  "image_url",
-  "icon_url",
-  "telegram_username",
-  "telegram_link",
-  "listing_type",
-  "is_nsfw",
-  "paid_rank",
-  "paid_rank_status",
-  "status",
-])
-
-function shouldSyncFramerForChangedFields(changedFields) {
-  return (changedFields || []).some((field) =>
-    FRAMER_CONTENT_FIELDS.has(String(field || "").trim())
-  )
-}
-
-function cleanCmsSlug(value) {
-  return String(value || "")
-    .toLowerCase()
-    .trim()
-    .replace(/&/g, " and ")
-    .replace(/[^a-z0-9-]+/g, "-")
-    .replace(/-+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 80)
-}
-
-function stripTelegramHandle(linkOrUsername) {
-  if (!linkOrUsername) return ""
-  return String(linkOrUsername)
-    .replace("https://t.me/", "")
-    .replace("http://t.me/", "")
-    .replace("t.me/", "")
-    .replace("@", "")
-    .split("?")[0]
-    .split("/")[0]
-    .trim()
-}
-
-function boolValue(value) {
-  return value === true || String(value).toLowerCase() === "true"
-}
-
-function compactCmsString(value, fallback = "") {
-  if (value === null || value === undefined) return fallback
-  return String(value)
-}
-
-function getFieldByName(fields, name) {
-  const target = String(name || "").trim().toLowerCase()
-  return fields.find((field) => String(field.name || "").trim().toLowerCase() === target)
-}
-
-function addCmsField(fieldData, fields, fieldName, value) {
-  const field = getFieldByName(fields, fieldName)
-  if (!field) return
-  if (value === undefined || value === null) return
-
-  const fieldType = field.type || "string"
-  if (fieldType === "unsupported") return
-
-  // Image fields must be handled by addCmsImageField so the typed CMS value is correct.
-  if (fieldType === "image") return
-
-  let finalValue = value
-
-  if (fieldType === "number") {
-    finalValue = Number(value || 0)
-    if (!Number.isFinite(finalValue)) finalValue = 0
-  } else if (fieldType === "boolean") {
-    finalValue = boolValue(value)
-  } else if (fieldType === "date") {
-    try {
-      finalValue = value ? new Date(value).toISOString() : undefined
-      if (!finalValue || finalValue === "Invalid Date") return
-    } catch {
-      return
-    }
-  } else {
-    finalValue = compactCmsString(value)
-  }
-
-  fieldData[field.id] = {
-    type: fieldType,
-    value: finalValue,
-  }
-}
-
-async function addCmsImageField(fieldData, fields, framer, fieldName, imageUrl, altText, options = {}) {
-  const required = options.required === true
-  const field = getFieldByName(fields, fieldName)
-
-  if (!field) {
-    const message = `Framer image field not found: ${fieldName}`
-    console.warn(message)
-    return { ok: false, skipped: !required, error: message }
-  }
-
-  if (!imageUrl) {
-    const message = `No image URL provided for ${fieldName}`
-
-    // Optional fields like Background Image can be blank without failing the sync.
-    if (required) console.warn(message)
-
-    // Clear image fields when there is no optional image instead of leaving stale data.
-    if (field.type === "image" && !required) {
-      fieldData[field.id] = {
-        type: "image",
-        value: null,
-      }
-    }
-
-    return { ok: false, skipped: !required, error: message }
-  }
-
-  const cleanImageUrl = String(imageUrl).trim()
-
-  if (!/^https?:\/\//i.test(cleanImageUrl)) {
-    const message = `Invalid image URL for ${fieldName}: ${cleanImageUrl}`
-    console.warn(message)
-    return { ok: false, skipped: !required, error: message }
-  }
-
-  // If this CMS field is URL/text instead of Image, save the URL normally.
-  if (field.type !== "image") {
-    addCmsField(fieldData, fields, fieldName, cleanImageUrl)
-    return {
-      ok: true,
-      warning: `${fieldName} is ${field.type}, so the image URL was saved as text/URL.`,
-      value: cleanImageUrl,
-    }
-  }
-
-  try {
-    // Framer CMS image fields currently expect the typed value to be null or a string.
-    // Sending the full ImageAsset object causes the typia "expect null | string" error.
-    // The Supabase Storage URL is public, so pass the public URL string directly.
-    fieldData[field.id] = {
-      type: "image",
-      value: cleanImageUrl,
-    }
-
-    console.log(`Prepared Framer image field ${fieldName}:`, cleanImageUrl)
-
-    return { ok: true, value: cleanImageUrl }
-  } catch (err) {
-    const message = `Could not prepare Framer image for ${fieldName}: ${err.message}`
-    console.error(message, err)
-    return { ok: false, skipped: !required, error: message }
-  }
-}
-
-function buildCmsText(listing) {
-  const name =
-    listing.channel_name ||
-    listing.telegram_title ||
-    "Telegram Listing"
-
-  const listingType = String(
-    listing.listing_type || "channel"
-  ).toLowerCase()
-
-  const typeTitle =
-    listingType.charAt(0).toUpperCase() + listingType.slice(1)
-
-  const categories = Array.isArray(listing.categories)
-    ? listing.categories.filter(Boolean).join(", ")
-    : compactCmsString(listing.categories, "General")
-
-  const description =
-    listing.long_description ||
-    listing.telegram_description ||
-    listing.description ||
-    `${name} is a Telegram ${listingType} listed on TeleHub.`
-
-  const shortDescription =
-    listing.description ||
-    listing.telegram_description ||
-    `View ${name} on TeleHub.`
-
-  const memberCount = Number(listing.member_count || 0)
-
-  return {
-    name,
-    listingType,
-    typeTitle,
-    categories,
-    description,
-    shortDescription,
-    memberCount,
-    seoTitle: `${name} Telegram ${typeTitle}`,
-    seoDescription: `View ${name} on TeleHub, including its Telegram link, description, category, member count, and listing details.`,
-    introText: `${name} is a Telegram ${listingType} listed on TeleHub. View its description, category, member count, and Telegram join link.`,
-    safetyNote:
-      "TeleHub helps users discover Telegram communities, but users should review each community before joining. Report misleading, unsafe, or inappropriate listings.",
-    faq1Question: `How do I join ${name}?`,
-    faq1Answer: `Click the join button to open ${name} on Telegram.`,
-    faq2Question: `Is ${name} NSFW?`,
-    faq2Answer: boolValue(listing.is_nsfw)
-      ? `Yes, ${name} is marked as NSFW. This means it may contain adult, mature, or sensitive content.`
-      : `No, ${name} is not marked as NSFW. Users should still review the community before joining.`,
-    faq3Question: `What category is ${name} in?`,
-    faq3Answer: `${name} is listed under ${
-      categories || "General"
-    } on TeleHub.`,
-  }
-}
-async function ensureUniqueShortInvite(listing) {
-  const displayName = listing.telegram_title || listing.channel_name || "telegram-listing"
-  let base = cleanCmsSlug(listing.short_invite || displayName)
-
-  if (!base) {
-    base = `telegram-listing-${String(listing.id || Date.now()).replace(/[^a-z0-9]/gi, "").slice(0, 8)}`
-  }
-
-  let candidate = base
-  let counter = 2
-
-  while (true) {
-    const { data, error } = await supabaseAdmin
-      .from("channel_listings")
-      .select("id")
-      .eq("short_invite", candidate)
-      .neq("id", listing.id)
-      .maybeSingle()
-
-    if (error) throw error
-    if (!data) break
-
-    candidate = `${base}-${counter}`
-    counter += 1
-  }
-
-  if (candidate !== listing.short_invite) {
-    const { error } = await supabaseAdmin
-      .from("channel_listings")
-      .update({
-        short_invite: candidate,
-        updated_at: new Date().toISOString(),
-      })
-      .eq("id", listing.id)
-
-    if (error) throw error
-  }
-
-  return candidate
-}
-
-async function getFramerCollection(framer) {
-  const collections = await framer.getCollections()
-  const collection = collections.find(
-    (item) => String(item.name || "").trim().toLowerCase() === FRAMER_COLLECTION_NAME.toLowerCase()
-  )
-
-  if (!collection) {
-    throw new Error(`Framer CMS collection not found: ${FRAMER_COLLECTION_NAME}`)
-  }
-
-  return collection
-}
-
-async function syncListingToFramerCMS(listingId, options = {}) {
-  if (!process.env.FRAMER_API_KEY || !process.env.FRAMER_PROJECT_URL) {
-    throw new Error("Missing FRAMER_API_KEY or FRAMER_PROJECT_URL in Render environment variables.")
-  }
-
-  const { data: existingListing, error: listingError } = await supabaseAdmin
-    .from("channel_listings")
-    .select("*")
-    .eq("id", listingId)
-    .single()
-
-  if (listingError) throw listingError
-  if (!existingListing) throw new Error("Listing not found.")
-  if (existingListing.status !== "approved") {
-    throw new Error("Only approved listings can be synced to Framer CMS.")
-  }
-  if (existingListing.is_banned) {
-    throw new Error("Banned listings cannot be synced to Framer CMS.")
-  }
-
-  await supabaseAdmin
-    .from("channel_listings")
-    .update({
-      framer_sync_status: "syncing",
-      framer_sync_error: null,
-      updated_at: new Date().toISOString(),
-    })
-    .eq("id", listingId)
-
-  let telegramSyncWarning = null
-
-  try {
-    await syncListingTelegramData(existingListing)
-  } catch (err) {
-    telegramSyncWarning = err.message
-    console.warn("Telegram sync before Framer CMS sync failed:", err.message)
-  }
-
-  const { data: listing, error: freshError } = await supabaseAdmin
-    .from("channel_listings")
-    .select("*")
-    .eq("id", listingId)
-    .single()
-
-  if (freshError) throw freshError
-
-  const cmsSlug = await ensureUniqueShortInvite(listing)
-  const cms = buildCmsText({ ...listing, short_invite: cmsSlug })
-  const telegramUsername =
-    listing.telegram_username ||
-    (stripTelegramHandle(listing.telegram_link)
-      ? `@${stripTelegramHandle(listing.telegram_link)}`
-      : "")
-  // Telegram icon is the actual channel/group avatar pulled from Telegram.
-  // Uploaded user image remains separate as the optional background/banner image.
-  const telegramIconUrl = String(listing.icon_url || "").trim()
-  const uploadedBackgroundUrl = String(listing.image_url || "").trim()
-
-  const { connect } = await import("framer-api")
-  const framer = await connect(process.env.FRAMER_PROJECT_URL, process.env.FRAMER_API_KEY)
-
-  try {
-    const collection = await getFramerCollection(framer)
-    const fields = await collection.getFields()
-
-    console.log(
-      "FRAMER CMS FIELDS:",
-      fields.map((field) => ({
-        id: field.id,
-        name: field.name,
-        type: field.type,
-      }))
-    )
-    console.log("TELEGRAM ICON URL FOR CMS:", telegramIconUrl)
-    console.log("BACKGROUND IMAGE URL FOR CMS:", uploadedBackgroundUrl)
-
-    const fieldData = {}
-
-    addCmsField(fieldData, fields, "Name", cms.name)
-    addCmsField(fieldData, fields, "Supabase Listing ID", String(listing.id))
-    addCmsField(fieldData, fields, "Original App Slug", listing.slug || "")
-    addCmsField(fieldData, fields, "Description", cms.description)
-    addCmsField(fieldData, fields, "Short Description", cms.shortDescription)
-    addCmsField(fieldData, fields, "Telegram URL", listing.telegram_link || "")
-    addCmsField(fieldData, fields, "Telegram Username", telegramUsername)
-    addCmsField(fieldData, fields, "Listing Type", cms.listingType)
-    addCmsField(fieldData, fields, "Category", cms.categories || "General")
-
-    // IMPORTANT:
-    // Icon Image = Telegram channel/group avatar from listing.icon_url.
-    // Background Image URL = optional user-uploaded background/banner from listing.image_url.
-    // Both can be Framer Image fields. For Image fields, we pass the public image URL string.
-    const iconImageResult = await addCmsImageField(
-      fieldData,
-      fields,
-      framer,
-      "Icon Image",
-      telegramIconUrl,
-      `${cms.name} Telegram icon`,
-      { required: true }
-    )
-
-    const backgroundImageResult = await addCmsImageField(
-      fieldData,
-      fields,
-      framer,
-      "Background Image URL",
-      uploadedBackgroundUrl,
-      `${cms.name} background image`,
-      { required: false }
-    )
-
-    // Extra URL/text fallbacks if those fields exist in your CMS.
-    addCmsField(fieldData, fields, "Icon Image URL", telegramIconUrl)
-    addCmsField(fieldData, fields, "Telegram Icon URL", telegramIconUrl)
-    addCmsField(fieldData, fields, "Icon URL", telegramIconUrl)
-    addCmsField(fieldData, fields, "Background Image URL Text", uploadedBackgroundUrl)
-
-    addCmsField(fieldData, fields, "Member Count", cms.memberCount)
-    addCmsField(fieldData, fields, "Votes Count", Number(listing.votes_count || 0))
-    addCmsField(fieldData, fields, "Paid Rank", listing.paid_rank || "free")
-    addCmsField(fieldData, fields, "Status", listing.status || "approved")
-    addCmsField(fieldData, fields, "Is NSFW", boolValue(listing.is_nsfw))
-    addCmsField(fieldData, fields, "Short Invite", cmsSlug)
-    addCmsField(fieldData, fields, "Created At", listing.created_at || new Date().toISOString())
-    addCmsField(fieldData, fields, "Last Synced At", listing.last_synced_at || new Date().toISOString())
-    addCmsField(fieldData, fields, "SEO Title", cms.seoTitle)
-    addCmsField(fieldData, fields, "SEO Description", cms.seoDescription)
-    addCmsField(fieldData, fields, "Intro Text", cms.introText)
-    addCmsField(fieldData, fields, "Safety Note", cms.safetyNote)
-    addCmsField(fieldData, fields, "FAQ 1 Question", cms.faq1Question)
-    addCmsField(fieldData, fields, "FAQ 1 Answer", cms.faq1Answer)
-    addCmsField(fieldData, fields, "FAQ 2 Question", cms.faq2Question)
-    addCmsField(fieldData, fields, "FAQ 2 Answer", cms.faq2Answer)
-    addCmsField(fieldData, fields, "FAQ 3 Question", cms.faq3Question)
-    addCmsField(fieldData, fields, "FAQ 3 Answer", cms.faq3Answer)
-
-    // Framer unmanaged CMS collections create new items when no item id is provided.
-    // Only include an id when we have confirmed that item already exists in Framer.
-    const existingItems = await collection.getItems()
-    const existingCmsItem =
-      existingItems.find((item) => item.slug === cmsSlug) ||
-      (listing.framer_cms_item_id
-        ? existingItems.find((item) => item.id === listing.framer_cms_item_id)
-        : null)
-
-    const itemPayload = {
-      slug: cmsSlug,
-      fieldData,
-    }
-
-    if (existingCmsItem?.id) {
-      itemPayload.id = existingCmsItem.id
-    }
-
-    await collection.addItems([itemPayload])
-
-    let framerCmsItemId = existingCmsItem?.id || null
-
-    if (!framerCmsItemId) {
-      const itemsAfterCreate = await collection.getItems()
-      const createdItem = itemsAfterCreate.find((item) => item.slug === cmsSlug)
-      framerCmsItemId = createdItem?.id || null
-    }
-
-    let deployed = false
-
-    if (process.env.FRAMER_AUTO_DEPLOY !== "false" && options.publish !== false) {
-      const publication = await framer.publish()
-      await framer.deploy(publication.deployment.id)
-      deployed = true
-    }
-
-    const now = new Date().toISOString()
-    const framerWarnings = []
-
-    if (telegramSyncWarning) {
-      framerWarnings.push(`Telegram sync warning: ${telegramSyncWarning}`)
-    }
-
-    if (!iconImageResult.ok) {
-      framerWarnings.push(`Icon Image warning: ${iconImageResult.error}`)
-    }
-
-    if (!backgroundImageResult.ok && !backgroundImageResult.skipped) {
-      framerWarnings.push(`Background Image warning: ${backgroundImageResult.error}`)
-    }
-
-    await supabaseAdmin
-      .from("channel_listings")
-      .update({
-        short_invite: cmsSlug,
-        framer_cms_item_id: framerCmsItemId,
-        framer_sync_status: "synced",
-        framer_synced_at: now,
-        framer_sync_error: framerWarnings.length ? framerWarnings.join(" | ") : null,
-        updated_at: now,
-      })
-      .eq("id", listing.id)
-
-    return {
-      ok: true,
-      slug: cmsSlug,
-      url: `https://telehub.to/channel/${cmsSlug}`,
-      deployed,
-      framer_cms_item_id: framerCmsItemId,
-      icon_image: iconImageResult,
-      background_image: backgroundImageResult,
-      framer_sync_warning: framerWarnings.length ? framerWarnings.join(" | ") : null,
-      telegram_sync_warning: telegramSyncWarning,
-    }
-  } catch (err) {
-    await supabaseAdmin
-      .from("channel_listings")
-      .update({
-        framer_sync_status: "failed",
-        framer_sync_error: err.message,
-        updated_at: new Date().toISOString(),
-      })
-      .eq("id", listing.id)
-
-    throw err
-  } finally {
-    await framer.disconnect()
-  }
-}
-
-
-function getCmsItemFieldValue(item, fieldId) {
-  if (!item || !fieldId) return null
-  const fieldData = item.fieldData || {}
-  const rawValue = fieldData[fieldId]
-
-  if (rawValue && typeof rawValue === "object" && "value" in rawValue) {
-    return rawValue.value
-  }
-
-  return rawValue ?? null
-}
-
-function uniqueValues(values) {
-  return [...new Set(values.filter((value) => value !== null && value !== undefined && String(value).trim() !== "").map((value) => String(value).trim()))]
-}
-
-async function findFramerCmsItemForListing(collection, fields, listing) {
-  const items = await collection.getItems()
-  const supabaseIdField = getFieldByName(fields, "Supabase Listing ID")
-
-  const possibleIds = uniqueValues([
-    listing.framer_cms_item_id,
-  ])
-
-  const possibleSlugs = uniqueValues([
-    listing.short_invite,
-    cleanCmsSlug(listing.short_invite),
-    listing.slug,
-    cleanCmsSlug(listing.slug),
-  ])
-
-  const possibleSupabaseIds = uniqueValues([
-    listing.id,
-  ])
-
-  const itemById = items.find((item) => possibleIds.includes(String(item.id || "")))
-  if (itemById) return itemById
-
-  const itemBySlug = items.find((item) => possibleSlugs.includes(String(item.slug || "")))
-  if (itemBySlug) return itemBySlug
-
-  if (supabaseIdField?.id) {
-    const itemBySupabaseId = items.find((item) =>
-      possibleSupabaseIds.includes(String(getCmsItemFieldValue(item, supabaseIdField.id) || ""))
-    )
-    if (itemBySupabaseId) return itemBySupabaseId
-  }
-
-  return null
-}
-
-async function publishFramerIfNeeded(framer, options = {}) {
-  if (process.env.FRAMER_AUTO_DEPLOY === "false" || options.publish === false) {
-    return false
-  }
-
-  const publication = await framer.publish()
-  await framer.deploy(publication.deployment.id)
-  return true
-}
-
-async function deleteListingFromFramerCMS(listing, options = {}) {
-  if (!process.env.FRAMER_API_KEY || !process.env.FRAMER_PROJECT_URL) {
-    throw new Error("Missing FRAMER_API_KEY or FRAMER_PROJECT_URL in Render environment variables.")
-  }
-
-  const { connect } = await import("framer-api")
-  const framer = await connect(process.env.FRAMER_PROJECT_URL, process.env.FRAMER_API_KEY)
-
-  try {
-    const collection = await getFramerCollection(framer)
-    const fields = await collection.getFields()
-    const cmsItem = await findFramerCmsItemForListing(collection, fields, listing)
-
-    if (!cmsItem?.id) {
-      console.warn("No matching Framer CMS item found for deleted listing:", {
-        id: listing.id,
-        short_invite: listing.short_invite,
-        slug: listing.slug,
-        framer_cms_item_id: listing.framer_cms_item_id,
-      })
-
-      return {
-        ok: true,
-        found: false,
-        deleted: false,
-        deployed: false,
-        message: "No matching Framer CMS item was found. Supabase listing can still be deleted.",
-      }
-    }
-
-    if (typeof collection.removeItems !== "function") {
-      throw new Error("Framer collection.removeItems is unavailable. Update framer-api or check the collection type.")
-    }
-
-    await collection.removeItems([cmsItem.id])
-    const deployed = await publishFramerIfNeeded(framer, options)
-
-    return {
-      ok: true,
-      found: true,
-      deleted: true,
-      deployed,
-      framer_cms_item_id: cmsItem.id,
-      framer_slug: cmsItem.slug || null,
-    }
-  } finally {
-    await framer.disconnect()
-  }
-}
-
-async function safeDeleteRelatedRows(tableName, listingId) {
-  const { error } = await supabaseAdmin
-    .from(tableName)
-    .delete()
-    .eq("listing_id", listingId)
-
-  if (error) {
-    // Do not make the delete fail just because an optional related table does not exist
-    // or does not use listing_id. The final channel_listings delete will catch real FK problems.
-    if (["42P01", "42703"].includes(error.code)) {
-      console.warn(`Skipping optional related delete for ${tableName}:`, error.message)
-      return { table: tableName, ok: false, skipped: true, error: error.message }
-    }
-
-    throw error
-  }
-
-  return { table: tableName, ok: true }
-}
-
-async function deleteListingEverywhere(listing, options = {}) {
-  const framerResult = await deleteListingFromFramerCMS(listing, options)
-
-  const relatedTables = [
-    "listing_referral_clicks",
-    "channel_member_snapshots",
-    "channel_votes",
-    "channel_listing_changes",
-  ]
-
-  const relatedDeletes = []
-
-  for (const tableName of relatedTables) {
-    relatedDeletes.push(await safeDeleteRelatedRows(tableName, listing.id))
-  }
-
-  const { error: listingDeleteError } = await supabaseAdmin
-    .from("channel_listings")
-    .delete()
-    .eq("id", listing.id)
-
-  if (listingDeleteError) throw listingDeleteError
-
-  let homepageCache = null
-
-  try {
-    homepageCache = await updateHomepageListingCache()
-  } catch (cacheErr) {
-    console.error("Homepage cache refresh after listing delete failed:", cacheErr.message)
-  }
-
-  return {
-    ok: true,
-    listing_id: listing.id,
-    short_invite: listing.short_invite || null,
-    framer: framerResult,
-    related_deletes: relatedDeletes,
-    homepage_cache: homepageCache
-      ? {
-          updated_at: homepageCache.updated_at,
-          count: homepageCache.listings.length,
-        }
-      : null,
-  }
-}
-
-app.post("/api/framer/sync-listing", async (req, res) => {
-  try {
-    const authHeader = req.headers.authorization || ""
-    const token = authHeader.replace("Bearer ", "")
-    const { listing_id } = req.body || {}
-
-    if (!token) {
-      return res.status(401).json({ error: "Missing auth token." })
-    }
-
-    if (!listing_id) {
-      return res.status(400).json({ error: "Missing listing_id." })
-    }
-
-    const {
-      data: { user },
-      error: userError,
-    } = await supabaseAdmin.auth.getUser(token)
-
-    if (userError || !user) {
-      return res.status(401).json({ error: "Invalid auth token." })
-    }
-
-    const { data: listing, error: listingError } = await supabaseAdmin
-      .from("channel_listings")
-      .select("id, user_id")
-      .eq("id", listing_id)
-      .single()
-
-    if (listingError || !listing) {
-      return res.status(404).json({ error: "Listing not found." })
-    }
-
-    const email = (user.email || "").toLowerCase()
-    const isAdmin = ADMIN_EMAILS.includes(email)
-
-    if (listing.user_id !== user.id && !isAdmin) {
-      return res.status(403).json({ error: "You do not own this listing." })
-    }
-
-    const result = await queueFramerSync(() => syncListingToFramerCMS(listing_id))
-
-    return res.json(result)
-  } catch (err) {
-    console.error("Framer listing sync error:", err)
-    return res.status(500).json({ error: err.message })
-  }
-})
-
-
-// Call this after an existing listing edit is saved.
-// It skips Framer when only dynamic values such as member_count or votes_count changed.
-app.post("/api/framer/sync-content-change", async (req, res) => {
-  try {
-    const authHeader = req.headers.authorization || ""
-    const token = authHeader.replace("Bearer ", "")
-    const { listing_id, changed_fields } = req.body || {}
-
-    if (!token) {
-      return res.status(401).json({ error: "Missing auth token." })
-    }
-
-    if (!listing_id) {
-      return res.status(400).json({ error: "Missing listing_id." })
-    }
-
-    const {
-      data: { user },
-      error: userError,
-    } = await supabaseAdmin.auth.getUser(token)
-
-    if (userError || !user) {
-      return res.status(401).json({ error: "Invalid auth token." })
-    }
-
-    const { data: listing, error: listingError } = await supabaseAdmin
-      .from("channel_listings")
-      .select("id, user_id, status, is_banned")
-      .eq("id", listing_id)
-      .single()
-
-    if (listingError || !listing) {
-      return res.status(404).json({ error: "Listing not found." })
-    }
-
-    const email = (user.email || "").toLowerCase()
-    const isAdmin = ADMIN_EMAILS.includes(email)
-
-    if (listing.user_id !== user.id && !isAdmin) {
-      return res.status(403).json({ error: "You do not own this listing." })
-    }
-
-    const cleanChangedFields = Array.isArray(changed_fields)
-      ? changed_fields.map((field) => String(field || "").trim()).filter(Boolean)
-      : []
-
-    if (!shouldSyncFramerForChangedFields(cleanChangedFields)) {
-      return res.json({
-        ok: true,
-        synced: false,
-        reason: "No Framer-visible listing fields changed.",
-        changed_fields: cleanChangedFields,
-      })
-    }
-
-    if (listing.status !== "approved" || listing.is_banned) {
-      return res.json({
-        ok: true,
-        synced: false,
-        reason: "Listing is not currently eligible for Framer CMS sync.",
-        changed_fields: cleanChangedFields,
-      })
-    }
-
-    const result = await queueFramerSync(() =>
-      syncListingToFramerCMS(listing_id)
-    )
-
-    return res.json({
-      ok: true,
-      synced: true,
-      changed_fields: cleanChangedFields,
-      framer: result,
-    })
-  } catch (err) {
-    console.error("Framer content-change sync error:", err)
-    return res.status(500).json({ error: err.message })
-  }
-})
-
-
-app.post("/api/listings/delete", async (req, res) => {
-  try {
-    const authHeader = req.headers.authorization || ""
-    const token = authHeader.replace("Bearer ", "")
-    const { listing_id } = req.body || {}
-
-    if (!token) {
-      return res.status(401).json({ error: "Missing auth token." })
-    }
-
-    if (!listing_id) {
-      return res.status(400).json({ error: "Missing listing_id." })
-    }
-
-    const {
-      data: { user },
-      error: userError,
-    } = await supabaseAdmin.auth.getUser(token)
-
-    if (userError || !user) {
-      return res.status(401).json({ error: "Invalid auth token." })
-    }
-
-    const { data: listing, error: listingError } = await supabaseAdmin
-      .from("channel_listings")
-      .select("*")
-      .eq("id", listing_id)
-      .single()
-
-    if (listingError || !listing) {
-      return res.status(404).json({ error: "Listing not found." })
-    }
-
-    const email = (user.email || "").toLowerCase()
-    const isAdmin = ADMIN_EMAILS.includes(email)
-
-    if (listing.user_id !== user.id && !isAdmin) {
-      return res.status(403).json({ error: "You do not own this listing." })
-    }
-
-    const result = await queueFramerSync(() => deleteListingEverywhere(listing))
-
-    return res.json(result)
-  } catch (err) {
-    console.error("Delete listing everywhere error:", err)
-    return res.status(500).json({ error: err.message })
-  }
-})
-
-app.post("/api/framer/delete-listing", async (req, res) => {
-  try {
-    // Backward-compatible alias for the same delete behavior.
-    const authHeader = req.headers.authorization || ""
-    const token = authHeader.replace("Bearer ", "")
-    const { listing_id } = req.body || {}
-
-    if (!token) {
-      return res.status(401).json({ error: "Missing auth token." })
-    }
-
-    if (!listing_id) {
-      return res.status(400).json({ error: "Missing listing_id." })
-    }
-
-    const {
-      data: { user },
-      error: userError,
-    } = await supabaseAdmin.auth.getUser(token)
-
-    if (userError || !user) {
-      return res.status(401).json({ error: "Invalid auth token." })
-    }
-
-    const { data: listing, error: listingError } = await supabaseAdmin
-      .from("channel_listings")
-      .select("*")
-      .eq("id", listing_id)
-      .single()
-
-    if (listingError || !listing) {
-      return res.status(404).json({ error: "Listing not found." })
-    }
-
-    const email = (user.email || "").toLowerCase()
-    const isAdmin = ADMIN_EMAILS.includes(email)
-
-    if (listing.user_id !== user.id && !isAdmin) {
-      return res.status(403).json({ error: "You do not own this listing." })
-    }
-
-    const result = await queueFramerSync(() => deleteListingEverywhere(listing))
-
-    return res.json(result)
-  } catch (err) {
-    console.error("Framer delete listing error:", err)
-    return res.status(500).json({ error: err.message })
-  }
-})
-
-app.post("/api/framer/sync-all-listings", async (req, res) => {
-  try {
-    if (req.headers.authorization !== `Bearer ${process.env.CRON_SECRET}`) {
-      return res.status(401).json({ error: "Unauthorized" })
-    }
-
-    const { data: listings, error } = await supabaseAdmin
-      .from("channel_listings")
-      .select("id")
-      .eq("status", "approved")
-      .or("is_banned.is.null,is_banned.eq.false")
-
-    if (error) throw error
-
-    const results = []
-
-    for (const listing of listings || []) {
-      try {
-        const result = await queueFramerSync(() =>
-          syncListingToFramerCMS(listing.id, { publish: false })
-        )
-        results.push({ id: listing.id, ok: true, slug: result.slug })
-      } catch (err) {
-        results.push({ id: listing.id, ok: false, error: err.message })
-      }
-    }
-
-    let deployed = false
-
-    if (process.env.FRAMER_AUTO_DEPLOY !== "false") {
-      const { connect } = await import("framer-api")
-      const framer = await connect(process.env.FRAMER_PROJECT_URL, process.env.FRAMER_API_KEY)
-      try {
-        const publication = await framer.publish()
-        await framer.deploy(publication.deployment.id)
-        deployed = true
-      } finally {
-        await framer.disconnect()
-      }
-    }
-
-    return res.json({ ok: true, deployed, count: results.length, results })
-  } catch (err) {
-    console.error("Framer sync-all error:", err)
-    return res.status(500).json({ error: err.message })
-  }
-})
-
-// Schedule this endpoint once per day at midnight.
-// It performs the intentionally expensive full Telegram metadata + Framer CMS refresh.
-app.get("/api/cron/daily-full-sync", async (req, res) => {
-  try {
-    if (req.query.secret !== process.env.CRON_SECRET) {
-      return res.status(401).json({ error: "Unauthorized" })
-    }
-
-    const { data: listings, error } = await supabaseAdmin
-      .from("channel_listings")
-      .select("id")
-      .eq("status", "approved")
-      .or("is_banned.is.null,is_banned.eq.false")
-
-    if (error) throw error
-
-    const startedAt = Date.now()
-    const results = []
-
-    // Keep Framer work serialized for safety. This job runs only once per day.
-    for (const listing of listings || []) {
-      try {
-        const result = await queueFramerSync(() =>
-          syncListingToFramerCMS(listing.id, { publish: false })
-        )
-
-        results.push({
-          id: listing.id,
-          ok: true,
-          slug: result.slug,
-        })
-      } catch (err) {
-        results.push({
-          id: listing.id,
-          ok: false,
-          error: err.message,
-        })
-      }
-    }
-
-    let deployed = false
-
-    if (process.env.FRAMER_AUTO_DEPLOY !== "false") {
-      const { connect } = await import("framer-api")
-      const framer = await connect(
-        process.env.FRAMER_PROJECT_URL,
-        process.env.FRAMER_API_KEY
-      )
-
-      try {
-        const publication = await framer.publish()
-        await framer.deploy(publication.deployment.id)
-        deployed = true
-      } finally {
-        await framer.disconnect()
-      }
-    }
-
-    let homepageCache = null
-
-    try {
-      homepageCache = await updateHomepageListingCache()
-    } catch (cacheErr) {
-      console.error("Homepage cache refresh after daily full sync failed:", cacheErr)
-    }
-
-    return res.json({
-      ok: true,
-      full_sync: true,
-      deployed,
-      count: results.length,
-      succeeded: results.filter((item) => item.ok).length,
-      failed: results.filter((item) => !item.ok).length,
-      duration_ms: Date.now() - startedAt,
-      results,
-      homepage_cache: homepageCache
-        ? {
-            updated_at: homepageCache.updated_at,
-            count: homepageCache.listings.length,
-          }
-        : null,
-    })
-  } catch (err) {
-    console.error("Daily full sync error:", err)
-    return res.status(500).json({ error: err.message })
-  }
-})
-
-
-function shouldResetReferralWindow(listing) {
-  const now = new Date()
-
-  // Arizona timezone
-  const arizonaNow = new Date(
-    now.toLocaleString("en-US", {
-      timeZone: "America/Phoenix",
-    })
-  )
-
-  // Today's midnight in Arizona
-  const arizonaMidnight = new Date(arizonaNow)
-  arizonaMidnight.setHours(0, 0, 0, 0)
-
-  if (!listing.referral_last_reset) {
-    return true
-  }
-
-  const lastReset = new Date(listing.referral_last_reset)
-
-  // Convert last reset into Arizona timezone
-  const arizonaLastReset = new Date(
-    lastReset.toLocaleString("en-US", {
-      timeZone: "America/Phoenix",
-    })
-  )
-
-  // Reset once calendar day changes in Arizona
-  return arizonaLastReset < arizonaMidnight
-}
-
-function hashValue(value) {
-  if (!value) return null
-
-  return crypto
-    .createHash("sha256")
-    .update(String(value))
-    .digest("hex")
-}
-
-function getClientIp(req) {
-  const forwarded = req.headers["x-forwarded-for"]
-
-  if (forwarded) {
-    return forwarded.split(",")[0].trim()
-  }
-
-  return req.socket?.remoteAddress || null
-}
-
-function cleanVisitorId(value) {
-  return String(value || "")
-    .trim()
-    .replace(/[^a-zA-Z0-9_-]/g, "")
-    .slice(0, 80)
-}
-
-app.get("/api/referrals/track", async (req, res) => {
-  try {
-    const code = cleanReferralCode(req.query.code)
-    const visitorId = cleanVisitorId(req.query.visitor_id)
-
-    if (!code) {
-      return res.status(400).json({ error: "Missing referral code" })
-    }
-
-    const { data: listing, error } = await supabaseAdmin
-      .from("channel_listings")
-      .select("*")
-      .eq("short_invite", code)
-      .eq("status", "approved")
-      .maybeSingle()
-
-    if (error) throw error
-
-    if (!listing || listing.is_banned) {
-      return res.status(404).json({ error: "Invite not found" })
-    }
-
-    const nowDate = new Date()
-    const now = nowDate.toISOString()
-    const resetNeeded = shouldResetReferralWindow(listing)
-
-    const windowStartDate = resetNeeded
-      ? nowDate
-      : new Date(listing.referral_last_reset || now)
-
-    const windowStart = windowStartDate.toISOString()
-
-    const ip = getClientIp(req)
-    const userAgent = req.headers["user-agent"] || ""
-
-    const visitorHash = hashValue(visitorId)
-    const ipHash = hashValue(ip)
-    const userAgentHash = hashValue(userAgent)
-    const ipUserAgentHash = hashValue(`${ip || ""}|${userAgent || ""}`)
-
-    const startingClicks = resetNeeded
-      ? 0
-      : Number(listing.referral_clicks_today || 0)
-
-    let alreadyCounted = false
-
-    let duplicateChecks = []
-
-    if (visitorHash) {
-      duplicateChecks.push(`visitor_hash.eq.${visitorHash}`)
-    }
-
-    if (ipHash) {
-      duplicateChecks.push(`ip_hash.eq.${ipHash}`)
-    }
-
-    if (ipUserAgentHash) {
-      duplicateChecks.push(`ip_user_agent_hash.eq.${ipUserAgentHash}`)
-    }
-
-    if (duplicateChecks.length > 0) {
-      const { data: existingClick, error: existingError } = await supabaseAdmin
-        .from("listing_referral_clicks")
-        .select("id")
-        .eq("listing_id", listing.id)
-        .gte("created_at", windowStart)
-        .or(duplicateChecks.join(","))
-        .limit(1)
-        .maybeSingle()
-
-      if (existingError) throw existingError
-
-      alreadyCounted = !!existingClick
-    }
-
-    const canCount =
-      !alreadyCounted &&
-      startingClicks < REFERRAL_DAILY_CAP &&
-      (visitorHash || ipHash || ipUserAgentHash)
-
-    const nextClicks = canCount ? startingClicks + 1 : startingClicks
-    const nextBoost = Math.round(
-      (Math.min(nextClicks, REFERRAL_DAILY_CAP) / REFERRAL_DAILY_CAP) * 100
-    )
-
-    if (canCount) {
-      await supabaseAdmin.from("listing_referral_clicks").insert({
-        listing_id: listing.id,
-        short_invite: code,
-
-        // Keep raw values only if your table already has these columns.
-        // If you prefer privacy-only, remove ip_address and user_agent.
-        ip_address: ip,
-        user_agent: userAgent,
-
-        visitor_hash: visitorHash,
-        ip_hash: ipHash,
-        user_agent_hash: userAgentHash,
-        ip_user_agent_hash: ipUserAgentHash,
-
-        counted: true,
-        created_at: now,
-      })
-    } else {
-      await supabaseAdmin.from("listing_referral_clicks").insert({
-        listing_id: listing.id,
-        short_invite: code,
-        ip_address: ip,
-        user_agent: userAgent,
-        visitor_hash: visitorHash,
-        ip_hash: ipHash,
-        user_agent_hash: userAgentHash,
-        ip_user_agent_hash: ipUserAgentHash,
-        counted: false,
-        created_at: now,
-      })
-    }
-
-    const { error: updateError } = await supabaseAdmin
-      .from("channel_listings")
-      .update({
-        referral_clicks_today: nextClicks,
-        referral_boost_score: nextBoost,
-        referral_last_reset: resetNeeded ? now : listing.referral_last_reset,
-        updated_at: now,
-      })
-      .eq("id", listing.id)
-
-    if (updateError) throw updateError
-
-    return res.json({
-      ok: true,
-      counted: canCount,
-      already_counted: alreadyCounted,
-      telegram_link: listing.telegram_link,
-      clicks_today: nextClicks,
-      boost_percent: nextBoost,
-      daily_cap: REFERRAL_DAILY_CAP,
-    })
-  } catch (err) {
-    console.error("Referral tracking error:", err)
-    return res.status(500).json({ error: err.message })
-  }
-})
-
-
-
-// ========================================
-// RANKING ALGORITHM
-// ========================================
-
-const RANKING_WEIGHTS = {
-  votes: 0.35,
-  referralBoost: 0.25,
-  memberGrowth: 0.25,
-  freshness: 0.15,
-}
-
-function clampNumber(value, min, max) {
-  const num = Number(value || 0)
-  if (!Number.isFinite(num)) return min
-  return Math.max(min, Math.min(max, num))
-}
-
-function normalizeLogScore(value, maxValue) {
-  const num = Math.max(0, Number(value || 0))
-  const max = Math.max(1, Number(maxValue || 1))
-
-  return Math.min(100, (Math.log10(num + 1) / Math.log10(max + 1)) * 100)
-}
-
-function getFreshnessScore(listing) {
-  const dateValue =
-    listing.updated_at ||
-    listing.last_synced_at ||
-    listing.created_at
-
-  if (!dateValue) return 0
-
-  const ageMs = Date.now() - new Date(dateValue).getTime()
-  const ageDays = ageMs / (1000 * 60 * 60 * 24)
-
-  if (!Number.isFinite(ageDays)) return 0
-
-  // Full power when very fresh, fades over 30 days
-  return clampNumber(100 - (ageDays / 30) * 100, 0, 100)
-}
-
-function calculateRankingScore(listing, maxStats) {
-  const voteScore = normalizeLogScore(
-    listing.votes_count || 0,
-    maxStats.maxVotes
-  )
-
-  const referralScore = clampNumber(
-    listing.referral_boost_score || 0,
-    0,
-    100
-  )
-
-  const memberGrowthScore = normalizeLogScore(
-    listing.member_growth_24h || 0,
-    maxStats.maxGrowth
-  )
-
-  const freshnessScore = getFreshnessScore(listing)
-
-  const rankingScore =
-    voteScore * RANKING_WEIGHTS.votes +
-    referralScore * RANKING_WEIGHTS.referralBoost +
-    memberGrowthScore * RANKING_WEIGHTS.memberGrowth +
-    freshnessScore * RANKING_WEIGHTS.freshness
-
-  return {
-    ranking_score: Math.round(rankingScore * 100) / 100,
-    ranking_breakdown: {
-      vote_score: Math.round(voteScore * 100) / 100,
-      referral_score: Math.round(referralScore * 100) / 100,
-      member_growth_score: Math.round(memberGrowthScore * 100) / 100,
-      freshness_score: Math.round(freshnessScore * 100) / 100,
-    },
-  }
-}
-
-
-async function buildHomepageListings(limit = 18) {
-  const cleanLimit = Math.min(Math.max(Number(limit) || 18, 1), 30)
-
-  const { data: listings, error: listingsError } = await supabaseAdmin
-    .from("channel_listings")
-    .select(`
-      id,
-      slug,
-      channel_name,
-      telegram_title,
-      listing_type,
-      telegram_username,
-      telegram_link,
-      description,
-      categories,
-      image_url,
-      icon_url,
-      member_count,
-      votes_count,
-      referral_boost_score,
-      paid_rank,
-      paid_rank_status,
-      is_nsfw,
-      is_banned,
-      status,
-      created_at,
-      updated_at,
-      last_synced_at
-      `)
-    .eq("status", "approved")
-    .or("is_banned.is.null,is_banned.eq.false")
-    .or("is_nsfw.is.null,is_nsfw.eq.false")
-
-  if (listingsError) throw listingsError
-
-  const listingIds = (listings || []).map((item) => item.id)
-
-  let snapshots = []
-
-  if (listingIds.length > 0) {
-    const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString()
-
-    const { data: snapshotData, error: snapshotError } = await supabaseAdmin
-      .from("channel_member_snapshots")
-      .select("listing_id, member_count, created_at")
-      .in("listing_id", listingIds)
-      .gte("created_at", since)
-      .order("created_at", { ascending: true })
-
-    if (snapshotError) throw snapshotError
-
-    snapshots = snapshotData || []
-  }
-
-  const snapshotsByListing = {}
-
-  snapshots.forEach((snapshot) => {
-    if (!snapshotsByListing[snapshot.listing_id]) {
-      snapshotsByListing[snapshot.listing_id] = []
-    }
-
-    snapshotsByListing[snapshot.listing_id].push(snapshot)
-  })
-
-  const listingsWithGrowth = (listings || []).map((listing) => {
-    const listingSnapshots = snapshotsByListing[listing.id] || []
-    const firstSnapshot = listingSnapshots[0]
-    const latestSnapshot = listingSnapshots[listingSnapshots.length - 1]
-
-    const oldMembers = Number(
-      firstSnapshot?.member_count || listing.member_count || 0
-    )
-
-    const latestMembers = Number(
-      latestSnapshot?.member_count || listing.member_count || 0
-    )
-
-    const memberGrowth24h = Math.max(0, latestMembers - oldMembers)
-
-    return {
-      ...listing,
-      member_growth_24h: memberGrowth24h,
-    }
-  })
-
-  const maxStats = {
-    maxVotes: Math.max(
-      1,
-      ...listingsWithGrowth.map((item) => Number(item.votes_count || 0))
-    ),
-    maxGrowth: Math.max(
-      1,
-      ...listingsWithGrowth.map((item) =>
-        Number(item.member_growth_24h || 0)
-      )
-    ),
-  }
-
-  function getPaidRankPriority(item) {
-    const rank = String(item.paid_rank || "free").toLowerCase()
-    const status = String(item.paid_rank_status || "inactive").toLowerCase()
-
-    if (status !== "active" && status !== "trialing") return 0
-    if (rank === "sponsor") return 3
-    if (rank === "gold") return 2
-    if (rank === "silver") return 1
-
-    return 0
-  }
-
-  const threeDaysMs = 3 * 24 * 60 * 60 * 1000
-
-  const homepageListings = listingsWithGrowth
-    .map((listing) => {
-      const ranking = calculateRankingScore(listing, maxStats)
-
-      const createdAt = new Date(listing.created_at).getTime()
-      const ageMs = Date.now() - createdAt
-      const isNew = ageMs >= 0 && ageMs < threeDaysMs
-
-      const newnessScore = isNew
-        ? Math.max(0, (threeDaysMs - ageMs) / threeDaysMs) * 1000
-        : 0
-
-      return {
-        ...listing,
-        ...ranking,
-        _paid_priority: getPaidRankPriority(listing),
-        _homepage_score: Number(ranking.ranking_score || 0) + newnessScore,
-      }
-    })
-    .sort((a, b) => {
-      if (b._paid_priority !== a._paid_priority) {
-        return b._paid_priority - a._paid_priority
-      }
-
-      if (b._homepage_score !== a._homepage_score) {
-        return b._homepage_score - a._homepage_score
-      }
-
-      return new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
-    })
-    .slice(0, cleanLimit)
-    .map(({ _paid_priority, _homepage_score, ...item }) => item)
-
-  return homepageListings
-}
-
-async function updateHomepageListingCache() {
-  const listings = await buildHomepageListings(18)
-  const updatedAt = new Date().toISOString()
-
-  const { error } = await supabaseAdmin
-    .from("homepage_listing_cache")
-    .upsert({
-      id: "homepage_top_18",
-      listings,
-      updated_at: updatedAt,
-    })
-
-  if (error) throw error
-
-  return {
-    listings,
-    updated_at: updatedAt,
-  }
-}
-
-
-// ========================================
-// TELEGRAM TEMPLATE COPIER — MTProto source + Bot API destination
-// Reads one public/joined source through the user's authorized Telegram session.
-// Writes only supported settings to a destination where @teleg_sync_bot is admin.
-// No messages, members, usernames, or actual administrators are transferred.
-// ========================================
-
-const TELEGRAM_TEMPLATE_SESSION_TTL_HOURS = 24
-const TELEGRAM_MT_API_ID = Number(process.env.TELEGRAM_API_ID || 0)
-const TELEGRAM_MT_API_HASH = String(process.env.TELEGRAM_API_HASH || "").trim()
-const TELEGRAM_TEMPLATE_ENCRYPTION_KEY = String(
-  process.env.TELEGRAM_TEMPLATE_ENCRYPTION_KEY || ""
-).trim()
-let telegramBotIdentity = null
-
-function hashTemplateToken(value) {
-  return crypto.createHash("sha256").update(String(value || "")).digest("hex")
-}
-
-function createTemplateToken(bytes = 32) {
-  return crypto.randomBytes(bytes).toString("hex")
-}
-
-function createTemplateConnectionCode() {
-  return `TH-${crypto.randomInt(100000, 1000000)}`
-}
-
-function normalizeTemplateChatType(type) {
-  if (type === "channel") return "channel"
-  if (type === "supergroup") return "supergroup"
-  return null
-}
-
-function assertMtProtoConfigured() {
-  if (!TELEGRAM_MT_API_ID || !TELEGRAM_MT_API_HASH) {
-    const error = new Error("Missing TELEGRAM_API_ID or TELEGRAM_API_HASH in Render.")
-    error.statusCode = 500
-    throw error
-  }
-  if (!TELEGRAM_TEMPLATE_ENCRYPTION_KEY) {
-    const error = new Error("Missing TELEGRAM_TEMPLATE_ENCRYPTION_KEY in Render.")
-    error.statusCode = 500
-    throw error
-  }
-}
-
-function getTemplateCipherKey() {
-  assertMtProtoConfigured()
-  return crypto.createHash("sha256").update(TELEGRAM_TEMPLATE_ENCRYPTION_KEY).digest()
-}
-
-function encryptTemplateSecret(value) {
-  if (!value) return null
-  const iv = crypto.randomBytes(12)
-  const cipher = crypto.createCipheriv("aes-256-gcm", getTemplateCipherKey(), iv)
-  const encrypted = Buffer.concat([cipher.update(String(value), "utf8"), cipher.final()])
-  const tag = cipher.getAuthTag()
-  return Buffer.concat([iv, tag, encrypted]).toString("base64")
-}
-
-function decryptTemplateSecret(value) {
-  if (!value) return ""
-  const packed = Buffer.from(String(value), "base64")
-  if (packed.length < 29) throw new Error("Stored Telegram session is invalid.")
-  const iv = packed.subarray(0, 12)
-  const tag = packed.subarray(12, 28)
-  const encrypted = packed.subarray(28)
-  const decipher = crypto.createDecipheriv("aes-256-gcm", getTemplateCipherKey(), iv)
-  decipher.setAuthTag(tag)
-  return Buffer.concat([decipher.update(encrypted), decipher.final()]).toString("utf8")
-}
-
-function serializeBotPermissions(member) {
-  if (!member || member.status !== "administrator") return {}
-  const keys = [
-    "can_manage_chat",
-    "can_change_info",
-    "can_delete_messages",
-    "can_invite_users",
-    "can_restrict_members",
-    "can_pin_messages",
-    "can_manage_topics",
-    "can_promote_members",
-    "can_post_messages",
-    "can_edit_messages",
-    "can_manage_video_chats",
-  ]
-  return Object.fromEntries(keys.map((key) => [key, member[key] === true]))
-}
-
-async function getTelegramBotIdentity() {
-  if (!telegramBotIdentity) telegramBotIdentity = await tg("getMe")
-  return telegramBotIdentity
-}
-
-async function requireTemplateSession(req) {
-  const rawToken = String(req.headers["x-template-session"] || "").trim()
-  if (!rawToken) {
-    const error = new Error("Missing template session.")
-    error.statusCode = 401
-    throw error
-  }
-
-  const tokenHash = hashTemplateToken(rawToken)
-  const now = new Date().toISOString()
-  const { data: session, error } = await supabaseAdmin
-    .from("telegram_template_sessions")
-    .select("*")
-    .eq("session_token_hash", tokenHash)
-    .gt("expires_at", now)
-    .maybeSingle()
-
-  if (error) throw error
-  if (!session) {
-    const authError = new Error("Template session expired. Refresh the page to start again.")
-    authError.statusCode = 401
-    throw authError
-  }
-
-  await supabaseAdmin
-    .from("telegram_template_sessions")
-    .update({ last_used_at: now })
-    .eq("id", session.id)
-
-  return session
-}
-
-async function updateTemplateSession(sessionId, values) {
-  const { data, error } = await supabaseAdmin
-    .from("telegram_template_sessions")
-    .update({ ...values, last_used_at: new Date().toISOString() })
-    .eq("id", sessionId)
-    .select("*")
-    .single()
-  if (error) throw error
-  return data
-}
-
-async function getTemplateConnectedChat(sessionId, connectedChatId) {
-  const { data, error } = await supabaseAdmin
-    .from("telegram_template_chats")
-    .select("*")
-    .eq("id", connectedChatId)
-    .eq("session_id", sessionId)
-    .maybeSingle()
-  if (error) throw error
-  return data
-}
-
-async function createMtProtoClient(encryptedSession = "") {
-  assertMtProtoConfigured()
-  const { TelegramClient } = require("telegram")
-  const { StringSession } = require("telegram/sessions")
-  const stringSession = encryptedSession ? decryptTemplateSecret(encryptedSession) : ""
-  const client = new TelegramClient(
-    new StringSession(stringSession),
-    TELEGRAM_MT_API_ID,
-    TELEGRAM_MT_API_HASH,
-    {
-      connectionRetries: 5,
-      requestRetries: 3,
-      floodSleepThreshold: 10,
-      autoReconnect: false,
-    }
-  )
-  await client.connect()
-  return client
-}
-
-async function safelyDisconnectMt(client) {
-  if (!client) return
-
-  try {
-    if (typeof client.destroy === "function") {
-      await client.destroy()
-      return
-    }
-  } catch (destroyError) {
-    console.warn("MTProto destroy warning:", destroyError.message)
-  }
-
-  try {
-    await client.disconnect()
-  } catch (disconnectError) {
-    console.warn(
-      "MTProto disconnect warning:",
-      disconnectError.message
-    )
-  }
-}
-
-
-
-function cleanTelegramSourceReference(value) {
-  const raw = String(value || "").trim()
-  if (!raw) return ""
-  if (/^https?:\/\/t\.me\//i.test(raw)) return raw
-  if (/^t\.me\//i.test(raw)) return `https://${raw}`
-  if (raw.startsWith("@")) return raw
-  if (/^[a-zA-Z0-9_]{5,}$/.test(raw)) return `@${raw}`
-  return raw
-}
-
-function mtBool(value) {
-  return value === true
-}
-
-function mtAllowedPermissions(defaultBannedRights) {
-  if (!defaultBannedRights) return null
-  // MTProto stores default restrictions as banned rights; Bot API expects allowed rights.
-  return {
-    can_send_messages: !mtBool(defaultBannedRights.sendMessages),
-    can_send_audios: !mtBool(defaultBannedRights.sendAudios),
-    can_send_documents: !mtBool(defaultBannedRights.sendDocs),
-    can_send_photos: !mtBool(defaultBannedRights.sendPhotos),
-    can_send_videos: !mtBool(defaultBannedRights.sendVideos),
-    can_send_video_notes: !mtBool(defaultBannedRights.sendRoundvideos),
-    can_send_voice_notes: !mtBool(defaultBannedRights.sendVoices),
-    can_send_polls: !mtBool(defaultBannedRights.sendPolls),
-    can_send_other_messages: !mtBool(defaultBannedRights.sendStickers),
-    can_add_web_page_previews: !mtBool(defaultBannedRights.embedLinks),
-    can_change_info: !mtBool(defaultBannedRights.changeInfo),
-    can_invite_users: !mtBool(defaultBannedRights.inviteUsers),
-    can_pin_messages: !mtBool(defaultBannedRights.pinMessages),
-    can_manage_topics: !mtBool(defaultBannedRights.manageTopics),
-  }
-}
-
-
-function telegramCloneError(message, statusCode = 400) {
-  const error = new Error(message)
-  error.statusCode = statusCode
-  return error
-}
-
-function telegramCloneType(entity) {
-  if (!entity || entity.className !== "Channel") return null
-  return entity.broadcast ? "channel" : "supergroup"
-}
-
-function telegramCloneAdminRights(entity) {
-  const rights = entity?.adminRights || {}
-  return {
-    is_creator: entity?.creator === true,
-    can_change_info:
-      entity?.creator === true ||
-      rights.changeInfo === true,
-    can_ban_users:
-      entity?.creator === true ||
-      rights.banUsers === true,
-    can_manage_topics:
-      entity?.creator === true ||
-      rights.manageTopics === true ||
-      rights.changeInfo === true,
-  }
-}
-
-function telegramCloneCanManageDestination(entity) {
-  const rights = telegramCloneAdminRights(entity)
-  return rights.is_creator || rights.can_change_info
-}
-
-function telegramClonePublicEntity(entity) {
-  const type = telegramCloneType(entity)
-  const rights = telegramCloneAdminRights(entity)
-
-  return {
-    id: String(entity.id),
-    title: entity.title || "Telegram Community",
-    username: entity.username || null,
-    type,
-    creator: rights.is_creator,
-    admin_rights: rights,
-  }
-}
-
-async function requireLinkedTelegramClient(req) {
-  const user = await requireTelehubUser(req)
-  const connection = await getTelegramAccountConnection(user.id)
-
-  if (
-    !connection ||
-    connection.auth_status !== "connected" ||
-    !connection.encrypted_mtproto_session
-  ) {
-    throw telegramCloneError(
-      "Link your Telegram account from your TeleHub profile first.",
-      401
-    )
-  }
-
-  const client = await createMtProtoClient(
-    connection.encrypted_mtproto_session
-  )
-
-  if (!(await client.checkAuthorization())) {
-    await safelyDisconnectMt(client)
-    throw telegramCloneError(
-      "Your Telegram connection expired. Reconnect it from your profile.",
-      401
-    )
-  }
-
-  return { user, connection, client }
-}
-
-async function resolveTelegramCloneEntity(client, reference, label) {
-  const cleanReference = cleanTelegramSourceReference(reference)
-
-  if (!cleanReference) {
-    throw telegramCloneError(`Enter a ${label} Telegram link or username.`)
-  }
-
-  let entity
-
-  try {
-    entity = await client.getEntity(cleanReference)
-  } catch (error) {
-    throw telegramCloneError(
-      `Could not access the ${label}. Make sure it is public or joined by your linked Telegram account.`
-    )
-  }
-
-  if (!telegramCloneType(entity)) {
-    throw telegramCloneError(
-      `The ${label} must be a Telegram channel or supergroup.`
-    )
-  }
-
-  return entity
-}
-
-
-function normalizeTelegramForumTopic(topic) {
-  if (!topic || topic.className !== "ForumTopic") return null
-
-  return {
-    id: Number(topic.id),
-    title: String(topic.title || "Topic"),
-    icon_color:
-      topic.iconColor === null || topic.iconColor === undefined
-        ? null
-        : Number(topic.iconColor),
-    icon_emoji_id:
-      topic.iconEmojiId === null || topic.iconEmojiId === undefined
-        ? null
-        : String(topic.iconEmojiId),
-    pinned: topic.pinned === true,
-    closed: topic.closed === true,
-    hidden: topic.hidden === true,
-    is_general: Number(topic.id) === 1,
-  }
-}
-
-async function getAllTelegramForumTopics(client, channelInput) {
-  const { Api } = require("telegram")
-  const topics = []
-  const seen = new Set()
-
-  let offsetDate = 0
-  let offsetId = 0
-  let offsetTopic = 0
-
-  for (let page = 0; page < 10; page += 1) {
-    const result = await client.invoke(
-      new Api.channels.GetForumTopics({
-        channel: channelInput,
-        q: "",
-        offsetDate,
-        offsetId,
-        offsetTopic,
-        limit: 100,
-      })
-    )
-
-    const pageTopics = (result.topics || [])
-      .map(normalizeTelegramForumTopic)
-      .filter(Boolean)
-
-    for (const topic of pageTopics) {
-      if (!seen.has(topic.id)) {
-        seen.add(topic.id)
-        topics.push(topic)
-      }
-    }
-
-    if (pageTopics.length < 100) break
-
-    const lastTopic = pageTopics[pageTopics.length - 1]
-    offsetTopic = Number(lastTopic.id || 0)
-
-    const lastMessage = (result.messages || []).find(
-      (message) => Number(message.id) === Number(lastTopic.id)
-    )
-
-    offsetId = Number(lastMessage?.id || 0)
-    offsetDate = Number(lastMessage?.date || 0)
-
-    if (!offsetTopic) break
-  }
-
-  return topics
-}
-
-function extractCreatedForumTopicId(updates) {
-  const updateList = updates?.updates || []
-
-  for (const update of updateList) {
-    const message = update?.message
-    const action = message?.action
-
-    if (
-      message?.id &&
-      action &&
-      (
-        action.className === "MessageActionTopicCreate" ||
-        action.className === "MessageActionTopicEdit"
-      )
-    ) {
-      return Number(message.id)
-    }
-  }
-
-  return null
-}
-
-async function ensureDestinationForumEnabled(
-  client,
-  destinationInput,
-  destinationEntity
-) {
-  const { Api } = require("telegram")
-
-  if (destinationEntity.forum === true) {
-    return { enabled: false, already_enabled: true }
-  }
-
-  await client.invoke(
-    new Api.channels.ToggleForum({
-      channel: destinationInput,
-      enabled: true,
-    })
-  )
-
-  return { enabled: true, already_enabled: false }
-}
-
-async function cloneTelegramForumTopics(
-  client,
-  destinationInput,
-  sourceTopics
-) {
-  const { Api } = require("telegram")
-
-  const results = []
-  const createdTopicIds = []
-  const pinnedCreatedIds = []
-
-  const generalTopic = (sourceTopics || []).find(
-    (topic) => topic.is_general
-  )
-
-  if (generalTopic && generalTopic.title !== "General") {
-    try {
-      await client.invoke(
-        new Api.channels.EditForumTopic({
-          channel: destinationInput,
-          topicId: 1,
-          title: generalTopic.title,
-          iconEmojiId: generalTopic.icon_emoji_id
-            ? BigInt(generalTopic.icon_emoji_id)
-            : undefined,
-        })
-      )
-
-      results.push({
-        key: "topic_general",
-        label: generalTopic.title,
-        ok: true,
-        general: true,
-      })
-    } catch (error) {
-      results.push({
-        key: "topic_general",
-        label: generalTopic.title,
-        ok: false,
-        general: true,
-        message: error.message,
-      })
-    }
-  }
-
-  for (const topic of sourceTopics || []) {
-    if (topic.is_general) continue
-
-    try {
-      const createResult = await client.invoke(
-        new Api.channels.CreateForumTopic({
-          channel: destinationInput,
-          title: topic.title,
-          iconColor:
-            topic.icon_color === null
-              ? undefined
-              : topic.icon_color,
-          iconEmojiId: topic.icon_emoji_id
-            ? BigInt(topic.icon_emoji_id)
-            : undefined,
-          randomId: BigInt(
-            "0x" + crypto.randomBytes(8).toString("hex")
-          ),
-        })
-      )
-
-      const createdId = extractCreatedForumTopicId(createResult)
-
-      if (createdId) {
-        createdTopicIds.push(createdId)
-        if (topic.pinned) pinnedCreatedIds.push(createdId)
-      }
-
-      results.push({
-        key: `topic_${topic.id}`,
-        label: topic.title,
-        ok: true,
-        topic_id: createdId,
-      })
-
-      if (createdId && topic.closed) {
-        try {
-          await client.invoke(
-            new Api.channels.EditForumTopic({
-              channel: destinationInput,
-              topicId: createdId,
-              closed: true,
-            })
-          )
-        } catch (closeError) {
-          results.push({
-            key: `topic_close_${topic.id}`,
-            label: `${topic.title} closed state`,
-            ok: false,
-            message: closeError.message,
-          })
-        }
-      }
-    } catch (error) {
-      results.push({
-        key: `topic_${topic.id}`,
-        label: topic.title,
-        ok: false,
-        message: error.message,
-      })
-    }
-  }
-
-  if (pinnedCreatedIds.length > 0) {
-    try {
-      await client.invoke(
-        new Api.channels.ReorderPinnedForumTopics({
-          channel: destinationInput,
-          force: true,
-          order: pinnedCreatedIds,
-        })
-      )
-
-      results.push({
-        key: "topic_pinned_order",
-        label: "Pinned topic order",
-        ok: true,
-      })
-    } catch (error) {
-      results.push({
-        key: "topic_pinned_order",
-        label: "Pinned topic order",
-        ok: false,
-        message: error.message,
-      })
-    }
-  }
-
-  return {
-    results,
-    created_topic_ids: createdTopicIds,
-  }
-}
-
-async function inspectTelegramCloneEntity(client, entity, includePhoto = false) {
-  const { Api } = require("telegram")
-
-  const input = await client.getInputEntity(entity)
-  const fullResult = await client.invoke(
-    new Api.channels.GetFullChannel({ channel: input })
-  )
-
-  const full = fullResult.fullChat || {}
-  const chat =
-    (fullResult.chats || []).find(
-      (item) => String(item.id) === String(entity.id)
-    ) || entity
-
-  let photoBuffer = null
-
-  if (
-    includePhoto &&
-    chat.photo &&
-    chat.photo.className !== "ChatPhotoEmpty"
-  ) {
-    try {
-      photoBuffer = await client.downloadProfilePhoto(chat, {
-        isBig: true,
-      })
-    } catch (error) {
-      console.warn(
-        "Telegram clone source-photo download warning:",
-        error.message
-      )
-    }
-  }
-
-  const type = telegramCloneType(chat)
-
-  let topics = []
-
-  // GramJS does not always populate chat.forum reliably on the entity
-  // returned by GetFullChannel. Try reading forum topics for every
-  // supergroup and treat a successful non-empty result as forum mode.
-  if (type === "supergroup") {
-    try {
-      topics = await getAllTelegramForumTopics(client, input)
-    } catch (topicError) {
-      const message = String(topicError?.message || topicError || "")
-
-      // A normal non-forum supergroup can reject GetForumTopics. That is
-      // expected and should not make the whole preview fail.
-      if (
-        !message.includes("CHAT_NOT_FORUM") &&
-        !message.includes("CHANNEL_FORUM_MISSING")
-      ) {
-        console.warn(
-          "Telegram clone source-topic inspection warning:",
-          message
-        )
-      }
-    }
-  }
-
-  return {
-    entity: chat,
-    input,
-    type,
-    title: chat.title || "Telegram Community",
-    username: chat.username || null,
-    description: full.about || "",
-    photo_available:
-      Boolean(chat.photo) &&
-      chat.photo.className !== "ChatPhotoEmpty",
-    photo_buffer: photoBuffer,
-    permissions:
-      type === "supergroup"
-        ? mtAllowedPermissions(chat.defaultBannedRights)
-        : null,
-    default_banned_rights: chat.defaultBannedRights || null,
-    topics,
-    settings: {
-      slow_mode_seconds: Number(full.slowmodeSeconds || 0),
-      protected_content: chat.noforwards === true,
-      forum_mode: chat.forum === true || topics.length > 0,
-      linked_chat_id: full.linkedChatId
-        ? String(full.linkedChatId)
-        : null,
-      history_hidden:
-        chat.defaultBannedRights?.viewMessages === true,
-      anti_spam: full.antispam === true,
-      auto_delete_seconds: Number(full.ttlPeriod || 0),
-    },
-    rights: telegramCloneAdminRights(chat),
-  }
-}
-
-function buildTelegramClonePreview(source, destination) {
-  if (source.type !== destination.type) {
-    throw telegramCloneError(
-      "Source and destination must both be channels or both be supergroups."
-    )
-  }
-
-  if (!telegramCloneCanManageDestination(destination.entity)) {
-    throw telegramCloneError(
-      "Your linked Telegram account must be an administrator with permission to change the destination."
-    )
-  }
-
-  const automatic = [
-    {
-      key: "title",
-      label: "Name",
-      supported: destination.rights.can_change_info,
-      source_value: source.title,
-      destination_value: destination.title,
-    },
-    {
-      key: "description",
-      label: "Description",
-      supported: destination.rights.can_change_info,
-      source_value: source.description,
-      destination_value: destination.description,
-    },
-    {
-      key: "photo",
-      label: "Profile photo",
-      supported:
-        destination.rights.can_change_info &&
-        source.photo_available,
-      source_value: source.photo_available
-        ? "Source photo detected"
-        : "No source photo",
-      destination_value: destination.photo_available
-        ? "Destination has a photo"
-        : "No destination photo",
-    },
-  ]
-
-  if (source.type === "supergroup") {
-    automatic.push({
-      key: "permissions",
-      label: "Default member permissions",
-      supported:
-        destination.rights.can_ban_users &&
-        Boolean(source.default_banned_rights),
-      source_value: source.permissions,
-      destination_value: destination.permissions,
-    })
-
-    automatic.push({
-      key: "topics",
-      label: "Forum topics",
-      supported:
-        (source.settings.forum_mode === true || source.topics.length > 0) &&
-        destination.rights.can_manage_topics === true,
-      source_value:
-        source.topics.length > 0
-          ? `${source.topics.length} topics detected`
-          : source.settings.forum_mode === true
-            ? "Forum enabled, but no named topics were returned"
-            : "Source does not use topics",
-      destination_value:
-        destination.settings.forum_mode === true
-          ? `${destination.topics.length} existing topics`
-          : "Topics disabled",
-    })
-  }
-
-  return {
-    source: {
-      id: String(source.entity.id),
-      title: source.title,
-      username: source.username,
-      type: source.type,
-    },
-    destination: {
-      id: String(destination.entity.id),
-      title: destination.title,
-      username: destination.username,
-      type: destination.type,
-      rights: destination.rights,
-    },
-    automatic,
-    topics: source.topics || [],
-    manual: [
-      {
-        key: "slow_mode",
-        label: "Slow mode",
-        value: source.settings.slow_mode_seconds,
-      },
-      {
-        key: "protected_content",
-        label: "Content protection",
-        value: source.settings.protected_content,
-      },
-      {
-        key: "forum_mode",
-        label: "Forum/topics mode",
-        value: source.settings.forum_mode,
-      },
-      {
-        key: "linked_chat",
-        label: "Linked discussion chat",
-        value: source.settings.linked_chat_id,
-      },
-      {
-        key: "anti_spam",
-        label: "Aggressive anti-spam",
-        value: source.settings.anti_spam,
-      },
-      {
-        key: "auto_delete",
-        label: "Message auto-delete",
-        value: source.settings.auto_delete_seconds,
-      },
-    ],
-  }
-}
-
-async function applyTelegramClonePhoto(
-  client,
-  destinationInput,
-  photoBuffer
-) {
-  if (!photoBuffer || !photoBuffer.length) {
-    return {
-      ok: false,
-      skipped: true,
-      message: "Source profile photo could not be downloaded.",
-    }
-  }
-
-  const { Api } = require("telegram")
-  const { CustomFile } = require("telegram/client/uploads")
-
-  const file = new CustomFile(
-    `telehub-clone-${Date.now()}.jpg`,
-    photoBuffer.length,
-    "",
-    photoBuffer
-  )
-
-  const uploadedFile = await client.uploadFile({
-    file,
-    workers: 1,
-  })
-
-  await client.invoke(
-    new Api.channels.EditPhoto({
-      channel: destinationInput,
-      photo: new Api.InputChatUploadedPhoto({
-        file: uploadedFile,
-      }),
-    })
-  )
-
-  return { ok: true }
-}
-
-async function applyTelegramClonePermissions(
-  client,
-  destinationInput,
-  bannedRights
-) {
-  if (!bannedRights) {
-    return {
-      ok: false,
-      skipped: true,
-      message: "No source permissions were available.",
-    }
-  }
-
-  const { Api } = require("telegram")
-
-  await client.invoke(
-    new Api.messages.EditChatDefaultBannedRights({
-      peer: destinationInput,
-      bannedRights,
-    })
-  )
-
-  return { ok: true }
-}
-
-app.get("/api/telegram-clone/status", async (req, res) => {
-  try {
-    const user = await requireTelehubUser(req)
-    const connection = await getTelegramAccountConnection(user.id)
-
-    return res.json({
-      ok: true,
-      connected:
-        connection?.auth_status === "connected" &&
-        Boolean(connection?.encrypted_mtproto_session),
-      telegram: connection
-        ? {
-            username: connection.telegram_username || null,
-            first_name: connection.telegram_first_name || null,
-            last_name: connection.telegram_last_name || null,
-          }
-        : null,
-    })
-  } catch (error) {
-    return res
-      .status(error.statusCode || 500)
-      .json({ error: error.message })
-  }
-})
-
-app.get("/api/telegram-clone/destinations", async (req, res) => {
-  let client
-
-  try {
-    const linked = await requireLinkedTelegramClient(req)
-    client = linked.client
-
-    const dialogs = await client.getDialogs({ limit: 200 })
-    const destinations = []
-    const seen = new Set()
-
-    for (const dialog of dialogs || []) {
-      const entity = dialog.entity
-      const type = telegramCloneType(entity)
-
-      if (!type || !telegramCloneCanManageDestination(entity)) {
-        continue
-      }
-
-      const id = String(entity.id)
-      if (seen.has(id)) continue
-      seen.add(id)
-
-      destinations.push(telegramClonePublicEntity(entity))
-    }
-
-    destinations.sort((a, b) =>
-      String(a.title).localeCompare(String(b.title))
-    )
-
-    return res.json({
-      ok: true,
-      destinations,
-    })
-  } catch (error) {
-    console.error(
-      "Telegram clone destinations error:",
-      error
-    )
-    return res
-      .status(error.statusCode || 500)
-      .json({ error: error.message })
-  } finally {
-    await safelyDisconnectMt(client)
-  }
-})
-
-app.post("/api/telegram-clone/preview", async (req, res) => {
-  let client
-
-  try {
-    const linked = await requireLinkedTelegramClient(req)
-    client = linked.client
-
-    const { source, destination } = req.body || {}
-
-    const sourceEntity = await resolveTelegramCloneEntity(
-      client,
-      source,
-      "source"
-    )
-    const destinationEntity =
-      await resolveTelegramCloneEntity(
-        client,
-        destination,
-        "destination"
-      )
-
-    const [sourceInspection, destinationInspection] =
-      await Promise.all([
-        inspectTelegramCloneEntity(
-          client,
-          sourceEntity,
-          false
-        ),
-        inspectTelegramCloneEntity(
-          client,
-          destinationEntity,
-          false
-        ),
-      ])
-
-    const preview = buildTelegramClonePreview(
-      sourceInspection,
-      destinationInspection
-    )
-
-    return res.json({ ok: true, preview })
-  } catch (error) {
-    console.error("Telegram clone preview error:", error)
-    return res
-      .status(error.statusCode || 500)
-      .json({ error: error.message })
-  } finally {
-    await safelyDisconnectMt(client)
-  }
-})
-
-app.post("/api/telegram-clone/apply", async (req, res) => {
-  let client
-
-  try {
-    const linked = await requireLinkedTelegramClient(req)
-    client = linked.client
-
-    const {
-      source,
-      destination,
-      copy = {},
-    } = req.body || {}
-
-    const sourceEntity = await resolveTelegramCloneEntity(
-      client,
-      source,
-      "source"
-    )
-    const destinationEntity =
-      await resolveTelegramCloneEntity(
-        client,
-        destination,
-        "destination"
-      )
-
-    const [sourceInspection, destinationInspection] =
-      await Promise.all([
-        inspectTelegramCloneEntity(
-          client,
-          sourceEntity,
-          copy.photo !== false
-        ),
-        inspectTelegramCloneEntity(
-          client,
-          destinationEntity,
-          false
-        ),
-      ])
-
-    const preview = buildTelegramClonePreview(
-      sourceInspection,
-      destinationInspection
-    )
-
-    const { Api } = require("telegram")
-    const destinationInput =
-      await client.getInputEntity(destinationEntity)
-
-    const results = []
-
-    if (copy.title !== false) {
-      if (!destinationInspection.rights.can_change_info) {
-        results.push({
-          key: "title",
-          ok: false,
-          skipped: true,
-          message: "Missing permission to change destination information.",
-        })
-      } else {
-        try {
-          await client.invoke(
-            new Api.channels.EditTitle({
-              channel: destinationInput,
-              title: sourceInspection.title,
-            })
-          )
-          results.push({ key: "title", ok: true })
-        } catch (error) {
-          results.push({
-            key: "title",
-            ok: false,
-            message: error.message,
-          })
-        }
-      }
-    }
-
-    if (copy.description !== false) {
-      if (!destinationInspection.rights.can_change_info) {
-        results.push({
-          key: "description",
-          ok: false,
-          skipped: true,
-          message: "Missing permission to change destination information.",
-        })
-      } else {
-        try {
-          await client.invoke(
-            new Api.channels.EditAbout({
-              channel: destinationInput,
-              about: sourceInspection.description || "",
-            })
-          )
-          results.push({
-            key: "description",
-            ok: true,
-          })
-        } catch (error) {
-          results.push({
-            key: "description",
-            ok: false,
-            message: error.message,
-          })
-        }
-      }
-    }
-
-    if (copy.photo !== false) {
-      if (!destinationInspection.rights.can_change_info) {
-        results.push({
-          key: "photo",
-          ok: false,
-          skipped: true,
-          message: "Missing permission to change destination information.",
-        })
-      } else if (!sourceInspection.photo_available) {
-        results.push({
-          key: "photo",
-          ok: false,
-          skipped: true,
-          message: "The source has no profile photo.",
-        })
-      } else {
-        try {
-          const photoResult =
-            await applyTelegramClonePhoto(
-              client,
-              destinationInput,
-              sourceInspection.photo_buffer
-            )
-          results.push({
-            key: "photo",
-            ...photoResult,
-          })
-        } catch (error) {
-          results.push({
-            key: "photo",
-            ok: false,
-            message: error.message,
-          })
-        }
-      }
-    }
-
-    if (
-      sourceInspection.type === "supergroup" &&
-      copy.permissions !== false
-    ) {
-      if (!destinationInspection.rights.can_ban_users) {
-        results.push({
-          key: "permissions",
-          ok: false,
-          skipped: true,
-          message: "Missing permission to manage destination member permissions.",
-        })
-      } else {
-        try {
-          const permissionResult =
-            await applyTelegramClonePermissions(
-              client,
-              destinationInput,
-              sourceInspection.default_banned_rights
-            )
-          results.push({
-            key: "permissions",
-            ...permissionResult,
-          })
-        } catch (error) {
-          results.push({
-            key: "permissions",
-            ok: false,
-            message: error.message,
-          })
-        }
-      }
-    }
-
-
-    if (
-      sourceInspection.type === "supergroup" &&
-      (sourceInspection.settings.forum_mode === true ||
-        sourceInspection.topics.length > 0) &&
-      copy.topics !== false
-    ) {
-      if (!destinationInspection.rights.can_manage_topics) {
-        results.push({
-          key: "topics",
-          ok: false,
-          skipped: true,
-          message:
-            "Missing permission to manage Topics in the destination.",
-        })
-      } else {
-        try {
-          const forumResult =
-            await ensureDestinationForumEnabled(
-              client,
-              destinationInput,
-              destinationInspection.entity
-            )
-
-          results.push({
-            key: "forum_mode",
-            ok: true,
-            message: forumResult.already_enabled
-              ? "Topics were already enabled."
-              : "Topics enabled on destination.",
-          })
-
-          const topicCloneResult =
-            await cloneTelegramForumTopics(
-              client,
-              destinationInput,
-              sourceInspection.topics
-            )
-
-          results.push(...topicCloneResult.results)
-        } catch (error) {
-          results.push({
-            key: "topics",
-            ok: false,
-            message: error.message,
-          })
-        }
-      }
-    }
-
-    return res.json({
-      ok: results.some((item) => item.ok),
-      preview,
-      results,
-    })
-  } catch (error) {
-    console.error("Telegram clone apply error:", error)
-    return res
-      .status(error.statusCode || 500)
-      .json({ error: error.message })
-  } finally {
-    await safelyDisconnectMt(client)
-  }
-})
-
-
-
-async function inspectMtProtoSource(session, sourceReference, options = {}) {
-  const { Api } = require("telegram")
-  const client = await createMtProtoClient(session.mtproto_session_encrypted)
-  try {
-    if (!(await client.checkAuthorization())) {
-      const error = new Error("Connect your Telegram account before selecting a source.")
-      error.statusCode = 401
-      throw error
-    }
-
-    const reference = cleanTelegramSourceReference(sourceReference)
-    if (!reference) {
-      const error = new Error("Paste a public or joined Telegram channel/group link.")
-      error.statusCode = 400
-      throw error
-    }
-
-    const entity = await client.getEntity(reference)
-    if (!entity || entity.className !== "Channel") {
-      const error = new Error("The source must be a Telegram channel or supergroup.")
-      error.statusCode = 400
-      throw error
-    }
-
-    const input = await client.getInputEntity(entity)
-    const fullResult = await client.invoke(new Api.channels.GetFullChannel({ channel: input }))
-    const full = fullResult.fullChat || {}
-    const chat = (fullResult.chats || []).find(
-      (item) => String(item.id) === String(entity.id)
-    ) || entity
-
-    let photoBuffer = null
-    if (options.includePhoto && chat.photo && chat.photo.className !== "ChatPhotoEmpty") {
-      try {
-        photoBuffer = await client.downloadProfilePhoto(entity, { isBig: true })
-      } catch (photoError) {
-        console.warn("Could not download MTProto source photo:", photoError.message)
-      }
-    }
-
-    const sourceType = chat.broadcast ? "channel" : "supergroup"
-    return {
-      chat_type: sourceType,
-      title: chat.title || "Telegram Community",
-      username: chat.username || null,
-      description: full.about || "",
-      photo_available: Boolean(chat.photo && chat.photo.className !== "ChatPhotoEmpty"),
-      photo_buffer: photoBuffer,
-      permissions: sourceType === "supergroup" ? mtAllowedPermissions(chat.defaultBannedRights) : null,
-      manual: [
-        { key: "slow_mode", label: "Slow mode", value: Number(full.slowmodeSeconds || 0) },
-        { key: "protected_content", label: "Content protection", value: chat.noforwards === true },
-        { key: "forum_mode", label: "Forum/topics mode", value: chat.forum === true },
-        { key: "linked_chat", label: "Linked discussion chat", value: full.linkedChatId ? String(full.linkedChatId) : null },
-        { key: "visible_history", label: "History hidden for new members", value: chat.defaultBannedRights?.viewMessages === true },
-        { key: "anti_spam", label: "Aggressive anti-spam", value: full.antispam === true },
-        { key: "auto_delete", label: "Message auto-delete", value: Number(full.ttlPeriod || 0) },
-      ],
-      admin_presets: [],
-      admin_note: "Administrator roles are not exposed unless the connected account is an administrator of the source.",
-    }
-  } finally {
-    await safelyDisconnectMt(client)
-  }
-}
-
-async function inspectDestinationChat(chatId) {
-  const bot = await getTelegramBotIdentity()
-  const [chat, botMember] = await Promise.all([
-    tg("getChat", { chat_id: chatId }),
-    tg("getChatMember", { chat_id: chatId, user_id: bot.id }),
-  ])
-  const chatType = normalizeTemplateChatType(chat.type)
-  if (!chatType) throw new Error("Destination must be a Telegram channel or supergroup.")
-  if (botMember.status !== "administrator") {
-    throw new Error("@teleg_sync_bot must be an administrator in the destination.")
-  }
-  return {
-    chat,
-    chat_type: chatType,
-    bot_member: botMember,
-    bot_permissions: serializeBotPermissions(botMember),
-  }
-}
-
-function buildMtTemplatePreview(source, destinationInspection) {
-  const destination = destinationInspection.chat
-  if (source.chat_type !== destinationInspection.chat_type) {
-    throw new Error("Source and destination must both be channels or both be supergroups.")
-  }
-
-  const automatic = [
-    {
-      key: "title",
-      label: "Name",
-      supported: destinationInspection.bot_permissions.can_change_info === true,
-      source_value: source.title || "",
-      destination_value: destination.title || "",
-    },
-    {
-      key: "description",
-      label: "Description",
-      supported: destinationInspection.bot_permissions.can_change_info === true,
-      source_value: source.description || "",
-      destination_value: destination.description || "",
-    },
-    {
-      key: "photo",
-      label: "Profile photo",
-      supported:
-        destinationInspection.bot_permissions.can_change_info === true &&
-        source.photo_available === true,
-      source_value: source.photo_available ? "Source photo detected" : "No source photo",
-      destination_value: destination.photo?.big_file_id ? "Destination has a photo" : "No destination photo",
-    },
-  ]
-
-  if (source.chat_type === "supergroup") {
-    automatic.push({
-      key: "permissions",
-      label: "Default member permissions",
-      supported:
-        destinationInspection.bot_permissions.can_restrict_members === true &&
-        Boolean(source.permissions),
-      source_value: source.permissions,
-      destination_value: destination.permissions || null,
-    })
-  }
-
-  return {
-    source: {
-      title: source.title,
-      username: source.username,
-      type: source.chat_type,
-    },
-    destination: {
-      id: String(destination.id),
-      title: destination.title,
-      username: destination.username || null,
-      type: destinationInspection.chat_type,
-    },
-    automatic,
-    admin_presets: source.admin_presets,
-    admin_note: source.admin_note,
-    manual: source.manual,
-  }
-}
-
-async function setDestinationPhotoFromBuffer(destinationChatId, photoBuffer) {
-  if (!photoBuffer || !photoBuffer.length) {
-    return { ok: false, skipped: true, reason: "Source photo could not be downloaded." }
-  }
-  const form = new FormData()
-  form.append("chat_id", String(destinationChatId))
-  form.append("photo", new Blob([photoBuffer], { type: "image/jpeg" }), "telegram-source-photo.jpg")
-  const response = await fetch(`${TELEGRAM_API}/setChatPhoto`, { method: "POST", body: form })
-  const json = await response.json()
-  if (!json.ok) throw new Error(json.description || "Could not copy the profile photo.")
-  return { ok: true }
-}
-
-function filterChatPermissions(permissions) {
-  if (!permissions || typeof permissions !== "object") return null
-  const keys = [
-    "can_send_messages",
-    "can_send_audios",
-    "can_send_documents",
-    "can_send_photos",
-    "can_send_videos",
-    "can_send_video_notes",
-    "can_send_voice_notes",
-    "can_send_polls",
-    "can_send_other_messages",
-    "can_add_web_page_previews",
-    "can_change_info",
-    "can_invite_users",
-    "can_pin_messages",
-    "can_manage_topics",
-  ]
-  return Object.fromEntries(keys.map((key) => [key, permissions[key] === true]))
-}
-
-app.post("/api/telegram-template/session", async (req, res) => {
-  try {
-    const rawToken = createTemplateToken()
-    const tokenHash = hashTemplateToken(rawToken)
-    let connectionCode = createTemplateConnectionCode()
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      const { data: existing } = await supabaseAdmin
-        .from("telegram_template_sessions")
-        .select("id")
-        .eq("connection_code", connectionCode)
-        .maybeSingle()
-      if (!existing) break
-      connectionCode = createTemplateConnectionCode()
-    }
-
-    const expiresAt = new Date(
-      Date.now() + TELEGRAM_TEMPLATE_SESSION_TTL_HOURS * 60 * 60 * 1000
-    ).toISOString()
-    const { data: session, error } = await supabaseAdmin
-      .from("telegram_template_sessions")
-      .insert({
-        session_token_hash: tokenHash,
-        connection_code: connectionCode,
-        expires_at: expiresAt,
-        mtproto_auth_status: "disconnected",
-      })
-      .select("id, connection_code, expires_at")
-      .single()
-    if (error) throw error
-
-    return res.json({
-      ok: true,
-      session_token: rawToken,
-      connection_code: session.connection_code,
-      expires_at: session.expires_at,
-    })
-  } catch (err) {
-    console.error("Telegram template session error:", err)
-    return res.status(500).json({ error: err.message })
-  }
-})
-
-app.get("/api/telegram-template/auth/status", async (req, res) => {
-  try {
-    const session = await requireTemplateSession(req)
-    return res.json({
-      ok: true,
-      status: session.mtproto_auth_status || "disconnected",
-      connected: session.mtproto_auth_status === "connected",
-      telegram_user: session.mtproto_user_json || null,
-    })
-  } catch (err) {
-    return res.status(err.statusCode || 500).json({ error: err.message })
-  }
-})
-
-app.post("/api/telegram-template/auth/send-code", async (req, res) => {
-  let client
-  try {
-    const session = await requireTemplateSession(req)
-    const phoneNumber = String(req.body?.phone_number || "").trim()
-    if (!/^\+[1-9]\d{6,14}$/.test(phoneNumber)) {
-      return res.status(400).json({ error: "Enter the phone number in international format, such as +16025551234." })
-    }
-
-    client = await createMtProtoClient("")
-    const sent = await client.sendCode(
-      { apiId: TELEGRAM_MT_API_ID, apiHash: TELEGRAM_MT_API_HASH },
-      phoneNumber
-    )
-    const serialized = client.session.save()
-    await updateTemplateSession(session.id, {
-      mtproto_session_encrypted: encryptTemplateSecret(serialized),
-      mtproto_phone_encrypted: encryptTemplateSecret(phoneNumber),
-      mtproto_phone_code_hash_encrypted: encryptTemplateSecret(sent.phoneCodeHash),
-      mtproto_auth_status: "code_sent",
-      mtproto_user_json: null,
-    })
-
-    return res.json({ ok: true, status: "code_sent", delivery: sent.isCodeViaApp ? "telegram" : "sms" })
-  } catch (err) {
-    console.error("Telegram MTProto send-code error:", err)
-    return res.status(err.statusCode || 500).json({ error: err.message })
-  } finally {
-    await safelyDisconnectMt(client)
-  }
-})
-
-app.post("/api/telegram-template/auth/verify-code", async (req, res) => {
-  let client
-  try {
-    const { Api } = require("telegram")
-    const session = await requireTemplateSession(req)
-    const phoneCode = String(req.body?.code || "").replace(/\s+/g, "").trim()
-    if (!phoneCode) return res.status(400).json({ error: "Enter the Telegram login code." })
-    if (!session.mtproto_session_encrypted || !session.mtproto_phone_encrypted || !session.mtproto_phone_code_hash_encrypted) {
-      return res.status(400).json({ error: "Request a new Telegram login code first." })
-    }
-
-    client = await createMtProtoClient(session.mtproto_session_encrypted)
-    try {
-      await client.invoke(
-        new Api.auth.SignIn({
-          phoneNumber: decryptTemplateSecret(session.mtproto_phone_encrypted),
-          phoneCodeHash: decryptTemplateSecret(session.mtproto_phone_code_hash_encrypted),
-          phoneCode,
-        })
-      )
-    } catch (signInError) {
-      const message = String(signInError?.errorMessage || signInError?.message || "")
-      if (message.includes("SESSION_PASSWORD_NEEDED")) {
-        await updateTemplateSession(session.id, {
-          mtproto_session_encrypted: encryptTemplateSecret(client.session.save()),
-          mtproto_auth_status: "password_needed",
-        })
-        return res.json({ ok: true, status: "password_needed", password_needed: true })
-      }
-      throw signInError
-    }
-
-    const me = await client.getMe()
-    await updateTemplateSession(session.id, {
-      mtproto_session_encrypted: encryptTemplateSecret(client.session.save()),
-      mtproto_phone_code_hash_encrypted: null,
-      mtproto_auth_status: "connected",
-      mtproto_user_json: {
-        id: String(me.id),
-        username: me.username || null,
-        first_name: me.firstName || null,
-        last_name: me.lastName || null,
-      },
-    })
-    return res.json({ ok: true, status: "connected", connected: true })
-  } catch (err) {
-    console.error("Telegram MTProto verify-code error:", err)
-    return res.status(err.statusCode || 500).json({ error: err.message })
-  } finally {
-    await safelyDisconnectMt(client)
-  }
-})
-
-app.post("/api/telegram-template/auth/verify-password", async (req, res) => {
-  let client
-  try {
-    const session = await requireTemplateSession(req)
-    const password = String(req.body?.password || "")
-    if (!password) return res.status(400).json({ error: "Enter your Telegram two-step verification password." })
-    if (!session.mtproto_session_encrypted) return res.status(400).json({ error: "Telegram login session not found." })
-
-    client = await createMtProtoClient(session.mtproto_session_encrypted)
-    await client.signInWithPassword(
-      { apiId: TELEGRAM_MT_API_ID, apiHash: TELEGRAM_MT_API_HASH },
-      {
-        password: async () => password,
-        onError: async (error) => {
-          throw error
-        },
-      }
-    )
-    const me = await client.getMe()
-    await updateTemplateSession(session.id, {
-      mtproto_session_encrypted: encryptTemplateSecret(client.session.save()),
-      mtproto_phone_code_hash_encrypted: null,
-      mtproto_auth_status: "connected",
-      mtproto_user_json: {
-        id: String(me.id),
-        username: me.username || null,
-        first_name: me.firstName || null,
-        last_name: me.lastName || null,
-      },
-    })
-    return res.json({ ok: true, status: "connected", connected: true })
-  } catch (err) {
-    console.error("Telegram MTProto verify-password error:", err)
-    return res.status(err.statusCode || 500).json({ error: err.message })
-  } finally {
-    await safelyDisconnectMt(client)
-  }
-})
-
-app.post("/api/telegram-template/auth/disconnect", async (req, res) => {
-  let client
-  try {
-    const session = await requireTemplateSession(req)
-    if (session.mtproto_session_encrypted) {
-      try {
-        client = await createMtProtoClient(session.mtproto_session_encrypted)
-        if (await client.checkAuthorization()) await client.invoke(new (require("telegram").Api.auth.LogOut)({}))
-      } catch (logoutError) {
-        console.warn("Telegram remote logout warning:", logoutError.message)
-      }
-    }
-    await updateTemplateSession(session.id, {
-      mtproto_session_encrypted: null,
-      mtproto_phone_encrypted: null,
-      mtproto_phone_code_hash_encrypted: null,
-      mtproto_auth_status: "disconnected",
-      mtproto_user_json: null,
-    })
-    return res.json({ ok: true, status: "disconnected" })
-  } catch (err) {
-    return res.status(err.statusCode || 500).json({ error: err.message })
-  } finally {
-    await safelyDisconnectMt(client)
-  }
-})
-
-
-
-async function requireTelehubUser(req) {
-  const token = String(req.headers.authorization || "").replace(/^Bearer\s+/i, "").trim()
-  if (!token) {
-    const error = new Error("Sign in to continue.")
-    error.statusCode = 401
-    throw error
-  }
-
-  const { data: { user }, error } = await supabaseAdmin.auth.getUser(token)
-  if (error || !user) {
-    const authError = new Error("Your session is invalid or expired.")
-    authError.statusCode = 401
-    throw authError
-  }
-  return user
-}
-
-async function getTelegramAccountConnection(userId) {
-  const { data, error } = await supabaseAdmin
-    .from("telegram_account_connections")
-    .select("*")
-    .eq("user_id", userId)
-    .maybeSingle()
-  if (error) throw error
-  return data
-}
-
-async function upsertTelegramAccountConnection(userId, values) {
-  const now = new Date().toISOString()
-  const { data, error } = await supabaseAdmin
-    .from("telegram_account_connections")
-    .upsert({ user_id: userId, ...values, updated_at: now, last_used_at: now }, { onConflict: "user_id" })
-    .select("*")
-    .single()
-  if (error) throw error
-  return data
-}
-
-function publicTelegramConnection(connection) {
-  return {
-    connected: connection?.auth_status === "connected",
-    status: connection?.auth_status || "disconnected",
-    telegram_user: connection?.auth_status === "connected" ? {
-      id: connection.telegram_user_id || null,
-      username: connection.telegram_username || null,
-      first_name: connection.telegram_first_name || null,
-      last_name: connection.telegram_last_name || null,
-    } : null,
-  }
-}
-
-app.get("/api/profile", async (req, res) => {
-  try {
-    const user = await requireTelehubUser(req)
-    const { data: existing, error: readError } = await supabaseAdmin
-      .from("profiles")
-      .select("*")
-      .eq("id", user.id)
-      .maybeSingle()
-    if (readError) throw readError
-
-    let profile = existing
-    if (!profile) {
-      const suggested = String(user.user_metadata?.username || "")
-        .replace(/[^A-Za-z0-9_]/g, "")
-        .slice(0, 30)
-      const { data, error } = await supabaseAdmin
-        .from("profiles")
-        .insert({ id: user.id, username: suggested.length >= 3 ? suggested : null })
-        .select("*")
-        .single()
-      if (error) throw error
-      profile = data
-    }
-
-    return res.json({
-      ok: true,
-      profile: { ...profile, email: user.email || null },
-    })
-  } catch (err) {
-    return res.status(err.statusCode || 500).json({ error: err.message })
-  }
-})
-
-app.post("/api/profile/username", async (req, res) => {
-  try {
-    const user = await requireTelehubUser(req)
-    const username = String(req.body?.username || "").trim()
-    if (!/^[A-Za-z0-9_]{3,30}$/.test(username)) {
-      return res.status(400).json({ error: "Username must be 3–30 letters, numbers, or underscores." })
-    }
-
-    const { data: taken, error: takenError } = await supabaseAdmin
-      .from("profiles")
-      .select("id")
-      .ilike("username", username)
-      .neq("id", user.id)
-      .maybeSingle()
-    if (takenError) throw takenError
-    if (taken) return res.status(409).json({ error: "That username is already taken." })
-
-    const now = new Date().toISOString()
-    const { data: profile, error } = await supabaseAdmin
-      .from("profiles")
-      .upsert({ id: user.id, username, updated_at: now }, { onConflict: "id" })
-      .select("*")
-      .single()
-    if (error) throw error
-
-    await supabaseAdmin.auth.admin.updateUserById(user.id, {
-      user_metadata: { ...(user.user_metadata || {}), username },
-    })
-
-    return res.json({ ok: true, profile: { ...profile, email: user.email || null } })
-  } catch (err) {
-    return res.status(err.statusCode || 500).json({ error: err.message })
-  }
-})
-
-app.get("/api/profile/favorites", async (req, res) => {
-  try {
-    const user = await requireTelehubUser(req)
-    const { data, error } = await supabaseAdmin
-      .from("listing_favorites")
-      .select(`
-        listing_id,
-        created_at,
-        listing:channel_listings (
-          id,
-          channel_name,
-          telegram_title,
-          description,
-          telegram_description,
-          icon_url,
-          image_url,
-          telegram_link,
-          listing_type,
-          member_count,
-          votes_count,
-          short_invite,
-          categories,
-          paid_rank,
-          status,
-          is_banned
-        )
-      `)
-      .eq("user_id", user.id)
-      .order("created_at", { ascending: false })
-    if (error) throw error
-
-    const favorites = (data || []).filter((item) => item.listing && item.listing.status === "approved" && !item.listing.is_banned)
-    return res.json({ ok: true, favorites })
-  } catch (err) {
-    return res.status(err.statusCode || 500).json({ error: err.message })
-  }
-})
-
-app.post("/api/profile/favorites/toggle", async (req, res) => {
-  try {
-    const user = await requireTelehubUser(req)
-    const listingId = String(req.body?.listing_id || "").trim()
-    if (!listingId) return res.status(400).json({ error: "Missing listing_id." })
-
-    const { data: listing, error: listingError } = await supabaseAdmin
-      .from("channel_listings")
-      .select("id, status, is_banned")
-      .eq("id", listingId)
-      .maybeSingle()
-    if (listingError) throw listingError
-    if (!listing || listing.status !== "approved" || listing.is_banned) {
-      return res.status(404).json({ error: "Listing not found." })
-    }
-
-    const { data: existing, error: existingError } = await supabaseAdmin
-      .from("listing_favorites")
-      .select("id")
-      .eq("user_id", user.id)
-      .eq("listing_id", listingId)
-      .maybeSingle()
-    if (existingError) throw existingError
-
-    if (existing) {
-      const { error } = await supabaseAdmin.from("listing_favorites").delete().eq("id", existing.id)
-      if (error) throw error
-      return res.json({ ok: true, favorited: false })
-    }
-
-    const { error } = await supabaseAdmin
-      .from("listing_favorites")
-      .insert({ user_id: user.id, listing_id: listingId })
-    if (error) throw error
-    return res.json({ ok: true, favorited: true })
-  } catch (err) {
-    return res.status(err.statusCode || 500).json({ error: err.message })
-  }
-})
-
-app.delete("/api/profile/favorites/:listingId", async (req, res) => {
-  try {
-    const user = await requireTelehubUser(req)
-    const { error } = await supabaseAdmin
-      .from("listing_favorites")
-      .delete()
-      .eq("user_id", user.id)
-      .eq("listing_id", req.params.listingId)
-    if (error) throw error
-    return res.json({ ok: true })
-  } catch (err) {
-    return res.status(err.statusCode || 500).json({ error: err.message })
-  }
-})
-
-app.get("/api/telegram-account/status", async (req, res) => {
-  try {
-    const user = await requireTelehubUser(req)
-    const connection = await getTelegramAccountConnection(user.id)
-    return res.json({ ok: true, ...publicTelegramConnection(connection) })
-  } catch (err) {
-    return res.status(err.statusCode || 500).json({ error: err.message })
-  }
-})
-
-app.post("/api/telegram-account/send-code", async (req, res) => {
-  let client
-  try {
-    const user = await requireTelehubUser(req)
-    const phoneNumber = String(req.body?.phone_number || "").trim()
-    if (!/^\+[1-9]\d{6,14}$/.test(phoneNumber)) {
-      return res.status(400).json({ error: "Enter a valid international phone number, such as +16025551234." })
-    }
-
-    client = await createMtProtoClient("")
-    const sent = await client.sendCode(
-      { apiId: TELEGRAM_MT_API_ID, apiHash: TELEGRAM_MT_API_HASH },
-      phoneNumber
-    )
-
-    await upsertTelegramAccountConnection(user.id, {
-      encrypted_mtproto_session: encryptTemplateSecret(client.session.save()),
-      encrypted_phone_number: encryptTemplateSecret(phoneNumber),
-      encrypted_phone_code_hash: encryptTemplateSecret(sent.phoneCodeHash),
-      auth_status: "code_sent",
-      telegram_user_id: null,
-      telegram_username: null,
-      telegram_first_name: null,
-      telegram_last_name: null,
-      connected_at: null,
-    })
-
-    return res.json({ ok: true, status: "code_sent" })
-  } catch (err) {
-    console.error("Persistent Telegram send-code error:", err)
-    return res.status(err.statusCode || 500).json({ error: err.message })
-  } finally {
-    await safelyDisconnectMt(client)
-  }
-})
-
-app.post("/api/telegram-account/verify-code", async (req, res) => {
-  let client
-  try {
-    const { Api } = require("telegram")
-    const user = await requireTelehubUser(req)
-    const connection = await getTelegramAccountConnection(user.id)
-    const phoneCode = String(req.body?.code || "").replace(/\s+/g, "").trim()
-    if (!phoneCode) return res.status(400).json({ error: "Enter the Telegram login code." })
-    if (!connection?.encrypted_mtproto_session || !connection?.encrypted_phone_number || !connection?.encrypted_phone_code_hash) {
-      return res.status(400).json({ error: "Request a new Telegram login code first." })
-    }
-
-    client = await createMtProtoClient(connection.encrypted_mtproto_session)
-    try {
-      await client.invoke(new Api.auth.SignIn({
-        phoneNumber: decryptTemplateSecret(connection.encrypted_phone_number),
-        phoneCodeHash: decryptTemplateSecret(connection.encrypted_phone_code_hash),
-        phoneCode,
-      }))
-    } catch (signInError) {
-      const message = String(signInError?.errorMessage || signInError?.message || "")
-      if (message.includes("SESSION_PASSWORD_NEEDED")) {
-        await upsertTelegramAccountConnection(user.id, {
-          encrypted_mtproto_session: encryptTemplateSecret(client.session.save()),
-          auth_status: "password_needed",
-        })
-        return res.json({ ok: true, status: "password_needed", password_needed: true })
-      }
-      throw signInError
-    }
-
-    const me = await client.getMe()
-    const connectionData = await upsertTelegramAccountConnection(user.id, {
-      encrypted_mtproto_session: encryptTemplateSecret(client.session.save()),
-      encrypted_phone_code_hash: null,
-      auth_status: "connected",
-      telegram_user_id: String(me.id),
-      telegram_username: me.username || null,
-      telegram_first_name: me.firstName || null,
-      telegram_last_name: me.lastName || null,
-      connected_at: new Date().toISOString(),
-    })
-
-    return res.json({ ok: true, ...publicTelegramConnection(connectionData) })
-  } catch (err) {
-    console.error("Persistent Telegram verify-code error:", err)
-    return res.status(err.statusCode || 500).json({ error: err.message })
-  } finally {
-    await safelyDisconnectMt(client)
-  }
-})
-
-app.post("/api/telegram-account/verify-password", async (req, res) => {
-  let client
-  try {
-    const user = await requireTelehubUser(req)
-    const connection = await getTelegramAccountConnection(user.id)
-    const password = String(req.body?.password || "")
-    if (!password) return res.status(400).json({ error: "Enter your Telegram two-step verification password." })
-    if (!connection?.encrypted_mtproto_session) return res.status(400).json({ error: "Telegram login session not found." })
-
-    client = await createMtProtoClient(connection.encrypted_mtproto_session)
-    await client.signInWithPassword(
-      { apiId: TELEGRAM_MT_API_ID, apiHash: TELEGRAM_MT_API_HASH },
-      { password: async () => password, onError: async (error) => { throw error } }
-    )
-
-    const me = await client.getMe()
-    const connectionData = await upsertTelegramAccountConnection(user.id, {
-      encrypted_mtproto_session: encryptTemplateSecret(client.session.save()),
-      encrypted_phone_code_hash: null,
-      auth_status: "connected",
-      telegram_user_id: String(me.id),
-      telegram_username: me.username || null,
-      telegram_first_name: me.firstName || null,
-      telegram_last_name: me.lastName || null,
-      connected_at: new Date().toISOString(),
-    })
-
-    return res.json({ ok: true, ...publicTelegramConnection(connectionData) })
-  } catch (err) {
-    console.error("Persistent Telegram verify-password error:", err)
-    return res.status(err.statusCode || 500).json({ error: err.message })
-  } finally {
-    await safelyDisconnectMt(client)
-  }
-})
-
-app.post("/api/telegram-account/disconnect", async (req, res) => {
-  let client
-  try {
-    const user = await requireTelehubUser(req)
-    const connection = await getTelegramAccountConnection(user.id)
-
-    if (connection?.encrypted_mtproto_session) {
-      try {
-        client = await createMtProtoClient(connection.encrypted_mtproto_session)
-        if (await client.checkAuthorization()) {
-          const { Api } = require("telegram")
-          await client.invoke(new Api.auth.LogOut({}))
-        }
-      } catch (logoutError) {
-        console.warn("Persistent Telegram logout warning:", logoutError.message)
-      }
-    }
-
-    await upsertTelegramAccountConnection(user.id, {
-      encrypted_mtproto_session: null,
-      encrypted_phone_number: null,
-      encrypted_phone_code_hash: null,
-      auth_status: "disconnected",
-      telegram_user_id: null,
-      telegram_username: null,
-      telegram_first_name: null,
-      telegram_last_name: null,
-      connected_at: null,
-    })
-
-    return res.json({ ok: true, connected: false, status: "disconnected" })
-  } catch (err) {
-    return res.status(err.statusCode || 500).json({ error: err.message })
-  } finally {
-    await safelyDisconnectMt(client)
-  }
-})
-
-
-
-app.get("/api/telegram-template/chats", async (req, res) => {
-  try {
-    const session = await requireTemplateSession(req)
-    const { data: chats, error } = await supabaseAdmin
-      .from("telegram_template_chats")
-      .select("*")
-      .eq("session_id", session.id)
-      .order("connected_at", { ascending: true })
-    if (error) throw error
-
-    const verifiedChats = []
-    for (const savedChat of chats || []) {
-      try {
-        const inspection = await inspectDestinationChat(savedChat.telegram_chat_id)
-        const now = new Date().toISOString()
-        await supabaseAdmin
-          .from("telegram_template_chats")
-          .update({
-            title: inspection.chat.title || savedChat.title,
-            username: inspection.chat.username || null,
-            chat_type: inspection.chat_type,
-            bot_status: inspection.bot_member.status,
-            bot_permissions: inspection.bot_permissions,
-            last_verified_at: now,
-          })
-          .eq("id", savedChat.id)
-        verifiedChats.push({
-          ...savedChat,
-          title: inspection.chat.title || savedChat.title,
-          username: inspection.chat.username || null,
-          chat_type: inspection.chat_type,
-          bot_status: inspection.bot_member.status,
-          bot_permissions: inspection.bot_permissions,
-          last_verified_at: now,
-        })
-      } catch (chatError) {
-        verifiedChats.push({ ...savedChat, bot_status: "unavailable", verification_error: chatError.message })
-      }
-    }
-
-    return res.json({
-      ok: true,
-      connection_code: session.connection_code,
-      expires_at: session.expires_at,
-      auth_status: session.mtproto_auth_status || "disconnected",
-      telegram_user: session.mtproto_user_json || null,
-      chats: verifiedChats,
-    })
-  } catch (err) {
-    return res.status(err.statusCode || 500).json({ error: err.message })
-  }
-})
-
-app.post("/api/telegram-template/preview", async (req, res) => {
-  try {
-    const session = await requireTemplateSession(req)
-    const { source_link, destination_chat_id } = req.body || {}
-    if (!source_link || !destination_chat_id) {
-      return res.status(400).json({ error: "Paste a source link and choose a destination." })
-    }
-    if (session.mtproto_auth_status !== "connected") {
-      return res.status(401).json({ error: "Connect your Telegram account first." })
-    }
-
-    const destinationSaved = await getTemplateConnectedChat(session.id, destination_chat_id)
-    if (!destinationSaved) return res.status(404).json({ error: "Destination chat was not found." })
-
-    const [source, destinationInspection] = await Promise.all([
-      inspectMtProtoSource(session, source_link),
-      inspectDestinationChat(destinationSaved.telegram_chat_id),
-    ])
-    return res.json({ ok: true, preview: buildMtTemplatePreview(source, destinationInspection) })
-  } catch (err) {
-    console.error("Telegram template preview error:", err)
-    return res.status(err.statusCode || 500).json({ error: err.message })
-  }
-})
-
-app.post("/api/telegram-template/apply", async (req, res) => {
-  try {
-    const session = await requireTemplateSession(req)
-    const { source_link, destination_chat_id } = req.body || {}
-    if (!source_link || !destination_chat_id) {
-      return res.status(400).json({ error: "Paste a source link and choose a destination." })
-    }
-    if (session.mtproto_auth_status !== "connected") {
-      return res.status(401).json({ error: "Connect your Telegram account first." })
-    }
-
-    const destinationSaved = await getTemplateConnectedChat(session.id, destination_chat_id)
-    if (!destinationSaved) return res.status(404).json({ error: "Destination chat was not found." })
-
-    const [source, destinationInspection] = await Promise.all([
-      inspectMtProtoSource(session, source_link, { includePhoto: true }),
-      inspectDestinationChat(destinationSaved.telegram_chat_id),
-    ])
-    const preview = buildMtTemplatePreview(source, destinationInspection)
-    const destinationId = destinationInspection.chat.id
-    const results = []
-
-    async function runSetting(key, label, work) {
-      try {
-        await work()
-        results.push({ key, label, ok: true })
-      } catch (settingError) {
-        results.push({ key, label, ok: false, error: settingError.message })
-      }
-    }
-
-    if (destinationInspection.bot_permissions.can_change_info) {
-      await runSetting("title", "Name", () =>
-        tg("setChatTitle", { chat_id: destinationId, title: source.title })
-      )
-      await runSetting("description", "Description", () =>
-        tg("setChatDescription", { chat_id: destinationId, description: source.description || "" })
-      )
-      if (source.photo_available && source.photo_buffer) {
-        await runSetting("photo", "Profile photo", () =>
-          setDestinationPhotoFromBuffer(destinationId, source.photo_buffer)
-        )
-      } else {
-        results.push({ key: "photo", label: "Profile photo", ok: false, skipped: true, error: "No downloadable source photo was available." })
-      }
-    } else {
-      for (const [key, label] of [["title", "Name"], ["description", "Description"], ["photo", "Profile photo"]]) {
-        results.push({ key, label, ok: false, skipped: true, error: "Bot needs permission to change chat information." })
-      }
-    }
-
-    if (source.chat_type === "supergroup" && source.permissions) {
-      if (destinationInspection.bot_permissions.can_restrict_members) {
-        await runSetting("permissions", "Default member permissions", () =>
-          tg("setChatPermissions", {
-            chat_id: destinationId,
-            permissions: filterChatPermissions(source.permissions),
-            use_independent_chat_permissions: true,
-          })
-        )
-      } else {
-        results.push({ key: "permissions", label: "Default member permissions", ok: false, skipped: true, error: "Bot needs permission to restrict members." })
-      }
-    }
-
-    const successful = results.filter((item) => item.ok).length
-    const failed = results.filter((item) => !item.ok && !item.skipped).length
-    const skipped = results.filter((item) => item.skipped).length
-    return res.json({
-      ok: failed === 0,
-      successful,
-      failed,
-      skipped,
-      results,
-      admin_presets: preview.admin_presets,
-      admin_note: preview.admin_note,
-      manual: preview.manual,
-    })
-  } catch (err) {
-    console.error("Telegram template apply error:", err)
-    return res.status(err.statusCode || 500).json({ error: err.message })
-  }
-})
-
-async function handleTelegramTemplateConnection(update) {
-  const message = update.message || update.channel_post
-  const chat = update.my_chat_member?.chat || message?.chat
-  if (!chat) return false
-  const normalizedType = normalizeTemplateChatType(chat.type)
-  if (!normalizedType) return false
-
-  const text = String(message?.text || message?.caption || "").trim()
-  const codeMatch = text.match(/(?:^|\s)(TH-\d{6})(?:\s|$)/i)
-  if (!codeMatch) return false
-  const connectionCode = codeMatch[1].toUpperCase()
-  const now = new Date().toISOString()
-
-  const { data: session, error: sessionError } = await supabaseAdmin
-    .from("telegram_template_sessions")
-    .select("*")
-    .eq("connection_code", connectionCode)
-    .gt("expires_at", now)
-    .maybeSingle()
-  if (sessionError) throw sessionError
-  if (!session) return false
-
-  const inspection = await inspectDestinationChat(chat.id)
-  const { error: upsertError } = await supabaseAdmin
-    .from("telegram_template_chats")
-    .upsert(
-      {
-        session_id: session.id,
-        telegram_chat_id: String(chat.id),
-        title: inspection.chat.title || chat.title || "Telegram Community",
-        username: inspection.chat.username || chat.username || null,
-        chat_type: inspection.chat_type,
-        bot_status: inspection.bot_member.status,
-        bot_permissions: inspection.bot_permissions,
-        connected_by_telegram_user_id: message?.from?.id ? String(message.from.id) : null,
-        connected_at: now,
-        last_verified_at: now,
-      },
-      { onConflict: "session_id,telegram_chat_id" }
-    )
-  if (upsertError) throw upsertError
-
-  if (message?.message_id && inspection.bot_permissions.can_delete_messages) {
-    try {
-      await tg("deleteMessage", { chat_id: chat.id, message_id: message.message_id })
-    } catch (deleteError) {
-      console.warn("Could not remove Telegram template verification message:", deleteError.message)
-    }
-  }
-  return true
-}
-
-app.post("/api/telegram/webhook", async (req, res) => {
-  try {
-    const configuredSecret = String(process.env.TELEGRAM_WEBHOOK_SECRET || "").trim()
-    const receivedSecret = String(req.headers["x-telegram-bot-api-secret-token"] || "")
-    if (configuredSecret && receivedSecret !== configuredSecret) {
-      return res.status(401).json({ error: "Invalid Telegram webhook secret." })
-    }
-
-    const update = req.body || {}
-    try {
-      const connected = await handleTelegramTemplateConnection(update)
-      if (connected) return res.json({ ok: true, template_connected: true })
-    } catch (templateError) {
-      console.error("Telegram template connection error:", templateError)
-    }
-
-    const chat = update.my_chat_member?.chat || update.message?.chat || update.channel_post?.chat
-    if (!chat) return res.json({ ok: true })
-    const username = cleanUsername(chat.username)
-    if (!username) return res.json({ ok: true, message: "Bot detected chat, but no public username found." })
-
-    const { data: listings } = await supabaseAdmin
-      .from("channel_listings")
-      .select("*")
-      .or(`telegram_username.eq.${username},telegram_link.ilike.%${username.replace("@", "")}%`)
-    for (const listing of listings || []) {
-      await syncListingTelegramData({
-        ...listing,
-        telegram_chat_id: String(chat.id),
-        telegram_username: username,
-      })
-    }
-    return res.json({ ok: true })
-  } catch (err) {
-    console.error("Telegram webhook error:", err)
-    return res.status(500).json({ error: err.message })
-  }
-})
-
-app.post("/api/telegram/sync-listing/:id", async (req, res) => {
-  try {
-    const { id } = req.params
-
-    const { data: listing, error } = await supabaseAdmin
-      .from("channel_listings")
-      .select("*")
-      .eq("id", id)
-      .single()
-
-    if (error) throw error
-
-    const result = await syncListingTelegramData(listing)
-
-    res.json({
-      ok: true,
-      member_count: result.memberCount,
-      icon_url: result.iconUrl,
-      telegram_title: result.chat.title,
-      telegram_username: cleanUsername(result.chat.username),
-      listing_type: result.listingType,
-    })
-  } catch (err) {
-    console.error("Manual sync error:", err)
-    res.status(500).json({ error: err.message })
-  }
-})
-
-
-
-
-app.post("/api/telegram/sync-hourly", async (req, res) => {
-  try {
-    if (req.headers.authorization !== `Bearer ${process.env.CRON_SECRET}`) {
-      return res.status(401).json({ error: "Unauthorized" })
-    }
-
-    const result = await runHourlyTelegramSync()
-    return res.json(result)
-  } catch (err) {
-    console.error("Hourly sync error:", err)
-    return res.status(500).json({ error: err.message })
-  }
-})
-
-
-app.post("/api/admin/approve-listing/:id", async (req, res) => {
-  try {
-    const { id } = req.params
-
-    const { data: listing, error } = await supabaseAdmin
-      .from("channel_listings")
-      .update({ status: "approved" })
-      .eq("id", id)
-      .select()
-      .single()
-
-    if (error) throw error
-
-    // Sync Telegram data, then create/update the Framer CMS page.
-    await syncListingTelegramData(listing)
-    const framerResult = await queueFramerSync(() => syncListingToFramerCMS(listing.id))
-
-    res.json({ ok: true, framer: framerResult })
-  } catch (err) {
-    console.error("Approve listing error:", err)
-    res.status(500).json({ error: err.message })
-  }
-})
-
-
-app.get("/api/listings/ranked", async (req, res) => {
-  try {
-    const { data: listings, error: listingsError } = await supabaseAdmin
-      .from("channel_listings")
-      .select("*")
-      .eq("status", "approved")
-      .eq("is_banned", false)
-
-    if (listingsError) throw listingsError
-
-    const listingIds = (listings || []).map((item) => item.id)
-
-    let snapshots = []
-
-    if (listingIds.length > 0) {
-      const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString()
-
-      const { data: snapshotData, error: snapshotError } = await supabaseAdmin
-        .from("channel_member_snapshots")
-        .select("listing_id, member_count, created_at")
-        .in("listing_id", listingIds)
-        .gte("created_at", since)
-        .order("created_at", { ascending: true })
-
-      if (snapshotError) throw snapshotError
-
-      snapshots = snapshotData || []
-    }
-
-    const snapshotsByListing = {}
-
-    snapshots.forEach((snapshot) => {
-      if (!snapshotsByListing[snapshot.listing_id]) {
-        snapshotsByListing[snapshot.listing_id] = []
-      }
-
-      snapshotsByListing[snapshot.listing_id].push(snapshot)
-    })
-
-    const listingsWithGrowth = (listings || []).map((listing) => {
-      const listingSnapshots = snapshotsByListing[listing.id] || []
-      const firstSnapshot = listingSnapshots[0]
-      const latestSnapshot = listingSnapshots[listingSnapshots.length - 1]
-
-      const oldMembers = Number(firstSnapshot?.member_count || listing.member_count || 0)
-      const latestMembers = Number(latestSnapshot?.member_count || listing.member_count || 0)
-
-      const memberGrowth24h = Math.max(0, latestMembers - oldMembers)
-
-      return {
-        ...listing,
-        member_growth_24h: memberGrowth24h,
-      }
-    })
-
-    const maxStats = {
-      maxVotes: Math.max(
-        1,
-        ...listingsWithGrowth.map((item) => Number(item.votes_count || 0))
-      ),
-      maxGrowth: Math.max(
-        1,
-        ...listingsWithGrowth.map((item) => Number(item.member_growth_24h || 0))
-      ),
-    }
-
-    const rankedListings = listingsWithGrowth
-      .map((listing) => {
-        const ranking = calculateRankingScore(listing, maxStats)
-
-        return {
-          ...listing,
-          ...ranking,
-        }
-      })
-      .sort((a, b) => {
-        if (b.ranking_score !== a.ranking_score) {
-          return b.ranking_score - a.ranking_score
-        }
-
-        return (
-          new Date(b.created_at).getTime() -
-          new Date(a.created_at).getTime()
-        )
-      })
-
-    return res.json({
-      ok: true,
-      listings: rankedListings,
-      weights: RANKING_WEIGHTS,
-    })
-  } catch (err) {
-    console.error("Ranked listings error:", err)
-    return res.status(500).json({ error: err.message })
-  }
-})
-
-app.get("/api/listings/homepage-static", async (req, res) => {
-  try {
-    const { data, error } = await supabaseAdmin
-      .from("homepage_listing_cache")
-      .select("listings, updated_at")
-      .eq("id", "homepage_top_18")
-      .maybeSingle()
-
-    if (error) throw error
-
-    res.set("Cache-Control", "public, max-age=300, s-maxage=3600")
-
-    return res.json({
-      ok: true,
-      cached: true,
-      listings: data?.listings || [],
-      updated_at: data?.updated_at || null,
-    })
-  } catch (err) {
-    console.error("Homepage static listings error:", err)
-
-    return res.status(500).json({
-      ok: false,
-      error: err.message,
-      listings: [],
-    })
-  }
-})
-
-
-app.get("/api/cron/update-homepage-cache", async (req, res) => {
-  try {
-    if (req.query.secret !== process.env.CRON_SECRET) {
-      return res.status(401).json({ error: "Unauthorized" })
-    }
-
-    const result = await updateHomepageListingCache()
-
-    return res.json({
-      ok: true,
-      count: result.listings.length,
-      updated_at: result.updated_at,
-    })
-  } catch (err) {
-    console.error("Update homepage cache error:", err)
-
-    return res.status(500).json({
-      ok: false,
-      error: err.message,
-    })
-  }
-})
-
-
-app.get("/api/listings/homepage", async (req, res) => {
-  try {
-    const limit = Math.min(
-      Math.max(parseInt(req.query.limit) || 18, 1),
-      30
-    )
-
-    // Reuse your ranked listings logic
-    const { data: listings, error: listingsError } =
-      await supabaseAdmin
-        .from("channel_listings")
-        .select("*")
-        .eq("status", "approved")
-        .eq("is_banned", false)
-
-    if (listingsError) throw listingsError
-
-    const listingIds = (listings || []).map((item) => item.id)
-
-    let snapshots = []
-
-    if (listingIds.length > 0) {
-      const since = new Date(
-        Date.now() - 24 * 60 * 60 * 1000
-      ).toISOString()
-
-      const {
-        data: snapshotData,
-        error: snapshotError,
-      } = await supabaseAdmin
-        .from("channel_member_snapshots")
-        .select("listing_id, member_count, created_at")
-        .in("listing_id", listingIds)
-        .gte("created_at", since)
-        .order("created_at", { ascending: true })
-
-      if (snapshotError) throw snapshotError
-
-      snapshots = snapshotData || []
-    }
-
-    const snapshotsByListing = {}
-
-    snapshots.forEach((snapshot) => {
-      if (!snapshotsByListing[snapshot.listing_id]) {
-        snapshotsByListing[snapshot.listing_id] = []
-      }
-
-      snapshotsByListing[snapshot.listing_id].push(snapshot)
-    })
-
-    const listingsWithGrowth = (listings || []).map((listing) => {
-      const listingSnapshots =
-        snapshotsByListing[listing.id] || []
-
-      const firstSnapshot = listingSnapshots[0]
-      const latestSnapshot =
-        listingSnapshots[listingSnapshots.length - 1]
-
-      const oldMembers = Number(
-        firstSnapshot?.member_count ||
-          listing.member_count ||
-          0
-      )
-
-      const latestMembers = Number(
-        latestSnapshot?.member_count ||
-          listing.member_count ||
-          0
-      )
-
-      const memberGrowth24h = Math.max(
-        0,
-        latestMembers - oldMembers
-      )
-
-      return {
-        ...listing,
-        member_growth_24h: memberGrowth24h,
-      }
-    })
-
-    const maxStats = {
-      maxVotes: Math.max(
-        1,
-        ...listingsWithGrowth.map((item) =>
-          Number(item.votes_count || 0)
-        )
-      ),
-      maxGrowth: Math.max(
-        1,
-        ...listingsWithGrowth.map((item) =>
-          Number(item.member_growth_24h || 0)
-        )
-      ),
-    }
-
-    const homepageListings = listingsWithGrowth
-      .map((listing) => ({
-        ...listing,
-        ...calculateRankingScore(listing, maxStats),
-      }))
-      .sort((a, b) => {
-        if (b.ranking_score !== a.ranking_score) {
-          return b.ranking_score - a.ranking_score
-        }
-
-        return (
-          new Date(b.created_at).getTime() -
-          new Date(a.created_at).getTime()
-        )
-      })
-      .slice(0, limit)
-
-    return res.json({
-      ok: true,
-      listings: homepageListings,
-    })
-  } catch (err) {
-    console.error("Homepage listings error:", err)
-    return res.status(500).json({
-      error: err.message,
-    })
-  }
-})
-
-
-
-app.get("/api/widgets/preview", async (req, res) => {
-  try {
-    const link = String(req.query.link || "").trim()
-
-    if (!link) {
-      return res.status(400).json({ error: "Missing Telegram link" })
-    }
-
-    const username = extractUsernameFromLink(link)
-
-    if (!username) {
-      return res.status(400).json({
-        error: "This widget currently supports public t.me usernames only.",
-      })
-    }
-
-    const chat = await tg("getChat", { chat_id: username })
-    const memberCount = await tg("getChatMemberCount", { chat_id: chat.id })
-
-    let iconUrl = null
-
-    if (chat.photo?.big_file_id) {
-      const file = await tg("getFile", { file_id: chat.photo.big_file_id })
-      iconUrl = `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${file.file_path}`
-    }
-
-    const listingType = normalizeTelegramType(chat.type)
-
-    if (!listingType) {
-      return res.status(400).json({
-        error: "We could not detect whether this is a Telegram group or channel.",
-      })
-    }
-
-    return res.json({
-      ok: true,
-      title: chat.title || username,
-      username: cleanUsername(chat.username),
-      description: chat.description || chat.bio || "",
-      member_count: memberCount,
-      icon_url: iconUrl,
-      telegram_link: link,
-      listing_type: listingType,
-      theme_color: "#229ED9",
-    })
-  } catch (err) {
-    console.error("Widget preview error:", err)
-    return res.status(500).json({ error: err.message })
-  }
-})
-
-
-
-app.get("/api/telegram/sync-hourly", async (req, res) => {
-  try {
-    if (req.query.secret !== process.env.CRON_SECRET) {
-      return res.status(401).json({ error: "Unauthorized" })
-    }
-
-    const result = await runHourlyTelegramSync()
-    return res.json(result)
-  } catch (err) {
-    console.error("Hourly sync error:", err)
-    return res.status(500).json({ error: err.message })
-  }
-})
-
-
-
-
-// ========================================
-// ADMIN AI TELEGRAM LISTING IMPORT
-// ========================================
-
-const DEFAULT_ADMIN_IMPORT_LIMIT = 25
-const MAX_ADMIN_IMPORT_LIMIT = 50
-const OPENAI_IMPORT_MODEL = process.env.OPENAI_IMPORT_MODEL || "gpt-4o-mini"
-const IMPORT_CATEGORY_FALLBACKS = [
-  "Crypto",
-  "Gaming",
-  "Technology",
-  "Trading",
-  "Finance",
-  "Education",
-  "Startups",
-  "News",
-  "Business",
-  "Community",
-  "Investing",
-  "AI",
-  "Marketing",
-  "Entertainment",
-  "Sports",
+type TabName = "pending" | "changes" | "banned" | "import"
+
+const BACKEND_URL = "https://telegramboard.onrender.com"
+const IMAGE_BUCKET = "listing-images"
+
+const MOD_FIELDS = [
+    "listing_type",
+    "channel_name",
+    "telegram_link",
+    "description",
+    "long_description",
+    "categories",
+    "image_url",
+    "icon_url",
+    "telegram_username",
+    "telegram_title",
+    "telegram_description",
+    "member_count",
+    "votes_count",
+    "is_nsfw",
+    "short_invite",
+    "status",
 ]
 
-const ADMIN_USER_IDS = (process.env.ADMIN_USER_IDS || "0a908330-be3d-44ad-af73-c7113fa1e41d,f63dca60-e46c-494d-9909-a4554b2ae904,eb65ec8c-ced2-4f25-807e-6a733aa75f08")
-  .split(",")
-  .map((id) => id.trim())
-  .filter(Boolean)
-
-function isBackendAdminUser(user) {
-  if (!user) return false
-  const email = String(user.email || "").toLowerCase()
-  return ADMIN_EMAILS.includes(email) || ADMIN_USER_IDS.includes(user.id)
-}
-
-function cleanImportTelegramLink(value) {
-  let trimmed = String(value || "").trim()
-
-  if (!trimmed) return ""
-
-  // Allow users to paste links with commas, bullets, or extra spaces.
-  trimmed = trimmed
-    .replace(/^[-*•]+\s*/, "")
-    .replace(/[),.;]+$/g, "")
-    .trim()
-
-  if (trimmed.startsWith("@")) {
-    trimmed = `https://t.me/${trimmed.replace("@", "")}`
-  }
-
-  if (trimmed.startsWith("t.me/")) {
-    trimmed = `https://${trimmed}`
-  }
-
-  trimmed = trimmed
-    .replace("http://t.me/", "https://t.me/")
-    .replace("https://telegram.me/", "https://t.me/")
-    .replace("http://telegram.me/", "https://t.me/")
-    .replace("https://t.me/s/", "https://t.me/")
-    .replace(/\/+$/g, "")
-
-  return trimmed
-}
-
-function parseTelegramImportLinks(value) {
-  const rawItems = Array.isArray(value)
-    ? value
-    : String(value || "")
-        .split(/[\n,]+/g)
-        .map((item) => item.trim())
-
-  return uniqueValues(rawItems.map(cleanImportTelegramLink))
-}
-
-function slugifyImportValue(value) {
-  return cleanCmsSlug(value || "telegram-listing") || "telegram-listing"
-}
-
-async function generateUniqueShortInviteFromBase(baseValue) {
-  const base = slugifyImportValue(baseValue).slice(0, 24) || "telegram-listing"
-  let candidate = base
-  let counter = 2
-
-  while (true) {
-    const { data, error } = await supabaseAdmin
-      .from("channel_listings")
-      .select("id")
-      .eq("short_invite", candidate)
-      .maybeSingle()
-
-    if (error) throw error
-    if (!data) return candidate
-
-    const suffix = `-${counter}`
-    candidate = `${base.slice(0, 24 - suffix.length)}${suffix}`
-    counter += 1
-  }
-}
-
-function makeImportFallbackCategories(text, listingType) {
-  const lower = String(text || "").toLowerCase()
-  const matches = []
-
-  const tests = [
-    ["Crypto", ["crypto", "bitcoin", "ethereum", "solana", "memecoin", "airdrop", "web3", "token", "coin"]],
-    ["Trading", ["trading", "forex", "stocks", "signals", "options", "market", "invest"]],
-    ["Gaming", ["gaming", "game", "minecraft", "valorant", "cs2", "fortnite", "roblox", "xbox", "playstation"]],
-    ["Technology", ["tech", "software", "app", "android", "ios", "developer", "coding"]],
-    ["AI", ["ai", "artificial intelligence", "chatgpt", "bot", "automation"]],
-    ["Education", ["learn", "education", "course", "study", "school", "language"]],
-    ["Marketing", ["marketing", "smm", "growth", "promotion", "traffic"]],
-    ["Business", ["business", "startup", "entrepreneur", "sales", "ecommerce"]],
-    ["News", ["news", "updates", "announcements"]],
-    ["Entertainment", ["movie", "music", "anime", "memes", "fun", "media"]],
-  ]
-
-  for (const [category, keywords] of tests) {
-    if (keywords.some((keyword) => lower.includes(keyword))) {
-      matches.push(category)
-    }
-  }
-
-  if (!matches.length) matches.push(listingType === "group" ? "Community" : "News")
-  if (!matches.includes("Telegram")) matches.push("Telegram")
-
-  return matches.slice(0, 5)
-}
-
-function sanitizeAiImportContent(raw, fallback) {
-  const source = raw && typeof raw === "object" ? raw : {}
-
-  let description = String(source.description || fallback.description || "").trim()
-  let longDescription = String(source.long_description || source.longDescription || fallback.long_description || "").trim()
-  let categories = Array.isArray(source.categories) ? source.categories : fallback.categories
-
-  categories = uniqueValues(
-    (categories || [])
-      .map((cat) => String(cat || "").trim())
-      .filter(Boolean)
-      .map((cat) => cat.charAt(0).toUpperCase() + cat.slice(1))
-  ).slice(0, 5)
-
-  if (!categories.length) categories = fallback.categories
-
-  if (!description) description = fallback.description
-  if (!longDescription) longDescription = fallback.long_description
-
-  description = description.slice(0, 250)
-  longDescription = longDescription.slice(0, 2000)
-
-  return {
-    description,
-    long_description: longDescription,
-    categories,
-    is_nsfw: source.is_nsfw === true,
-  }
-}
-
-function fallbackImportContent({ title, username, telegramDescription, memberCount, listingType }) {
-  const typeLabel = listingType === "group" ? "group" : "channel"
-  const name = title || username || "This Telegram community"
-  const baseText = [title, username, telegramDescription].filter(Boolean).join(" ")
-  const categories = makeImportFallbackCategories(baseText, listingType)
-  const memberText = memberCount ? `${Number(memberCount).toLocaleString()} members` : "an active audience"
-
-  const description = telegramDescription
-    ? String(telegramDescription).slice(0, 240)
-    : `${name} is a Telegram ${typeLabel} listed on TeleHub with ${memberText}.`
-
-  const long_description = telegramDescription
-    ? `${telegramDescription}\n\n${name} is listed on TeleHub so users can discover its Telegram link, category, member count, and community details.`
-    : `${name} is a Telegram ${typeLabel} listed on TeleHub. Explore this listing to view its Telegram link, member count, category, and community details before joining.`
-
-  return {
-    description: description.slice(0, 250),
-    long_description: long_description.slice(0, 2000),
-    categories,
-    is_nsfw: false,
-  }
-}
-
-async function generateAiImportContent(input) {
-  const fallback = fallbackImportContent(input)
-  const styleAngles = ["direct utility listing", "casual Telegram promo", "clean directory summary", "community-focused listing", "creator/news update listing", "fan/community listing", "short punchy listing", "professional but not corporate listing"]
-  const styleAngle = styleAngles[Math.floor(Math.random() * styleAngles.length)]
-  
-  if (!process.env.OPENAI_API_KEY) {
-    return {
-      ...fallback,
-      ai_used: false,
-      ai_error: "OPENAI_API_KEY is not set; used fallback content.",
-    }
-  }
-  
-  try {
-    const prompt = {
-      telegram_title: input.title || "",
-      telegram_username: input.username || "",
-      telegram_description: input.telegramDescription || "",
-      member_count: Number(input.memberCount || 0),
-      listing_type: input.listingType || "channel",
-      writing_style: styleAngle,
-    }
-
-    const response = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model: OPENAI_IMPORT_MODEL,
-        response_format: { type: "json_object" },
-        temperature: 0.95,
-        presence_penalty: 0.6,
-        frequency_penalty: 0.5,
-        max_tokens: 900,
-        messages: [
-          {
-            role: "system",
-            content:
-              "You generate realistic, varied listing copy for TeleHub, a Telegram group/channel directory. Follow the writing_style provided in the user JSON. Return ONLY valid JSON: {\"description\":string,\"long_description\":string,\"categories\":string[],\"is_nsfw\":boolean}. The description must NOT use generic repeated openings like \"Join\", \"Stay updated\", \"Welcome to\", \"Discover\", \"This is\", \"A Telegram\", or \"[Name] is\" unless absolutely necessary. Every listing must use a different sentence structure and tone based on the source: some should sound like a fan/community listing, some like a clean directory summary, some like a direct utility listing, some like a creator/news listing, and some like a casual Telegram promo. Use the Telegram title, username, bio, member count, and listing type as the only source. Rewrite the bio into natural human copy; do not copy the bio word-for-word. Use 0-3 relevant emojis only when they fit the original vibe. Do not invent official status, guarantees, discounts, pricing, safety, verification, or trust claims. Only say official if the source clearly says official. description must be 120-240 characters, punchy, specific, and card-ready. long_description must be 500-1100 characters in 1-3 short paragraphs, explaining what users may find, who it is for, and why someone might join, without sounding corporate or AI-written. categories must be 2-5 short Title Case tags, specific first and broad second. is_nsfw is true only for clearly adult, explicit, sexual, gambling, drugs, or mature content.",
-          },
-          {
-            role: "user",
-            content: JSON.stringify(prompt),
-          },
-        ],
-      }),
-    })
-
-    const json = await response.json()
-
-    if (!response.ok) {
-      throw new Error(json?.error?.message || "OpenAI request failed")
-    }
-
-    const content = json?.choices?.[0]?.message?.content || "{}"
-    const parsed = JSON.parse(content)
-    const sanitized = sanitizeAiImportContent(parsed, fallback)
-
-    return {
-      ...sanitized,
-      ai_used: true,
-      ai_error: null,
-    }
-  } catch (err) {
-    console.error("AI import content generation failed:", err.message)
-    return {
-      ...fallback,
-      ai_used: false,
-      ai_error: err.message,
-    }
-  }
-}
-
-async function findDuplicateImportListing({ telegramChatId, telegramUsername, telegramLink }) {
-  const checks = []
-
-  if (telegramChatId) checks.push(["telegram_chat_id", String(telegramChatId)])
-  if (telegramUsername) checks.push(["telegram_username", telegramUsername])
-  if (telegramLink) checks.push(["telegram_link", telegramLink])
-
-  for (const [field, value] of checks) {
-    const { data, error } = await supabaseAdmin
-      .from("channel_listings")
-      .select("id, channel_name, short_invite, telegram_link, telegram_username, telegram_chat_id")
-      .eq(field, value)
-      .limit(1)
-      .maybeSingle()
-
-    if (error) throw error
-    if (data) return data
-  }
-
-  return null
-}
-
-async function importSingleTelegramListing(link, options, adminUser) {
-  const telegramLink = cleanImportTelegramLink(link)
-
-  if (!telegramLink) {
-    return { ok: false, link, error: "Empty link." }
-  }
-
-  const username = extractUsernameFromLink(telegramLink)
-
-  if (!username) {
-    return {
-      ok: false,
-      link: telegramLink,
-      error: "Only public t.me usernames can be imported automatically.",
-    }
-  }
-
-  const chat = await tg("getChat", { chat_id: username })
-  const listingType = normalizeTelegramType(chat.type)
-
-  if (!listingType) {
-    return {
-      ok: false,
-      link: telegramLink,
-      error: "Could not detect whether this Telegram link is a group or channel.",
-    }
-  }
-
-  const telegramUsername = cleanUsername(chat.username) || username
-  const normalizedTelegramLink = chat.username
-    ? `https://t.me/${chat.username}`
-    : telegramLink
-
-  const duplicate = await findDuplicateImportListing({
-    telegramChatId: String(chat.id),
-    telegramUsername,
-    telegramLink: normalizedTelegramLink,
-  })
-
-  if (duplicate) {
-    return {
-      ok: true,
-      skipped: true,
-      reason: "duplicate",
-      link: normalizedTelegramLink,
-      existing_listing_id: duplicate.id,
-      existing_name: duplicate.channel_name,
-      existing_short_invite: duplicate.short_invite,
-    }
-  }
-
-  const memberCount = await tg("getChatMemberCount", { chat_id: chat.id })
-  const telegramDescription = chat.description || chat.bio || ""
-
-  const aiContent = await generateAiImportContent({
-    title: chat.title || telegramUsername,
-    username: telegramUsername,
-    telegramDescription,
-    memberCount,
-    listingType,
-  })
-
-  const shortInviteBase = stripTelegramHandle(telegramUsername) || chat.title || "telegram-listing"
-  const shortInvite = await generateUniqueShortInviteFromBase(shortInviteBase)
-
-  const insertPayload = {
-    user_id: adminUser.id,
-    listing_type: listingType,
-    channel_name: chat.title || stripTelegramHandle(telegramUsername) || "Telegram Listing",
-    telegram_link: normalizedTelegramLink,
-    description: aiContent.description,
-    long_description: aiContent.long_description,
-    categories: aiContent.categories,
-    is_nsfw: aiContent.is_nsfw,
-    short_invite: shortInvite,
-    slug: `${listingType}-${slugifyImportValue(chat.title || telegramUsername)}-${Date.now().toString().slice(-6)}`,
-    status: "approved",
-    admin_reviewed: false,
-    telegram_chat_id: String(chat.id),
-    telegram_username: telegramUsername,
-    telegram_title: chat.title || null,
-    telegram_description: telegramDescription || null,
-    member_count: memberCount,
-    votes_count: 0,
-    last_synced_at: new Date().toISOString(),
-    framer_sync_status: options.syncToFramer ? "not_synced" : null,
-  }
-
-  const { data: inserted, error: insertError } = await supabaseAdmin
-    .from("channel_listings")
-    .insert(insertPayload)
-    .select("id, short_invite")
-    .single()
-
-  if (insertError) throw insertError
-
-  let iconUrl = null
-  let iconError = null
-
-  if (chat.photo?.big_file_id) {
-    try {
-      iconUrl = await uploadTelegramPhoto(chat.photo.big_file_id, inserted.id)
-    } catch (err) {
-      iconError = err.message
-      console.error("Auto import icon upload failed:", err.message)
-    }
-  }
-
-  if (iconUrl) {
-    const { error: imageUpdateError } = await supabaseAdmin
-      .from("channel_listings")
-      .update({
-        icon_url: iconUrl,
-        image_url: options.useIconAsBackground ? iconUrl : null,
-        updated_at: new Date().toISOString(),
-      })
-      .eq("id", inserted.id)
-
-    if (imageUpdateError) throw imageUpdateError
-  }
-
-  let framerResult = null
-  let framerError = null
-
-  if (options.syncToFramer) {
-    try {
-      framerResult = await queueFramerSync(() =>
-        syncListingToFramerCMS(inserted.id, { publish: false })
-      )
-    } catch (err) {
-      framerError = err.message
-      console.error("Auto import Framer sync failed:", err.message)
-    }
-  }
-
-  return {
-    ok: true,
-    created: true,
-    link: normalizedTelegramLink,
-    listing_id: inserted.id,
-    channel_name: insertPayload.channel_name,
-    short_invite: inserted.short_invite,
-    url: `https://telehub.to/channel/${inserted.short_invite}`,
-    listing_type: listingType,
-    member_count: memberCount,
-    categories: aiContent.categories,
-    ai_used: aiContent.ai_used,
-    ai_error: aiContent.ai_error,
-    icon_url: iconUrl,
-    icon_error: iconError,
-    framer_synced: !!framerResult?.ok,
-    framer_error: framerError,
-  }
-}
-
-app.post("/api/admin/import-telegram-listings", async (req, res) => {
-  try {
-    const authHeader = req.headers.authorization || ""
-    const token = authHeader.replace("Bearer ", "")
-
-    if (!token) {
-      return res.status(401).json({ error: "Missing auth token." })
-    }
-
-    const {
-      data: { user },
-      error: userError,
-    } = await supabaseAdmin.auth.getUser(token)
-
-    if (userError || !user || !isBackendAdminUser(user)) {
-      return res.status(403).json({ error: "Admin access required." })
-    }
-
-    const links = parseTelegramImportLinks(req.body?.links || req.body?.links_text || "")
-    const requestedLimit = Number(req.body?.limit || DEFAULT_ADMIN_IMPORT_LIMIT)
-    const limit = Math.min(Math.max(requestedLimit || DEFAULT_ADMIN_IMPORT_LIMIT, 1), MAX_ADMIN_IMPORT_LIMIT)
-    const linksToImport = links.slice(0, limit)
-
-    if (!linksToImport.length) {
-      return res.status(400).json({ error: "Paste at least one public Telegram link." })
-    }
-
-    const options = {
-      syncToFramer: req.body?.sync_to_framer !== false,
-      useIconAsBackground: req.body?.use_icon_as_background !== false,
-    }
-
-    const results = []
-
-    for (const link of linksToImport) {
-      try {
-        const result = await importSingleTelegramListing(link, options, user)
-        results.push(result)
-      } catch (err) {
-        console.error("Auto import listing failed:", link, err)
-        results.push({
-          ok: false,
-          link,
-          error: err.message || "Import failed.",
+// Old-style frontend admin check.
+// Add more user IDs or emails here if needed.
+const ADMIN_USER_IDS = [
+    "0a908330-be3d-44ad-af73-c7113fa1e41d",
+    "f63dca60-e46c-494d-9909-a4554b2ae904",
+    "eb65ec8c-ced2-4f25-807e-6a733aa75f08",
+]
+const ADMIN_EMAILS: string[] = []
+
+export default function TelecadiaAdminListings(props: { loginPath: string }) {
+    const { loginPath } = props
+
+    const [loading, setLoading] = React.useState(true)
+    const [user, setUser] = React.useState<any>(null)
+    const [isAdmin, setIsAdmin] = React.useState(false)
+
+    const [activeTab, setActiveTab] = React.useState<TabName>("changes")
+    const [pendingListings, setPendingListings] = React.useState<any[]>([])
+    const [pendingImageFiles, setPendingImageFiles] = React.useState<
+        Record<string, File | null>
+    >({})
+    const [pendingImagePreviews, setPendingImagePreviews] = React.useState<
+        Record<string, string>
+    >({})
+    const [savingListingId, setSavingListingId] = React.useState("")
+    const [changes, setChanges] = React.useState<any[]>([])
+    const [bannedListings, setBannedListings] = React.useState<any[]>([])
+
+    const [error, setError] = React.useState("")
+    const [message, setMessage] = React.useState("")
+    const [importLinks, setImportLinks] = React.useState("")
+    const [importing, setImporting] = React.useState(false)
+    const [importResults, setImportResults] = React.useState<any[]>([])
+    const [importUseIconAsBackground, setImportUseIconAsBackground] =
+        React.useState(true)
+    const [importSyncToFramer, setImportSyncToFramer] = React.useState(true)
+    const [telegramRetryAfter, setTelegramRetryAfter] = React.useState(0)
+
+    React.useEffect(() => {
+        loadAdminPanel()
+    }, [])
+
+    React.useEffect(() => {
+        if (telegramRetryAfter <= 0) return
+
+        const timer = window.setInterval(() => {
+            setTelegramRetryAfter((seconds) => Math.max(0, seconds - 1))
+        }, 1000)
+
+        return () => window.clearInterval(timer)
+    }, [telegramRetryAfter > 0])
+
+    async function loadAdminPanel() {
+        setLoading(true)
+        setError("")
+        setMessage("")
+
+        const { data: sessionData, error: sessionError } =
+            await supabase.auth.getSession()
+
+        if (sessionError) {
+            setError(sessionError.message)
+            setLoading(false)
+            return
+        }
+
+        const currentUser = sessionData.session?.user ?? null
+        setUser(currentUser)
+
+        if (!currentUser) {
+            setLoading(false)
+            return
+        }
+
+        const token = sessionData.session?.access_token
+
+        if (!token) {
+            setIsAdmin(false)
+            setLoading(false)
+            return
+        }
+
+        const adminRes = await fetch(`${BACKEND_URL}/api/auth/is-admin`, {
+            method: "POST",
+            headers: {
+                Authorization: `Bearer ${token}`,
+            },
         })
-      }
+
+        const adminData = await adminRes.json().catch(() => ({}))
+        const allowed = adminRes.ok && adminData?.isAdmin === true
+
+        if (!allowed) {
+            setIsAdmin(false)
+            setLoading(false)
+            return
+        }
+
+        setIsAdmin(true)
+
+        await Promise.all([
+            loadPendingListings(),
+            loadRecentChanges(),
+            loadBannedListings(),
+        ])
+
+        setLoading(false)
     }
 
-    let deployed = false
+    async function loadPendingListings() {
+        const sevenDaysAgo = new Date(
+            Date.now() - 7 * 24 * 60 * 60 * 1000
+        ).toISOString()
 
-    if (options.syncToFramer && process.env.FRAMER_AUTO_DEPLOY !== "false") {
-      const createdNeedingDeploy = results.some((item) => item.created && item.framer_synced)
+        const { data, error } = await supabase
+            .from("channel_listings")
+            .select("*")
+            .eq("admin_reviewed", false)
+            .eq("is_banned", false)
+            .eq("status", "approved")
+            .gte("created_at", sevenDaysAgo)
+            .order("created_at", { ascending: false })
 
-      if (createdNeedingDeploy) {
-        const { connect } = await import("framer-api")
-        const framer = await connect(process.env.FRAMER_PROJECT_URL, process.env.FRAMER_API_KEY)
+        if (error) {
+            setError(error.message)
+            return
+        }
+
+        setPendingListings(data || [])
+    }
+
+    async function loadRecentChanges() {
+        const { data, error } = await supabase
+            .from("channel_listing_changes")
+            .select("*")
+            .order("created_at", { ascending: false })
+            .limit(60)
+
+        if (error) {
+            setError(error.message)
+            return
+        }
+
+        setChanges(data || [])
+    }
+
+    async function loadBannedListings() {
+        const { data, error } = await supabase
+            .from("channel_listings")
+            .select("*")
+            .eq("is_banned", true)
+            .order("updated_at", { ascending: false })
+
+        if (error) {
+            setError(error.message)
+            return
+        }
+
+        setBannedListings(data || [])
+    }
+
+    function updatePendingField(id: string, field: string, value: any) {
+        setPendingListings((prev) =>
+            prev.map((listing) =>
+                listing.id === id ? { ...listing, [field]: value } : listing
+            )
+        )
+    }
+
+    function handlePendingBackgroundSelect(
+        listingId: string,
+        event: React.ChangeEvent<HTMLInputElement>
+    ) {
+        const file = event.target.files?.[0]
+        setError("")
+
+        if (!file) return
+        if (!file.type.startsWith("image/")) {
+            setError("Please upload an image file.")
+            return
+        }
+        if (file.size > 5 * 1024 * 1024) {
+            setError("Background image must be under 5MB.")
+            return
+        }
+
+        const previousPreview = pendingImagePreviews[listingId]
+        if (previousPreview?.startsWith("blob:")) {
+            URL.revokeObjectURL(previousPreview)
+        }
+
+        setPendingImageFiles((prev) => ({ ...prev, [listingId]: file }))
+        setPendingImagePreviews((prev) => ({
+            ...prev,
+            [listingId]: URL.createObjectURL(file),
+        }))
+    }
+
+    async function uploadPendingBackground(
+        listingId: string,
+        currentImageUrl: string | null
+    ) {
+        const file = pendingImageFiles[listingId]
+        if (!file) return currentImageUrl || null
+        if (!user?.id) throw new Error("You must be logged in.")
+
+        const rawExt = file.name.split(".").pop() || "jpg"
+        const cleanExt = rawExt.toLowerCase().replace(/[^a-z0-9]/g, "") || "jpg"
+        const filePath = `${user.id}/admin-${listingId}-${Date.now()}-${Math.random()
+            .toString(36)
+            .slice(2)}.${cleanExt}`
+
+        const { error: uploadError } = await supabase.storage
+            .from(IMAGE_BUCKET)
+            .upload(filePath, file, {
+                cacheControl: "3600",
+                upsert: false,
+                contentType: file.type,
+            })
+
+        if (uploadError) throw uploadError
+
+        const { data } = supabase.storage
+            .from(IMAGE_BUCKET)
+            .getPublicUrl(filePath)
+
+        return data.publicUrl
+    }
+
+    async function getAccessToken() {
+        const { data: sessionData, error: sessionError } =
+            await supabase.auth.getSession()
+
+        if (sessionError) throw sessionError
+
+        const token = sessionData.session?.access_token
+
+        if (!token) {
+            throw new Error("Your admin session expired. Log in again.")
+        }
+
+        return token
+    }
+
+    async function syncAdminListingChange(
+        listingId: string,
+        changedFields: string[],
+        options?: { forceFullSync?: boolean }
+    ) {
+        const token = await getAccessToken()
+        const forceFullSync =
+            options?.forceFullSync === true ||
+            changedFields.includes("short_invite")
+
+        const endpoint = forceFullSync
+            ? "/api/framer/sync-listing"
+            : "/api/framer/sync-content-change"
+
+        const body = forceFullSync
+            ? { listing_id: listingId }
+            : {
+                  listing_id: listingId,
+                  changed_fields: changedFields,
+              }
+
+        const res = await fetch(`${BACKEND_URL}${endpoint}`, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                Authorization: `Bearer ${token}`,
+            },
+            body: JSON.stringify(body),
+        })
+
+        const data = await res.json().catch(() => ({}))
+
+        if (!res.ok) {
+            throw new Error(
+                data?.error ||
+                    "The listing was saved, but its public page did not refresh."
+            )
+        }
+
+        return data
+    }
+
+    async function updateStatus(id: string, status: "approved" | "rejected") {
+        setError("")
+        setMessage("")
+        setSavingListingId(id)
 
         try {
-          const publication = await framer.publish()
-          await framer.deploy(publication.deployment.id)
-          deployed = true
+            const listing = pendingListings.find((item) => item.id === id)
+            if (!listing) throw new Error("Listing could not be found.")
+
+            if (status === "approved") {
+                const finalImageUrl = await uploadPendingBackground(
+                    id,
+                    listing.image_url || null
+                )
+
+                const { error } = await supabase
+                    .from("channel_listings")
+                    .update({
+                        listing_type: listing.listing_type || "channel",
+                        channel_name: String(listing.channel_name || "").trim(),
+                        telegram_title: String(
+                            listing.telegram_title || ""
+                        ).trim(),
+                        telegram_username: String(
+                            listing.telegram_username || ""
+                        ).trim(),
+                        telegram_link: String(
+                            listing.telegram_link || ""
+                        ).trim(),
+                        description: String(listing.description || "").trim(),
+                        long_description: String(
+                            listing.long_description || ""
+                        ).trim(),
+                        telegram_description: String(
+                            listing.telegram_description || ""
+                        ).trim(),
+                        member_count: Number(listing.member_count || 0),
+                        votes_count: Number(listing.votes_count || 0),
+                        short_invite: String(listing.short_invite || "").trim(),
+                        is_nsfw: Boolean(listing.is_nsfw),
+                        image_url: finalImageUrl,
+                        status: "approved",
+                        admin_reviewed: true,
+                        updated_at: new Date().toISOString(),
+                    })
+                    .eq("id", id)
+
+                if (error) throw error
+
+                await syncAdminListingChange(
+                    id,
+                    [
+                        "listing_type",
+                        "channel_name",
+                        "telegram_title",
+                        "telegram_username",
+                        "telegram_link",
+                        "description",
+                        "long_description",
+                        "telegram_description",
+                        "short_invite",
+                        "is_nsfw",
+                        "image_url",
+                        "status",
+                    ],
+                    {
+                        forceFullSync: true,
+                    }
+                )
+            } else {
+                const { error } = await supabase
+                    .from("channel_listings")
+                    .update({
+                        status: "rejected",
+                        admin_reviewed: true,
+                        updated_at: new Date().toISOString(),
+                    })
+                    .eq("id", id)
+
+                if (error) throw error
+            }
+
+            const preview = pendingImagePreviews[id]
+            if (preview?.startsWith("blob:")) URL.revokeObjectURL(preview)
+
+            setPendingImageFiles((prev) => {
+                const next = { ...prev }
+                delete next[id]
+                return next
+            })
+            setPendingImagePreviews((prev) => {
+                const next = { ...prev }
+                delete next[id]
+                return next
+            })
+
+            setPendingListings((prev) => prev.filter((item) => item.id !== id))
+            setMessage(
+                status === "approved"
+                    ? "Listing edits saved, approved, and public page refreshed."
+                    : "Listing rejected."
+            )
+
+            await Promise.all([
+                loadRecentChanges(),
+                loadBannedListings(),
+                loadPendingListings(),
+            ])
+        } catch (err: any) {
+            setError(err?.message || "Status update failed.")
         } finally {
-          await framer.disconnect()
+            setSavingListingId("")
         }
-      }
     }
 
-    let homepageCache = null
+    async function banListing(
+        listingId: string,
+        reason = "Temporarily banned by admin."
+    ) {
+        setError("")
+        setMessage("")
 
-    try {
-      homepageCache = await updateHomepageListingCache()
-    } catch (cacheErr) {
-      console.error("Homepage cache refresh after auto import failed:", cacheErr.message)
+        const { error } = await supabase
+            .from("channel_listings")
+            .update({
+                is_banned: true,
+                admin_reviewed: true,
+                ban_reason: reason,
+                updated_at: new Date().toISOString(),
+            })
+            .eq("id", listingId)
+
+        if (error) {
+            setError(error.message)
+            return
+        }
+
+        setMessage("Listing temporarily banned.")
+        await Promise.all([
+            loadRecentChanges(),
+            loadBannedListings(),
+            loadPendingListings(),
+        ])
     }
 
-    const summary = {
-      total_received: links.length,
-      processed: linksToImport.length,
-      created: results.filter((item) => item.created).length,
-      duplicates: results.filter((item) => item.skipped).length,
-      failed: results.filter((item) => item.ok === false).length,
-      framer_synced: results.filter((item) => item.framer_synced).length,
-      deployed,
+    async function unbanListing(listingId: string) {
+        setError("")
+        setMessage("")
+
+        const { error } = await supabase
+            .from("channel_listings")
+            .update({
+                is_banned: false,
+                ban_reason: null,
+                updated_at: new Date().toISOString(),
+            })
+            .eq("id", listingId)
+
+        if (error) {
+            setError(error.message)
+            return
+        }
+
+        try {
+            await syncAdminListingChange(listingId, ["status"], {
+                forceFullSync: true,
+            })
+            setMessage("Listing unbanned and public page refreshed.")
+        } catch (syncError: any) {
+            setError(
+                syncError?.message ||
+                    "Listing was unbanned, but its public page did not refresh."
+            )
+            setMessage("Listing unbanned.")
+        }
+
+        await loadBannedListings()
     }
 
-    return res.json({
-      ok: true,
-      ...summary,
-      limit,
-      remaining_not_processed: Math.max(0, links.length - linksToImport.length),
-      results,
-      homepage_cache: homepageCache
-        ? {
-            updated_at: homepageCache.updated_at,
-            count: homepageCache.listings.length,
-          }
-        : null,
-    })
-  } catch (err) {
-    console.error("Admin Telegram import error:", err)
-    return res.status(500).json({ error: err.message })
-  }
+    async function revertChange(change: any) {
+        setError("")
+        setMessage("")
+
+        const ok = window.confirm(
+            "Revert this listing back to the old version from before this change?"
+        )
+
+        if (!ok) return
+
+        const oldData = change.old_data || {}
+        const listingId = change.listing_id
+
+        const revertPayload: any = {}
+
+        MOD_FIELDS.forEach((field) => {
+            if (Object.prototype.hasOwnProperty.call(oldData, field)) {
+                revertPayload[field] = oldData[field]
+            }
+        })
+
+        revertPayload.updated_at = new Date().toISOString()
+
+        const { error } = await supabase
+            .from("channel_listings")
+            .update(revertPayload)
+            .eq("id", listingId)
+
+        if (error) {
+            setError(error.message)
+            return
+        }
+
+        const revertedFields = Object.keys(revertPayload).filter(
+            (field) => field !== "updated_at"
+        )
+
+        try {
+            await syncAdminListingChange(listingId, revertedFields, {
+                forceFullSync: revertedFields.includes("short_invite"),
+            })
+        } catch (syncError: any) {
+            setError(
+                syncError?.message ||
+                    "Change reverted, but the public page did not refresh."
+            )
+        }
+
+        await supabase.from("channel_listing_changes").insert({
+            listing_id: listingId,
+            changed_by: user?.id || null,
+            change_type: "admin_revert",
+            old_data: change.new_data || {},
+            new_data: revertPayload,
+        })
+
+        setMessage("Change reverted and public page refreshed.")
+        await loadRecentChanges()
+    }
+
+    function changedFields(change: any) {
+        const oldData = change.old_data || {}
+        const newData = change.new_data || {}
+
+        return MOD_FIELDS.filter((field) => {
+            const oldValue = JSON.stringify(oldData[field] ?? null)
+            const newValue = JSON.stringify(newData[field] ?? null)
+            return oldValue !== newValue
+        })
+    }
+
+    function formatValue(value: any) {
+        if (Array.isArray(value)) return value.join(", ")
+        if (value === true) return "Yes"
+        if (value === false) return "No"
+        if (value === null || value === undefined || value === "")
+            return "Empty"
+        return String(value)
+    }
+
+    function listingNameFromChange(change: any) {
+        return (
+            change.new_data?.channel_name ||
+            change.old_data?.channel_name ||
+            "Changed listing"
+        )
+    }
+
+    function listingLinkFromChange(change: any) {
+        return (
+            change.new_data?.telegram_link ||
+            change.old_data?.telegram_link ||
+            ""
+        )
+    }
+
+    function titleForListing(listing: any) {
+        return (
+            listing.telegram_title || listing.channel_name || "Telegram Listing"
+        )
+    }
+
+    function getListingType(item: any) {
+        const raw =
+            item?.listing_type ||
+            item?.new_data?.listing_type ||
+            item?.old_data?.listing_type ||
+            "channel"
+
+        return String(raw).toLowerCase() === "group" ? "group" : "channel"
+    }
+
+    function listingTypeLabel(item: any) {
+        return getListingType(item) === "group" ? "👥 Group" : "📢 Channel"
+    }
+
+    function listingNoun(item: any) {
+        return getListingType(item) === "group" ? "group" : "channel"
+    }
+
+    function shortInviteUrl(code: string) {
+        if (!code) return ""
+        return `${window.location.origin}/go?code=${encodeURIComponent(code)}`
+    }
+
+    function getReviewImage(item: any) {
+        return (
+            item?.image_url ||
+            item?.new_data?.image_url ||
+            item?.old_data?.image_url ||
+            ""
+        )
+    }
+
+    function getReviewIcon(item: any) {
+        return (
+            item?.icon_url ||
+            item?.new_data?.icon_url ||
+            item?.old_data?.icon_url ||
+            ""
+        )
+    }
+
+    function getListingUrl(item: any) {
+        const slug = item?.slug || item?.new_data?.slug || item?.old_data?.slug
+        if (!slug) return ""
+        return `${window.location.origin}/channel?slug=${encodeURIComponent(slug)}`
+    }
+
+    function copyText(value: string) {
+        navigator.clipboard?.writeText(value)
+        setMessage("Copied.")
+    }
+
+    function formatRetryTime(totalSeconds: number) {
+        const seconds = Math.max(0, Math.floor(totalSeconds || 0))
+        const hours = Math.floor(seconds / 3600)
+        const minutes = Math.floor((seconds % 3600) / 60)
+        const remainingSeconds = seconds % 60
+
+        if (hours > 0) return `${hours}h ${minutes}m ${remainingSeconds}s`
+        if (minutes > 0) return `${minutes}m ${remainingSeconds}s`
+        return `${remainingSeconds}s`
+    }
+
+    async function importTelegramListings() {
+        setError("")
+        setMessage("")
+        setImportResults([])
+
+        if (telegramRetryAfter > 0) {
+            setError(
+                `Telegram is still rate-limiting imports. Try again in ${formatRetryTime(
+                    telegramRetryAfter
+                )}.`
+            )
+            return
+        }
+
+        const links = importLinks
+            .split(/[\n,]+/g)
+            .map((link) => link.trim())
+            .filter(Boolean)
+
+        if (!links.length) {
+            setError("Paste at least one public Telegram link.")
+            return
+        }
+
+        setImporting(true)
+
+        try {
+            const { data: sessionData, error: sessionError } =
+                await supabase.auth.getSession()
+
+            if (sessionError) throw sessionError
+
+            const token = sessionData.session?.access_token
+
+            if (!token) {
+                throw new Error("You need to log in before importing listings.")
+            }
+
+            const res = await fetch(
+                `${BACKEND_URL}/api/admin/import-telegram-listings`,
+                {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json",
+                        Authorization: `Bearer ${token}`,
+                    },
+                    body: JSON.stringify({
+                        links,
+                        sync_to_framer: importSyncToFramer,
+                        use_icon_as_background: importUseIconAsBackground,
+                        limit: 5,
+                    }),
+                }
+            )
+
+            const data = await res.json().catch(() => ({}))
+            setImportResults(data.results || [])
+
+            if (
+                res.status === 429 ||
+                data?.code === "TELEGRAM_RATE_LIMITED" ||
+                data?.rate_limit?.code === "TELEGRAM_RATE_LIMITED"
+            ) {
+                const retryAfter = Number(
+                    data?.retry_after_seconds ||
+                        data?.rate_limit?.retry_after_seconds ||
+                        0
+                )
+
+                setTelegramRetryAfter(retryAfter)
+
+                if (Array.isArray(data?.unprocessed_links)) {
+                    setImportLinks(data.unprocessed_links.join("\n"))
+                }
+
+                setError(
+                    `Telegram temporarily rate-limited the importer. Try again in ${formatRetryTime(
+                        retryAfter
+                    )}. ${
+                        data?.remaining_not_processed || 0
+                    } link(s) were kept in the box and were not processed.`
+                )
+
+                if ((data?.created || 0) > 0) {
+                    setMessage(
+                        `Before the rate limit: ${data.created} added and ${
+                            data.duplicates || 0
+                        } skipped.`
+                    )
+                }
+
+                return
+            }
+
+            if (!res.ok) {
+                throw new Error(data?.error || "Import failed.")
+            }
+
+            setMessage(
+                `Import finished: ${data.created || 0} added, ${
+                    data.duplicates || 0
+                } skipped, ${data.failed || 0} failed.`
+            )
+
+            if ((data.remaining_not_processed || 0) > 0) {
+                if (Array.isArray(data?.unprocessed_links)) {
+                    setImportLinks(data.unprocessed_links.join("\n"))
+                }
+
+                setError(
+                    `${data.remaining_not_processed} links were not processed because this tool imports 5 at a time. The remaining links were kept in the box.`
+                )
+            } else {
+                setImportLinks("")
+            }
+
+            await Promise.all([
+                loadPendingListings(),
+                loadRecentChanges(),
+                loadBannedListings(),
+            ])
+        } catch (err: any) {
+            setError(err?.message || "Import failed.")
+        } finally {
+            setImporting(false)
+        }
+    }
+
+    if (loading) {
+        return (
+            <div style={pageWrap}>
+                <div style={cardStyle}>
+                    <p style={subtitleStyle}>Loading admin panel...</p>
+                </div>
+            </div>
+        )
+    }
+
+    if (!user) {
+        return (
+            <div style={pageWrap}>
+                <div style={cardStyle}>
+                    <h1 style={titleStyle}>Log in required</h1>
+                    <p style={subtitleStyle}>
+                        You need to log in before accessing the admin panel.
+                    </p>
+                    <a href={loginPath || "/login"} style={primaryLink}>
+                        Log in
+                    </a>
+                </div>
+            </div>
+        )
+    }
+
+    if (!isAdmin) {
+        return (
+            <div style={pageWrap}>
+                <div style={cardStyle}>
+                    <h1 style={titleStyle}>Access denied</h1>
+                    <p style={subtitleStyle}>
+                        This page is only available to TeleHub admins.
+                    </p>
+                </div>
+            </div>
+        )
+    }
+
+    return (
+        <div style={pageWrap}>
+            <div style={panelStyle}>
+                <div style={topRow}>
+                    <div>
+                        <h1 style={titleStyle}>Admin Panel</h1>
+                        <p style={subtitleStyle}>
+                            Posts and edits can go live while you still review,
+                            revert, or temporarily ban bad listings.
+                        </p>
+                    </div>
+
+                    <button onClick={loadAdminPanel} style={secondaryBtn}>
+                        Refresh
+                    </button>
+                </div>
+
+                <div style={tabsRow}>
+                    <button
+                        onClick={() => setActiveTab("changes")}
+                        style={{
+                            ...tabBtn,
+                            ...(activeTab === "changes" ? tabBtnActive : {}),
+                        }}
+                    >
+                        Recent Changes ({changes.length})
+                    </button>
+                    <button
+                        onClick={() => setActiveTab("pending")}
+                        style={{
+                            ...tabBtn,
+                            ...(activeTab === "pending" ? tabBtnActive : {}),
+                        }}
+                    >
+                        New Posts ({pendingListings.length})
+                    </button>
+                    <button
+                        onClick={() => setActiveTab("banned")}
+                        style={{
+                            ...tabBtn,
+                            ...(activeTab === "banned" ? tabBtnActive : {}),
+                        }}
+                    >
+                        Banned ({bannedListings.length})
+                    </button>
+                    <button
+                        onClick={() => setActiveTab("import")}
+                        style={{
+                            ...tabBtn,
+                            ...(activeTab === "import" ? tabBtnActive : {}),
+                        }}
+                    >
+                        Auto Import
+                    </button>
+                </div>
+
+                {message ? <div style={successStyle}>{message}</div> : null}
+                {error ? <div style={errorStyle}>{error}</div> : null}
+
+                {activeTab === "import" ? (
+                    <div style={importPanelStyle}>
+                        <div style={importHeaderRow}>
+                            <div>
+                                <h2 style={importTitleStyle}>
+                                    Auto import Telegram listings
+                                </h2>
+                                <p style={importSubtitleStyle}>
+                                    Paste public Telegram links, one per line.
+                                    TeleHub will pull the Telegram info, create
+                                    descriptions and tags with AI, add the
+                                    listings, and update the public pages.
+                                </p>
+                            </div>
+                        </div>
+
+                        <textarea
+                            value={importLinks}
+                            onChange={(e) => setImportLinks(e.target.value)}
+                            placeholder={
+                                "https://t.me/examplechannel\n@anotherchannel\nt.me/examplegroup"
+                            }
+                            style={importTextareaStyle}
+                        />
+
+                        <div style={importOptionsGrid}>
+                            <label style={importOptionStyle}>
+                                <input
+                                    type="checkbox"
+                                    checked={importUseIconAsBackground}
+                                    onChange={(e) =>
+                                        setImportUseIconAsBackground(
+                                            e.target.checked
+                                        )
+                                    }
+                                />
+                                <span>
+                                    Use Telegram icon as the background image
+                                </span>
+                            </label>
+
+                            <label style={importOptionStyle}>
+                                <input
+                                    type="checkbox"
+                                    checked={importSyncToFramer}
+                                    onChange={(e) =>
+                                        setImportSyncToFramer(e.target.checked)
+                                    }
+                                />
+                                <span>Create public pages automatically</span>
+                            </label>
+                        </div>
+
+                        <div style={importHelpBox}>
+                            This imports up to 5 links at a time with a short
+                            delay between each one. Public t.me usernames only.
+                            Private invite links usually cannot be imported
+                            automatically.
+                        </div>
+
+                        <div style={buttonRow}>
+                            <button
+                                onClick={importTelegramListings}
+                                disabled={importing || telegramRetryAfter > 0}
+                                style={{
+                                    ...approveBtn,
+                                    opacity:
+                                        importing || telegramRetryAfter > 0
+                                            ? 0.7
+                                            : 1,
+                                    cursor:
+                                        importing || telegramRetryAfter > 0
+                                            ? "not-allowed"
+                                            : "pointer",
+                                }}
+                            >
+                                {importing
+                                    ? "Importing listings..."
+                                    : telegramRetryAfter > 0
+                                      ? `Retry in ${formatRetryTime(
+                                            telegramRetryAfter
+                                        )}`
+                                      : "Import Listings"}
+                            </button>
+
+                            <button
+                                onClick={() => {
+                                    setImportLinks("")
+                                    setImportResults([])
+                                }}
+                                disabled={importing}
+                                style={secondaryBtn}
+                            >
+                                Clear
+                            </button>
+                        </div>
+
+                        {importResults.length > 0 ? (
+                            <div style={importResultsGrid}>
+                                {importResults.map((result, index) => (
+                                    <div
+                                        key={`${result.link || index}-${index}`}
+                                        style={
+                                            result.ok === false
+                                                ? importResultErrorCard
+                                                : result.skipped
+                                                  ? importResultSkippedCard
+                                                  : importResultCard
+                                        }
+                                    >
+                                        <div style={importResultTopLine}>
+                                            <strong>
+                                                {result.created
+                                                    ? result.channel_name ||
+                                                      "Imported listing"
+                                                    : result.skipped
+                                                      ? result.existing_name ||
+                                                        "Already listed"
+                                                      : "Import failed"}
+                                            </strong>
+                                            <span>
+                                                {result.created
+                                                    ? "Added"
+                                                    : result.skipped
+                                                      ? "Skipped"
+                                                      : "Failed"}
+                                            </span>
+                                        </div>
+
+                                        <div style={importResultMeta}>
+                                            {result.link || "Unknown link"}
+                                        </div>
+
+                                        {result.short_invite ? (
+                                            <div style={importResultMeta}>
+                                                Page: /channel/
+                                                {result.short_invite}
+                                            </div>
+                                        ) : null}
+
+                                        {Array.isArray(result.categories) &&
+                                        result.categories.length ? (
+                                            <div style={categoryWrap}>
+                                                {result.categories.map(
+                                                    (cat: string) => (
+                                                        <span
+                                                            key={cat}
+                                                            style={categoryPill}
+                                                        >
+                                                            {cat}
+                                                        </span>
+                                                    )
+                                                )}
+                                            </div>
+                                        ) : null}
+
+                                        {result.error || result.ai_error ? (
+                                            <div style={importResultErrorText}>
+                                                {result.error ||
+                                                    `AI note: ${result.ai_error}`}
+                                            </div>
+                                        ) : null}
+                                    </div>
+                                ))}
+                            </div>
+                        ) : null}
+                    </div>
+                ) : null}
+
+                {activeTab === "changes" ? (
+                    changes.length === 0 ? (
+                        <div style={emptyStyle}>No recent listing changes.</div>
+                    ) : (
+                        <div style={listGrid}>
+                            {changes.map((change) => {
+                                const fields = changedFields(change)
+                                const telegramLink =
+                                    listingLinkFromChange(change)
+
+                                return (
+                                    <div key={change.id} style={listingCard}>
+                                        <div style={listingTop}>
+                                            <div>
+                                                <h2 style={listingTitle}>
+                                                    {listingNameFromChange(
+                                                        change
+                                                    )}
+                                                </h2>
+
+                                                {telegramLink ? (
+                                                    <a
+                                                        href={telegramLink}
+                                                        target="_blank"
+                                                        rel="noreferrer"
+                                                        style={listingLink}
+                                                    >
+                                                        {telegramLink}
+                                                    </a>
+                                                ) : null}
+                                            </div>
+
+                                            <div style={badgeStack}>
+                                                <span style={typeBadge}>
+                                                    {listingTypeLabel(change)}
+                                                </span>
+                                                <span style={changeBadge}>
+                                                    {change.change_type ||
+                                                        "edit"}
+                                                </span>
+                                            </div>
+                                        </div>
+
+                                        <div style={metaStyle}>
+                                            Changed:{" "}
+                                            {change.created_at
+                                                ? new Date(
+                                                      change.created_at
+                                                  ).toLocaleString()
+                                                : "Unknown"}
+                                        </div>
+
+                                        <div style={changeSummaryBox}>
+                                            <strong>Change summary:</strong>{" "}
+                                            {fields.length
+                                                ? fields
+                                                      .map((field) =>
+                                                          field.replaceAll(
+                                                              "_",
+                                                              " "
+                                                          )
+                                                      )
+                                                      .join(", ")
+                                                : "No visible field changes found."}
+                                        </div>
+
+                                        {change.old_data?.image_url ||
+                                        change.new_data?.image_url ? (
+                                            <div style={imageCompareGrid}>
+                                                <div>
+                                                    <strong
+                                                        style={sectionMiniTitle}
+                                                    >
+                                                        Old image
+                                                    </strong>
+                                                    {change.old_data
+                                                        ?.image_url ? (
+                                                        <div
+                                                            style={{
+                                                                ...smallImagePreview,
+                                                                backgroundImage: `linear-gradient(rgba(9,20,45,0.22), rgba(9,20,45,0.5)), url(${change.old_data.image_url})`,
+                                                            }}
+                                                        />
+                                                    ) : (
+                                                        <div
+                                                            style={
+                                                                emptyMiniStyle
+                                                            }
+                                                        >
+                                                            No old image
+                                                        </div>
+                                                    )}
+                                                </div>
+
+                                                <div>
+                                                    <strong
+                                                        style={sectionMiniTitle}
+                                                    >
+                                                        New image
+                                                    </strong>
+                                                    {change.new_data
+                                                        ?.image_url ? (
+                                                        <div
+                                                            style={{
+                                                                ...smallImagePreview,
+                                                                backgroundImage: `linear-gradient(rgba(9,20,45,0.22), rgba(9,20,45,0.5)), url(${change.new_data.image_url})`,
+                                                            }}
+                                                        />
+                                                    ) : (
+                                                        <div
+                                                            style={
+                                                                emptyMiniStyle
+                                                            }
+                                                        >
+                                                            No new image
+                                                        </div>
+                                                    )}
+                                                </div>
+                                            </div>
+                                        ) : null}
+
+                                        <div style={infoGrid}>
+                                            <InfoRow
+                                                label="Type"
+                                                value={listingTypeLabel(change)}
+                                            />
+                                            <InfoRow
+                                                label="Listing ID"
+                                                value={change.listing_id}
+                                            />
+                                            <InfoRow
+                                                label="Short invite"
+                                                value={
+                                                    change.new_data
+                                                        ?.short_invite
+                                                        ? shortInviteUrl(
+                                                              change.new_data
+                                                                  .short_invite
+                                                          )
+                                                        : "Empty"
+                                                }
+                                            />
+                                            <InfoRow
+                                                label="NSFW"
+                                                value={
+                                                    change.new_data?.is_nsfw
+                                                        ? "Yes"
+                                                        : "No"
+                                                }
+                                            />
+                                            <InfoRow
+                                                label="Members"
+                                                value={
+                                                    change.new_data
+                                                        ?.member_count ||
+                                                    change.old_data
+                                                        ?.member_count ||
+                                                    "Unknown"
+                                                }
+                                            />
+                                        </div>
+
+                                        {fields.length === 0 ? (
+                                            <div style={emptyMiniStyle}>
+                                                No visible field changes found.
+                                            </div>
+                                        ) : (
+                                            <div style={diffGrid}>
+                                                {fields.map((field) => (
+                                                    <div
+                                                        key={field}
+                                                        style={diffRow}
+                                                    >
+                                                        <div
+                                                            style={
+                                                                diffFieldName
+                                                            }
+                                                        >
+                                                            {field.replaceAll(
+                                                                "_",
+                                                                " "
+                                                            )}
+                                                        </div>
+
+                                                        <div
+                                                            style={diffColumns}
+                                                        >
+                                                            <div
+                                                                style={
+                                                                    oldValueBox
+                                                                }
+                                                            >
+                                                                <strong>
+                                                                    Old
+                                                                </strong>
+                                                                <span>
+                                                                    {formatValue(
+                                                                        change
+                                                                            .old_data?.[
+                                                                            field
+                                                                        ]
+                                                                    )}
+                                                                </span>
+                                                            </div>
+
+                                                            <div
+                                                                style={
+                                                                    newValueBox
+                                                                }
+                                                            >
+                                                                <strong>
+                                                                    New
+                                                                </strong>
+                                                                <span>
+                                                                    {formatValue(
+                                                                        change
+                                                                            .new_data?.[
+                                                                            field
+                                                                        ]
+                                                                    )}
+                                                                </span>
+                                                            </div>
+                                                        </div>
+                                                    </div>
+                                                ))}
+                                            </div>
+                                        )}
+
+                                        <div style={buttonRow}>
+                                            <button
+                                                onClick={() =>
+                                                    revertChange(change)
+                                                }
+                                                style={warningBtn}
+                                            >
+                                                Revert Change
+                                            </button>
+
+                                            <button
+                                                onClick={() =>
+                                                    banListing(
+                                                        change.listing_id,
+                                                        "Temporarily banned after admin review."
+                                                    )
+                                                }
+                                                style={rejectBtn}
+                                            >
+                                                Temp Ban Listing
+                                            </button>
+                                        </div>
+                                    </div>
+                                )
+                            })}
+                        </div>
+                    )
+                ) : null}
+
+                {activeTab === "pending" ? (
+                    pendingListings.length === 0 ? (
+                        <div style={emptyStyle}>No recent new listings.</div>
+                    ) : (
+                        <div style={listGrid}>
+                            {pendingListings.map((listing) => {
+                                const backgroundPreview =
+                                    pendingImagePreviews[listing.id] ||
+                                    listing.image_url ||
+                                    ""
+
+                                return (
+                                    <div key={listing.id} style={listingCard}>
+                                        <label
+                                            style={{
+                                                ...adminPreviewImage,
+                                                ...(backgroundPreview
+                                                    ? {
+                                                          backgroundImage: `linear-gradient(rgba(9,20,45,0.34), rgba(9,20,45,0.68)), url(${backgroundPreview})`,
+                                                      }
+                                                    : {
+                                                          background:
+                                                              "linear-gradient(135deg, #EAF3FF, #D8E8FF)",
+                                                      }),
+                                                cursor: "pointer",
+                                            }}
+                                            title="Click to replace the background image"
+                                        >
+                                            <input
+                                                type="file"
+                                                accept="image/*"
+                                                onChange={(event) =>
+                                                    handlePendingBackgroundSelect(
+                                                        listing.id,
+                                                        event
+                                                    )
+                                                }
+                                                style={{ display: "none" }}
+                                            />
+                                            <span style={imageLabel}>
+                                                {backgroundPreview
+                                                    ? "Click to replace background"
+                                                    : "Click to upload background"}
+                                            </span>
+                                        </label>
+
+                                        <div style={listingTop}>
+                                            <div style={titleWithIcon}>
+                                                {listing.icon_url ? (
+                                                    <img
+                                                        src={listing.icon_url}
+                                                        alt={`${titleForListing(listing)} icon`}
+                                                        style={adminIcon}
+                                                    />
+                                                ) : null}
+
+                                                <div>
+                                                    <h2 style={listingTitle}>
+                                                        {titleForListing(
+                                                            listing
+                                                        )}
+                                                    </h2>
+                                                    <a
+                                                        href={
+                                                            listing.telegram_link
+                                                        }
+                                                        target="_blank"
+                                                        rel="noreferrer"
+                                                        style={listingLink}
+                                                    >
+                                                        {listing.telegram_link}
+                                                    </a>
+                                                </div>
+                                            </div>
+
+                                            <div style={badgeStack}>
+                                                <span style={typeBadge}>
+                                                    {listingTypeLabel(listing)}
+                                                </span>
+                                                <span style={statusBadge}>
+                                                    {listing.status}
+                                                </span>
+                                            </div>
+                                        </div>
+
+                                        <div style={infoGrid}>
+                                            <EditableInfoRow
+                                                label="Type"
+                                                value={
+                                                    listing.listing_type ||
+                                                    "channel"
+                                                }
+                                                type="select"
+                                                options={["channel", "group"]}
+                                                onChange={(value) =>
+                                                    updatePendingField(
+                                                        listing.id,
+                                                        "listing_type",
+                                                        value
+                                                    )
+                                                }
+                                            />
+                                            <EditableInfoRow
+                                                label="Listing name"
+                                                value={
+                                                    listing.channel_name || ""
+                                                }
+                                                onChange={(value) =>
+                                                    updatePendingField(
+                                                        listing.id,
+                                                        "channel_name",
+                                                        value
+                                                    )
+                                                }
+                                            />
+                                            <EditableInfoRow
+                                                label="Telegram title"
+                                                value={
+                                                    listing.telegram_title || ""
+                                                }
+                                                onChange={(value) =>
+                                                    updatePendingField(
+                                                        listing.id,
+                                                        "telegram_title",
+                                                        value
+                                                    )
+                                                }
+                                            />
+                                            <EditableInfoRow
+                                                label="Telegram username"
+                                                value={
+                                                    listing.telegram_username ||
+                                                    ""
+                                                }
+                                                onChange={(value) =>
+                                                    updatePendingField(
+                                                        listing.id,
+                                                        "telegram_username",
+                                                        value
+                                                    )
+                                                }
+                                            />
+                                            <EditableInfoRow
+                                                label="Members"
+                                                value={
+                                                    listing.member_count || 0
+                                                }
+                                                type="number"
+                                                onChange={(value) =>
+                                                    updatePendingField(
+                                                        listing.id,
+                                                        "member_count",
+                                                        Number(value || 0)
+                                                    )
+                                                }
+                                            />
+                                            <EditableInfoRow
+                                                label="Votes"
+                                                value={listing.votes_count || 0}
+                                                type="number"
+                                                onChange={(value) =>
+                                                    updatePendingField(
+                                                        listing.id,
+                                                        "votes_count",
+                                                        Number(value || 0)
+                                                    )
+                                                }
+                                            />
+                                            <EditableInfoRow
+                                                label="Short invite"
+                                                value={
+                                                    listing.short_invite || ""
+                                                }
+                                                onChange={(value) =>
+                                                    updatePendingField(
+                                                        listing.id,
+                                                        "short_invite",
+                                                        value
+                                                    )
+                                                }
+                                            />
+                                            <EditableInfoRow
+                                                label="NSFW"
+                                                value={
+                                                    listing.is_nsfw
+                                                        ? "Yes"
+                                                        : "No"
+                                                }
+                                                type="select"
+                                                options={["No", "Yes"]}
+                                                onChange={(value) =>
+                                                    updatePendingField(
+                                                        listing.id,
+                                                        "is_nsfw",
+                                                        value === "Yes"
+                                                    )
+                                                }
+                                            />
+                                            <InfoRow
+                                                label="Last synced"
+                                                value={
+                                                    listing.last_synced_at
+                                                        ? new Date(
+                                                              listing.last_synced_at
+                                                          ).toLocaleString()
+                                                        : "Never"
+                                                }
+                                            />
+                                        </div>
+
+                                        <div style={sectionBlock}>
+                                            <strong style={sectionMiniTitle}>
+                                                Short description
+                                            </strong>
+                                            <textarea
+                                                value={
+                                                    listing.description || ""
+                                                }
+                                                onChange={(event) =>
+                                                    updatePendingField(
+                                                        listing.id,
+                                                        "description",
+                                                        event.target.value
+                                                    )
+                                                }
+                                                style={pendingTextareaStyle}
+                                                placeholder="Short description"
+                                            />
+                                        </div>
+
+                                        <div style={sectionBlock}>
+                                            <strong style={sectionMiniTitle}>
+                                                Long description
+                                            </strong>
+                                            <textarea
+                                                value={
+                                                    listing.long_description ||
+                                                    ""
+                                                }
+                                                onChange={(event) =>
+                                                    updatePendingField(
+                                                        listing.id,
+                                                        "long_description",
+                                                        event.target.value
+                                                    )
+                                                }
+                                                style={pendingLongTextareaStyle}
+                                                placeholder="Long description"
+                                            />
+                                        </div>
+
+                                        {listing.telegram_description ? (
+                                            <div style={sectionBlock}>
+                                                <strong
+                                                    style={sectionMiniTitle}
+                                                >
+                                                    Telegram bio/description
+                                                </strong>
+                                                <textarea
+                                                    value={
+                                                        listing.telegram_description ||
+                                                        ""
+                                                    }
+                                                    onChange={(event) =>
+                                                        updatePendingField(
+                                                            listing.id,
+                                                            "telegram_description",
+                                                            event.target.value
+                                                        )
+                                                    }
+                                                    style={pendingTextareaStyle}
+                                                    placeholder="Telegram bio/description"
+                                                />
+                                            </div>
+                                        ) : null}
+
+                                        <div style={categoryWrap}>
+                                            {(listing.categories || []).map(
+                                                (cat: string) => (
+                                                    <span
+                                                        key={cat}
+                                                        style={categoryPill}
+                                                    >
+                                                        {cat}
+                                                    </span>
+                                                )
+                                            )}
+                                        </div>
+
+                                        {listing.is_nsfw ? (
+                                            <span style={nsfwBadge}>NSFW</span>
+                                        ) : null}
+
+                                        <div style={metaStyle}>
+                                            Submitted:{" "}
+                                            {listing.created_at
+                                                ? new Date(
+                                                      listing.created_at
+                                                  ).toLocaleString()
+                                                : "Unknown"}
+                                        </div>
+
+                                        <div style={buttonRow}>
+                                            {getListingUrl(listing) ? (
+                                                <a
+                                                    href={getListingUrl(
+                                                        listing
+                                                    )}
+                                                    target="_blank"
+                                                    rel="noreferrer"
+                                                    style={secondaryLinkBtn}
+                                                >
+                                                    View Page
+                                                </a>
+                                            ) : null}
+
+                                            {listing.short_invite ? (
+                                                <button
+                                                    onClick={() =>
+                                                        copyText(
+                                                            shortInviteUrl(
+                                                                listing.short_invite
+                                                            )
+                                                        )
+                                                    }
+                                                    style={secondaryBtn}
+                                                >
+                                                    Copy Short Invite
+                                                </button>
+                                            ) : null}
+
+                                            <button
+                                                onClick={() =>
+                                                    updateStatus(
+                                                        listing.id,
+                                                        "approved"
+                                                    )
+                                                }
+                                                disabled={
+                                                    savingListingId ===
+                                                    listing.id
+                                                }
+                                                style={{
+                                                    ...approveBtn,
+                                                    opacity:
+                                                        savingListingId ===
+                                                        listing.id
+                                                            ? 0.65
+                                                            : 1,
+                                                }}
+                                            >
+                                                {savingListingId === listing.id
+                                                    ? "Saving..."
+                                                    : "Approve & Save"}
+                                            </button>
+
+                                            <button
+                                                onClick={() =>
+                                                    updateStatus(
+                                                        listing.id,
+                                                        "rejected"
+                                                    )
+                                                }
+                                                style={rejectBtn}
+                                            >
+                                                Reject
+                                            </button>
+
+                                            <button
+                                                onClick={() =>
+                                                    banListing(
+                                                        listing.id,
+                                                        "Temporarily banned from new post review."
+                                                    )
+                                                }
+                                                style={warningBtn}
+                                            >
+                                                Temp Ban
+                                            </button>
+                                        </div>
+                                    </div>
+                                )
+                            })}
+                        </div>
+                    )
+                ) : null}
+
+                {activeTab === "banned" ? (
+                    bannedListings.length === 0 ? (
+                        <div style={emptyStyle}>No banned listings.</div>
+                    ) : (
+                        <div style={listGrid}>
+                            {bannedListings.map((listing) => (
+                                <div key={listing.id} style={listingCard}>
+                                    <div style={listingTop}>
+                                        <div>
+                                            <h2 style={listingTitle}>
+                                                {listing.channel_name}
+                                            </h2>
+                                            <a
+                                                href={listing.telegram_link}
+                                                target="_blank"
+                                                rel="noreferrer"
+                                                style={listingLink}
+                                            >
+                                                {listing.telegram_link}
+                                            </a>
+                                        </div>
+
+                                        <div style={badgeStack}>
+                                            <span style={typeBadge}>
+                                                {listingTypeLabel(listing)}
+                                            </span>
+                                            <span style={banBadge}>Banned</span>
+                                        </div>
+                                    </div>
+
+                                    {listing.image_url ? (
+                                        <div
+                                            style={{
+                                                ...smallImagePreview,
+                                                backgroundImage: `linear-gradient(rgba(9,20,45,0.22), rgba(9,20,45,0.5)), url(${listing.image_url})`,
+                                            }}
+                                        />
+                                    ) : null}
+
+                                    <div style={infoGrid}>
+                                        <InfoRow
+                                            label="Type"
+                                            value={listingTypeLabel(listing)}
+                                        />
+                                        <InfoRow
+                                            label="Telegram username"
+                                            value={listing.telegram_username}
+                                        />
+                                        <InfoRow
+                                            label="Members"
+                                            value={
+                                                listing.member_count?.toLocaleString?.() ||
+                                                listing.member_count
+                                            }
+                                        />
+                                        <InfoRow
+                                            label="Votes"
+                                            value={listing.votes_count || 0}
+                                        />
+                                        <InfoRow
+                                            label="Short invite"
+                                            value={
+                                                listing.short_invite
+                                                    ? shortInviteUrl(
+                                                          listing.short_invite
+                                                      )
+                                                    : "Empty"
+                                            }
+                                        />
+                                    </div>
+
+                                    <p style={descriptionStyle}>
+                                        {listing.description}
+                                    </p>
+
+                                    {listing.ban_reason ? (
+                                        <div style={banReasonBox}>
+                                            Reason: {listing.ban_reason}
+                                        </div>
+                                    ) : null}
+
+                                    <div style={buttonRow}>
+                                        <button
+                                            onClick={() =>
+                                                unbanListing(listing.id)
+                                            }
+                                            style={approveBtn}
+                                        >
+                                            Unban
+                                        </button>
+                                    </div>
+                                </div>
+                            ))}
+                        </div>
+                    )
+                ) : null}
+            </div>
+        </div>
+    )
+}
+
+function EditableInfoRow({
+    label,
+    value,
+    onChange,
+    type = "text",
+    options = [],
+}: {
+    label: string
+    value: any
+    onChange: (value: string) => void
+    type?: "text" | "number" | "select"
+    options?: string[]
+}) {
+    const [editing, setEditing] = React.useState(false)
+
+    return (
+        <div
+            style={{
+                ...infoRow,
+                cursor: "text",
+                outline: editing ? "2px solid #2C74F4" : "none",
+            }}
+            onClick={() => setEditing(true)}
+            title="Click to edit"
+        >
+            <span style={infoLabel}>{label}</span>
+
+            {editing ? (
+                type === "select" ? (
+                    <select
+                        autoFocus
+                        value={String(value ?? "")}
+                        onChange={(event) => onChange(event.target.value)}
+                        onBlur={() => setEditing(false)}
+                        onClick={(event) => event.stopPropagation()}
+                        style={inlineEditInput}
+                    >
+                        {options.map((option) => (
+                            <option key={option} value={option}>
+                                {option}
+                            </option>
+                        ))}
+                    </select>
+                ) : (
+                    <input
+                        autoFocus
+                        type={type}
+                        value={value ?? ""}
+                        onChange={(event) => onChange(event.target.value)}
+                        onBlur={() => setEditing(false)}
+                        onKeyDown={(event) => {
+                            if (event.key === "Enter") {
+                                event.currentTarget.blur()
+                            }
+                        }}
+                        onClick={(event) => event.stopPropagation()}
+                        style={inlineEditInput}
+                    />
+                )
+            ) : (
+                <span style={infoValue}>
+                    {value === null || value === undefined || value === ""
+                        ? "Empty — click to edit"
+                        : String(value)}
+                </span>
+            )}
+        </div>
+    )
+}
+
+function InfoRow({ label, value }: { label: string; value: any }) {
+    return (
+        <div style={infoRow}>
+            <span style={infoLabel}>{label}</span>
+            <span style={infoValue}>
+                {value === null || value === undefined || value === ""
+                    ? "Empty"
+                    : String(value)}
+            </span>
+        </div>
+    )
+}
+
+addPropertyControls(TelecadiaAdminListings, {
+    loginPath: {
+        type: ControlType.String,
+        title: "Login Path",
+        defaultValue: "/login",
+    },
 })
 
+const pageWrap: React.CSSProperties = {
+    minHeight: "100vh",
+    background: "#EFF4FD",
+    padding: 24,
+    boxSizing: "border-box",
+    fontFamily: "Inter, ui-sans-serif, system-ui, sans-serif",
+}
 
-const PORT = process.env.PORT || 3000
+const cardStyle: React.CSSProperties = {
+    maxWidth: 560,
+    margin: "80px auto",
+    borderRadius: 30,
+    padding: 30,
+    background:
+        "linear-gradient(180deg, rgba(255,255,255,0.82), rgba(247,250,255,0.96))",
+    border: "1px solid rgba(219,230,248,1)",
+    boxShadow: "0 24px 70px rgba(61,126,245,0.1)",
+    backdropFilter: "blur(14px)",
+}
 
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`)
-})
+const panelStyle: React.CSSProperties = {
+    maxWidth: 1180,
+    margin: "0 auto",
+    borderRadius: 30,
+    padding: 30,
+    background:
+        "linear-gradient(180deg, rgba(255,255,255,0.82), rgba(247,250,255,0.96))",
+    border: "1px solid rgba(219,230,248,1)",
+    boxShadow: "0 24px 70px rgba(61,126,245,0.1)",
+    backdropFilter: "blur(14px)",
+}
+
+const topRow: React.CSSProperties = {
+    display: "flex",
+    justifyContent: "space-between",
+    gap: 16,
+    flexWrap: "wrap",
+    alignItems: "center",
+    marginBottom: 20,
+}
+
+const titleStyle: React.CSSProperties = {
+    margin: 0,
+    fontSize: 38,
+    lineHeight: 1.05,
+    letterSpacing: "-0.04em",
+    color: "#112B5C",
+}
+
+const subtitleStyle: React.CSSProperties = {
+    marginTop: 10,
+    marginBottom: 0,
+    color: "#6F84AF",
+    fontSize: 15,
+    lineHeight: 1.6,
+}
+
+const tabsRow: React.CSSProperties = {
+    display: "flex",
+    gap: 10,
+    flexWrap: "wrap",
+    marginBottom: 18,
+}
+
+const tabBtn: React.CSSProperties = {
+    height: 42,
+    padding: "0 15px",
+    borderRadius: 999,
+    border: "1px solid rgba(210, 224, 245, 0.95)",
+    background: "rgba(255,255,255,0.78)",
+    color: "#26477D",
+    fontWeight: 850,
+    cursor: "pointer",
+}
+
+const tabBtnActive: React.CSSProperties = {
+    background: "linear-gradient(135deg, #43A4FF, #2C74F4)",
+    color: "white",
+    border: "1px solid #2C74F4",
+}
+
+const listGrid: React.CSSProperties = {
+    display: "grid",
+    gap: 16,
+}
+
+const listingCard: React.CSSProperties = {
+    borderRadius: 24,
+    padding: 20,
+    border: "1px solid rgba(219,230,248,1)",
+    background: "rgba(255,255,255,0.72)",
+    boxShadow: "0 16px 40px rgba(61,126,245,0.06)",
+}
+
+const listingTop: React.CSSProperties = {
+    display: "flex",
+    justifyContent: "space-between",
+    gap: 12,
+    flexWrap: "wrap",
+}
+
+const listingTitle: React.CSSProperties = {
+    margin: 0,
+    fontSize: 22,
+    color: "#112B5C",
+}
+
+const listingLink: React.CSSProperties = {
+    display: "inline-block",
+    marginTop: 6,
+    color: "#2C74F4",
+    fontSize: 14,
+    fontWeight: 700,
+    textDecoration: "none",
+    maxWidth: "100%",
+    overflowWrap: "anywhere",
+}
+
+const statusBadge: React.CSSProperties = {
+    height: 32,
+    padding: "0 12px",
+    borderRadius: 999,
+    background: "#FFF6D8",
+    color: "#9A6B00",
+    fontSize: 13,
+    fontWeight: 800,
+    display: "inline-flex",
+    alignItems: "center",
+    textTransform: "capitalize",
+}
+
+const changeBadge: React.CSSProperties = {
+    ...statusBadge,
+    background: "#EAF3FF",
+    color: "#2C74F4",
+}
+
+const banBadge: React.CSSProperties = {
+    ...statusBadge,
+    background: "#FDEDEC",
+    color: "#C0392B",
+}
+
+const badgeStack: React.CSSProperties = {
+    display: "flex",
+    alignItems: "center",
+    gap: 8,
+    flexWrap: "wrap",
+    justifyContent: "flex-end",
+}
+
+const typeBadge: React.CSSProperties = {
+    height: 32,
+    padding: "0 12px",
+    borderRadius: 999,
+    background: "#EAF3FF",
+    color: "#2C74F4",
+    fontSize: 13,
+    fontWeight: 900,
+    display: "inline-flex",
+    alignItems: "center",
+}
+
+const nsfwBadge: React.CSSProperties = {
+    display: "inline-block",
+    marginTop: 12,
+    padding: "5px 9px",
+    borderRadius: 999,
+    background: "#FFE8EC",
+    color: "#B4233D",
+    fontSize: 11,
+    fontWeight: 900,
+    letterSpacing: "0.03em",
+}
+
+const descriptionStyle: React.CSSProperties = {
+    color: "#59719C",
+    fontSize: 15,
+    lineHeight: 1.6,
+    marginTop: 14,
+}
+
+const categoryWrap: React.CSSProperties = {
+    display: "flex",
+    flexWrap: "wrap",
+    gap: 8,
+    marginTop: 14,
+}
+
+const categoryPill: React.CSSProperties = {
+    padding: "8px 12px",
+    borderRadius: 999,
+    background: "#EAF3FF",
+    color: "#2C74F4",
+    fontSize: 13,
+    fontWeight: 700,
+}
+
+const metaStyle: React.CSSProperties = {
+    marginTop: 14,
+    color: "#8A9CBD",
+    fontSize: 13,
+    fontWeight: 700,
+}
+
+const diffGrid: React.CSSProperties = {
+    display: "grid",
+    gap: 12,
+    marginTop: 16,
+}
+
+const diffRow: React.CSSProperties = {
+    borderRadius: 16,
+    border: "1px solid rgba(219,230,248,1)",
+    background: "rgba(247,250,255,0.78)",
+    padding: 12,
+}
+
+const diffFieldName: React.CSSProperties = {
+    color: "#112B5C",
+    fontSize: 13,
+    fontWeight: 900,
+    textTransform: "capitalize",
+    marginBottom: 8,
+}
+
+const diffColumns: React.CSSProperties = {
+    display: "grid",
+    gridTemplateColumns: "1fr 1fr",
+    gap: 10,
+}
+
+const oldValueBox: React.CSSProperties = {
+    display: "grid",
+    gap: 5,
+    padding: 10,
+    borderRadius: 12,
+    background: "#FFF6D8",
+    color: "#7A5400",
+    fontSize: 13,
+    lineHeight: 1.45,
+    overflowWrap: "anywhere",
+}
+
+const newValueBox: React.CSSProperties = {
+    display: "grid",
+    gap: 5,
+    padding: 10,
+    borderRadius: 12,
+    background: "#EAF7EF",
+    color: "#1D6F42",
+    fontSize: 13,
+    lineHeight: 1.45,
+    overflowWrap: "anywhere",
+}
+
+const emptyMiniStyle: React.CSSProperties = {
+    marginTop: 14,
+    padding: 12,
+    borderRadius: 14,
+    background: "#F2F7FF",
+    color: "#6F84AF",
+    fontWeight: 700,
+    fontSize: 13,
+}
+
+const banReasonBox: React.CSSProperties = {
+    marginTop: 14,
+    padding: 12,
+    borderRadius: 14,
+    background: "#FDEDEC",
+    color: "#C0392B",
+    fontWeight: 800,
+    fontSize: 13,
+}
+
+const buttonRow: React.CSSProperties = {
+    display: "flex",
+    gap: 10,
+    flexWrap: "wrap",
+    marginTop: 18,
+}
+
+const approveBtn: React.CSSProperties = {
+    height: 44,
+    padding: "0 18px",
+    borderRadius: 14,
+    border: "1px solid #1DB954",
+    background: "#1DB954",
+    color: "white",
+    fontWeight: 800,
+    cursor: "pointer",
+}
+
+const rejectBtn: React.CSSProperties = {
+    height: 44,
+    padding: "0 18px",
+    borderRadius: 14,
+    border: "1px solid #E74C3C",
+    background: "#E74C3C",
+    color: "white",
+    fontWeight: 800,
+    cursor: "pointer",
+}
+
+const warningBtn: React.CSSProperties = {
+    height: 44,
+    padding: "0 18px",
+    borderRadius: 14,
+    border: "1px solid #F39C12",
+    background: "#F39C12",
+    color: "white",
+    fontWeight: 800,
+    cursor: "pointer",
+}
+
+const secondaryBtn: React.CSSProperties = {
+    height: 44,
+    padding: "0 18px",
+    borderRadius: 14,
+    border: "1px solid rgba(210, 224, 245, 0.95)",
+    background: "rgba(255,255,255,0.82)",
+    color: "#26477D",
+    fontWeight: 800,
+    cursor: "pointer",
+}
+
+const primaryLink: React.CSSProperties = {
+    marginTop: 20,
+    height: 48,
+    padding: "0 18px",
+    borderRadius: 16,
+    background: "linear-gradient(135deg, #43A4FF, #2C74F4)",
+    color: "white",
+    fontSize: 15,
+    fontWeight: 800,
+    textDecoration: "none",
+    display: "inline-flex",
+    alignItems: "center",
+    justifyContent: "center",
+}
+
+const emptyStyle: React.CSSProperties = {
+    borderRadius: 20,
+    padding: 24,
+    background: "rgba(255,255,255,0.7)",
+    border: "1px dashed rgba(207,224,255,1)",
+    color: "#6F84AF",
+    fontWeight: 700,
+    textAlign: "center",
+}
+
+const adminPreviewImage: React.CSSProperties = {
+    minHeight: 210,
+    borderRadius: 20,
+    padding: 16,
+    marginBottom: 18,
+    backgroundSize: "cover",
+    backgroundPosition: "center",
+    display: "flex",
+    alignItems: "end",
+    color: "white",
+    boxShadow: "0 18px 45px rgba(61,126,245,0.12)",
+}
+
+const smallImagePreview: React.CSSProperties = {
+    minHeight: 160,
+    borderRadius: 16,
+    marginTop: 8,
+    marginBottom: 12,
+    backgroundSize: "cover",
+    backgroundPosition: "center",
+    boxShadow: "0 14px 32px rgba(61,126,245,0.1)",
+}
+
+const imageLabel: React.CSSProperties = {
+    padding: "7px 10px",
+    borderRadius: 999,
+    background: "rgba(17,43,92,0.62)",
+    color: "white",
+    fontSize: 12,
+    fontWeight: 900,
+}
+
+const titleWithIcon: React.CSSProperties = {
+    display: "flex",
+    alignItems: "center",
+    gap: 12,
+    minWidth: 0,
+}
+
+const adminIcon: React.CSSProperties = {
+    width: 54,
+    height: 54,
+    minWidth: 54,
+    borderRadius: 999,
+    objectFit: "cover",
+    border: "2px solid rgba(46,124,246,0.18)",
+    boxShadow: "0 12px 28px rgba(61,126,245,0.16)",
+}
+
+const infoGrid: React.CSSProperties = {
+    display: "grid",
+    gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
+    gap: 10,
+    marginTop: 16,
+}
+
+const infoRow: React.CSSProperties = {
+    display: "grid",
+    gap: 4,
+    padding: 10,
+    borderRadius: 14,
+    background: "#F2F7FF",
+    border: "1px solid rgba(214,226,248,1)",
+    minWidth: 0,
+}
+
+const infoLabel: React.CSSProperties = {
+    color: "#7B8FB8",
+    fontSize: 12,
+    fontWeight: 900,
+}
+
+const infoValue: React.CSSProperties = {
+    color: "#112B5C",
+    fontSize: 13,
+    fontWeight: 800,
+    overflowWrap: "anywhere",
+}
+
+const inlineEditInput: React.CSSProperties = {
+    width: "100%",
+    minWidth: 0,
+    padding: "7px 9px",
+    borderRadius: 9,
+    border: "1px solid #2C74F4",
+    background: "white",
+    color: "#112B5C",
+    fontSize: 13,
+    fontWeight: 800,
+    boxSizing: "border-box",
+    outline: "none",
+}
+
+const pendingTextareaStyle: React.CSSProperties = {
+    width: "100%",
+    minHeight: 92,
+    marginTop: 8,
+    padding: 12,
+    borderRadius: 14,
+    border: "1px solid rgba(214,226,248,1)",
+    background: "#F8FBFE",
+    color: "#59719C",
+    fontSize: 15,
+    lineHeight: 1.6,
+    fontFamily: "inherit",
+    boxSizing: "border-box",
+    resize: "vertical",
+    outline: "none",
+}
+
+const pendingLongTextareaStyle: React.CSSProperties = {
+    ...pendingTextareaStyle,
+    minHeight: 180,
+}
+
+const sectionBlock: React.CSSProperties = {
+    marginTop: 16,
+}
+
+const sectionMiniTitle: React.CSSProperties = {
+    display: "block",
+    color: "#112B5C",
+    fontSize: 13,
+    fontWeight: 900,
+    marginBottom: 7,
+}
+
+const longDescriptionPreview: React.CSSProperties = {
+    ...descriptionStyle,
+    whiteSpace: "pre-wrap",
+    maxHeight: 240,
+    overflow: "auto",
+    padding: 12,
+    borderRadius: 14,
+    background: "#F8FBFE",
+    border: "1px solid rgba(214,226,248,1)",
+}
+
+const changeSummaryBox: React.CSSProperties = {
+    marginTop: 14,
+    padding: 12,
+    borderRadius: 14,
+    background: "#EAF3FF",
+    color: "#26477D",
+    fontSize: 13,
+    fontWeight: 800,
+    lineHeight: 1.5,
+}
+
+const imageCompareGrid: React.CSSProperties = {
+    display: "grid",
+    gridTemplateColumns: "1fr 1fr",
+    gap: 14,
+    marginTop: 16,
+}
+
+const secondaryLinkBtn: React.CSSProperties = {
+    ...secondaryBtn,
+    textDecoration: "none",
+    display: "inline-flex",
+    alignItems: "center",
+    justifyContent: "center",
+}
+
+const errorStyle: React.CSSProperties = {
+    color: "#C0392B",
+    background: "#FDEDEC",
+    border: "1px solid #F5C6CB",
+    padding: 12,
+    borderRadius: 12,
+    fontSize: 14,
+    marginBottom: 14,
+}
+
+const successStyle: React.CSSProperties = {
+    color: "#1D6F42",
+    background: "#EAF7EF",
+    border: "1px solid #BEE3CC",
+    padding: 12,
+    borderRadius: 12,
+    fontSize: 14,
+    marginBottom: 14,
+}
+
+const importPanelStyle: React.CSSProperties = {
+    display: "grid",
+    gap: 16,
+    padding: 20,
+    borderRadius: 24,
+    border: "1px solid rgba(214,226,248,1)",
+    background: "rgba(255,255,255,0.72)",
+}
+
+const importHeaderRow: React.CSSProperties = {
+    display: "flex",
+    alignItems: "flex-start",
+    justifyContent: "space-between",
+    gap: 16,
+}
+
+const importTitleStyle: React.CSSProperties = {
+    margin: 0,
+    color: "#112B5C",
+    fontSize: 24,
+    lineHeight: 1.15,
+    fontWeight: 950,
+    letterSpacing: "-0.035em",
+}
+
+const importSubtitleStyle: React.CSSProperties = {
+    margin: "8px 0 0",
+    color: "#6F84AF",
+    fontSize: 14,
+    lineHeight: 1.55,
+    fontWeight: 600,
+}
+
+const importTextareaStyle: React.CSSProperties = {
+    width: "100%",
+    minHeight: 220,
+    padding: 16,
+    borderRadius: 18,
+    border: "1px solid rgba(214,226,248,1)",
+    background: "white",
+    color: "#173668",
+    fontSize: 14,
+    lineHeight: 1.5,
+    fontWeight: 650,
+    boxSizing: "border-box",
+    outline: "none",
+    resize: "vertical",
+}
+
+const importOptionsGrid: React.CSSProperties = {
+    display: "grid",
+    gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
+    gap: 10,
+}
+
+const importOptionStyle: React.CSSProperties = {
+    minHeight: 46,
+    padding: "0 14px",
+    borderRadius: 14,
+    border: "1px solid rgba(214,226,248,1)",
+    background: "rgba(255,255,255,0.86)",
+    color: "#26477D",
+    fontSize: 13,
+    fontWeight: 800,
+    display: "flex",
+    alignItems: "center",
+    gap: 9,
+    cursor: "pointer",
+}
+
+const importHelpBox: React.CSSProperties = {
+    padding: 12,
+    borderRadius: 14,
+    background: "#F2F7FF",
+    border: "1px solid rgba(214,226,248,1)",
+    color: "#59719C",
+    fontSize: 13,
+    fontWeight: 700,
+    lineHeight: 1.45,
+}
+
+const importResultsGrid: React.CSSProperties = {
+    display: "grid",
+    gap: 10,
+    marginTop: 4,
+}
+
+const importResultCard: React.CSSProperties = {
+    padding: 14,
+    borderRadius: 16,
+    border: "1px solid rgba(190,230,205,1)",
+    background: "#F1FBF5",
+}
+
+const importResultSkippedCard: React.CSSProperties = {
+    ...importResultCard,
+    border: "1px solid rgba(214,226,248,1)",
+    background: "#F8FBFE",
+}
+
+const importResultErrorCard: React.CSSProperties = {
+    ...importResultCard,
+    border: "1px solid #F5C6CB",
+    background: "#FDEDEC",
+}
+
+const importResultTopLine: React.CSSProperties = {
+    display: "flex",
+    justifyContent: "space-between",
+    gap: 12,
+    color: "#112B5C",
+    fontSize: 14,
+    fontWeight: 900,
+}
+
+const importResultMeta: React.CSSProperties = {
+    marginTop: 6,
+    color: "#6F84AF",
+    fontSize: 12,
+    fontWeight: 700,
+    overflowWrap: "anywhere",
+}
+
+const importResultErrorText: React.CSSProperties = {
+    marginTop: 8,
+    color: "#B4233D",
+    fontSize: 12,
+    fontWeight: 800,
+    lineHeight: 1.45,
+}
