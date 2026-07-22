@@ -5448,6 +5448,311 @@ async function importSingleTelegramListing(link, options, adminUser) {
   }
 }
 
+
+// ========================================
+// TGSTAT LINK FINDER
+// Finds public Telegram links only. It does not call AI or create listings.
+// ========================================
+
+const TGSTAT_SEARCH_URL = "https://tgstat.com/channels/search"
+const TGSTAT_DEFAULT_USER_AGENT =
+  process.env.TGSTAT_USER_AGENT ||
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36"
+
+function extractCookiePairs(setCookieHeader) {
+  if (!setCookieHeader) return []
+
+  // Split only where a new cookie begins. This avoids breaking Expires values.
+  return String(setCookieHeader)
+    .split(/,(?=\s*[^;,\s]+=)/g)
+    .map((part) => part.trim().split(";")[0])
+    .filter(Boolean)
+}
+
+function mergeCookieHeaders(...cookieHeaders) {
+  const values = new Map()
+
+  for (const header of cookieHeaders.filter(Boolean)) {
+    const parts = String(header).split(/;\s*/g)
+
+    for (const part of parts) {
+      const separator = part.indexOf("=")
+      if (separator <= 0) continue
+      const name = part.slice(0, separator).trim()
+      const value = part.slice(separator + 1).trim()
+      if (name && value) values.set(name, value)
+    }
+  }
+
+  return [...values.entries()]
+    .map(([name, value]) => `${name}=${value}`)
+    .join("; ")
+}
+
+function extractTgstatCsrf(html) {
+  const source = String(html || "")
+  const hiddenMatch = source.match(
+    /name=["']_tgstat_csrk["'][^>]*value=["']([^"']+)["']/i
+  )
+  if (hiddenMatch?.[1]) return hiddenMatch[1]
+
+  const metaMatch = source.match(
+    /<meta[^>]+name=["']csrf-token["'][^>]+content=["']([^"']+)["']/i
+  )
+  return metaMatch?.[1] || null
+}
+
+function extractPublicTelegramLinksFromTgstatHtml(html) {
+  const links = []
+  const seen = new Set()
+  const pattern = /(?:https:\/\/tgstat\.com)?\/channel\/@([A-Za-z0-9_]+)\/stat/gi
+
+  for (const match of String(html || "").matchAll(pattern)) {
+    const username = match[1]
+    const key = username.toLowerCase()
+    if (seen.has(key)) continue
+    seen.add(key)
+    links.push(`https://t.me/${username}`)
+  }
+
+  return links
+}
+
+async function createTgstatSession() {
+  const initialCookie = String(process.env.TGSTAT_COOKIE || "").trim()
+  const response = await fetch(TGSTAT_SEARCH_URL, {
+    method: "GET",
+    headers: {
+      Accept: "text/html,application/xhtml+xml",
+      "User-Agent": TGSTAT_DEFAULT_USER_AGENT,
+      ...(initialCookie ? { Cookie: initialCookie } : {}),
+    },
+    redirect: "follow",
+  })
+
+  if (!response.ok) {
+    throw new Error(`TGStat session request failed with HTTP ${response.status}.`)
+  }
+
+  const html = await response.text()
+  const csrf = extractTgstatCsrf(html)
+
+  if (!csrf) {
+    throw new Error(
+      "TGStat CSRF token was not found. TGStat may have changed its page or blocked the request."
+    )
+  }
+
+  const setCookieHeader = response.headers.get("set-cookie") || ""
+  const responseCookies = extractCookiePairs(setCookieHeader).join("; ")
+  const cookie = mergeCookieHeaders(initialCookie, responseCookies)
+
+  return { csrf, cookie }
+}
+
+function appendTgstatFormValue(form, name, value) {
+  if (value === null || value === undefined || value === "") return
+  form.append(name, String(value))
+}
+
+async function requestTgstatSearchPage(session, search, page, offset) {
+  const form = new URLSearchParams()
+
+  appendTgstatFormValue(form, "_tgstat_csrk", session.csrf)
+  appendTgstatFormValue(form, "view", "list")
+  appendTgstatFormValue(form, "sort", search.sort || "participants")
+  appendTgstatFormValue(form, "q", search.query || "")
+  appendTgstatFormValue(form, "inAbout", search.inAbout ? "1" : "0")
+  appendTgstatFormValue(form, "categories", "")
+  appendTgstatFormValue(form, "countries", "")
+  appendTgstatFormValue(form, "languages", "")
+
+  for (const categoryId of search.categoryIds || []) {
+    appendTgstatFormValue(form, "categories[]", categoryId)
+  }
+  for (const countryId of search.countryIds || []) {
+    appendTgstatFormValue(form, "countries[]", countryId)
+  }
+  for (const languageId of search.languageIds || []) {
+    appendTgstatFormValue(form, "languages[]", languageId)
+  }
+
+  appendTgstatFormValue(form, "channelType", "public")
+  appendTgstatFormValue(form, "age", "0-120")
+  appendTgstatFormValue(form, "err", "0-100")
+  appendTgstatFormValue(form, "er", "0")
+  appendTgstatFormValue(form, "male", "0")
+  appendTgstatFormValue(form, "female", "0")
+  appendTgstatFormValue(
+    form,
+    "participantsCountFrom",
+    Math.max(Number(search.minSubscribers || 1000), 1000)
+  )
+  appendTgstatFormValue(form, "participantsCountTo", "")
+  appendTgstatFormValue(form, "avgReachFrom", "")
+  appendTgstatFormValue(form, "avgReachTo", "")
+  appendTgstatFormValue(form, "avgReach24From", "")
+  appendTgstatFormValue(form, "avgReach24To", "")
+  appendTgstatFormValue(form, "ciFrom", "")
+  appendTgstatFormValue(form, "ciTo", "")
+  appendTgstatFormValue(form, "isVerified", "0")
+  appendTgstatFormValue(form, "isRknVerified", "0")
+  appendTgstatFormValue(form, "isStoriesAvailable", "0")
+  appendTgstatFormValue(form, "noRedLabel", "1")
+  appendTgstatFormValue(form, "noScam", "1")
+  appendTgstatFormValue(form, "noDead", "1")
+  appendTgstatFormValue(form, "page", page)
+  appendTgstatFormValue(form, "offset", offset)
+
+  const response = await fetch(TGSTAT_SEARCH_URL, {
+    method: "POST",
+    headers: {
+      Accept: "*/*",
+      "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+      Origin: "https://tgstat.com",
+      Referer: TGSTAT_SEARCH_URL,
+      "User-Agent": TGSTAT_DEFAULT_USER_AGENT,
+      "X-Requested-With": "XMLHttpRequest",
+      ...(session.cookie ? { Cookie: session.cookie } : {}),
+    },
+    body: form.toString(),
+    redirect: "follow",
+  })
+
+  const responseText = await response.text()
+
+  if (!response.ok) {
+    throw new Error(
+      `TGStat search failed with HTTP ${response.status}: ${responseText.slice(0, 180)}`
+    )
+  }
+
+  let payload
+  try {
+    payload = JSON.parse(responseText)
+  } catch {
+    throw new Error(
+      "TGStat did not return JSON. A login, CAPTCHA, or changed response format may be blocking the search."
+    )
+  }
+
+  if (payload?.status !== "ok" || typeof payload?.html !== "string") {
+    throw new Error(payload?.message || "TGStat returned an invalid search response.")
+  }
+
+  return payload
+}
+
+app.post("/api/admin/scrape-tgstat-links", async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || ""
+    const token = authHeader.replace("Bearer ", "")
+
+    if (!token) {
+      return res.status(401).json({ error: "Missing auth token." })
+    }
+
+    const {
+      data: { user },
+      error: userError,
+    } = await supabaseAdmin.auth.getUser(token)
+
+    if (userError || !user || !isBackendAdminUser(user)) {
+      return res.status(403).json({ error: "Admin access required." })
+    }
+
+    const requestedPages = Number(req.body?.max_pages || 1)
+    const maxPages = Math.min(Math.max(requestedPages || 1, 1), 5)
+    const maxLinks = Math.min(
+      Math.max(Number(req.body?.max_links || maxPages * 30), 1),
+      150
+    )
+
+    const search = {
+      query: String(req.body?.query || "").trim().slice(0, 120),
+      inAbout: req.body?.in_about === true,
+      languageIds: Array.isArray(req.body?.language_ids)
+        ? req.body.language_ids.map(String).filter(Boolean).slice(0, 5)
+        : [],
+      countryIds: Array.isArray(req.body?.country_ids)
+        ? req.body.country_ids.map(String).filter(Boolean).slice(0, 5)
+        : [],
+      categoryIds: Array.isArray(req.body?.category_ids)
+        ? req.body.category_ids.map(String).filter(Boolean).slice(0, 5)
+        : [],
+      minSubscribers: Math.max(Number(req.body?.min_subscribers || 1000), 1000),
+      sort: [
+        "participants",
+        "avg_reach",
+        "ci_index",
+        "members_t",
+        "members_y",
+        "members_7d",
+        "members_30d",
+      ].includes(req.body?.sort)
+        ? req.body.sort
+        : "participants",
+    }
+
+    const session = await createTgstatSession()
+    const links = []
+    const seen = new Set()
+    const pages = []
+    let page = 0
+    let offset = 0
+    let hasMore = true
+
+    for (let index = 0; index < maxPages && hasMore && links.length < maxLinks; index += 1) {
+      const payload = await requestTgstatSearchPage(session, search, page, offset)
+      const pageLinks = extractPublicTelegramLinksFromTgstatHtml(payload.html)
+
+      for (const link of pageLinks) {
+        const key = link.toLowerCase()
+        if (seen.has(key)) continue
+        seen.add(key)
+        links.push(link)
+        if (links.length >= maxLinks) break
+      }
+
+      pages.push({
+        page,
+        offset,
+        extracted: pageLinks.length,
+        next_page: payload.nextPage,
+        next_offset: payload.nextOffset,
+      })
+
+      hasMore = payload.hasMore === true
+      page = Number(payload.nextPage ?? page + 1)
+      offset = Number(payload.nextOffset ?? offset + 30)
+
+      if (index + 1 < maxPages && hasMore) {
+        await new Promise((resolve) => setTimeout(resolve, 900))
+      }
+    }
+
+    return res.json({
+      ok: true,
+      source: "tgstat",
+      links_found: links.length,
+      links,
+      has_more: hasMore,
+      next_page: page,
+      next_offset: offset,
+      pages_scraped: pages.length,
+      pages,
+      created_listings: 0,
+      ai_calls: 0,
+    })
+  } catch (err) {
+    console.error("TGStat link scrape error:", err)
+    return res.status(500).json({
+      error: err.message || "TGStat link search failed.",
+      code: "TGSTAT_LINK_SEARCH_FAILED",
+    })
+  }
+})
+
 app.post("/api/admin/import-telegram-listings", async (req, res) => {
   try {
     const authHeader = req.headers.authorization || ""
