@@ -831,6 +831,122 @@ app.post("/api/auth/is-admin", async (req, res) => {
   }
 })
 
+
+// Authoritative voting endpoint.
+// Uses the service role so the vote row and cached votes_count stay consistent.
+// Normal users may cast one vote per 24 hours across TeleHub.
+// Admins may vote without the 24-hour restriction.
+app.post("/api/listings/vote", async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || ""
+    const token = authHeader.replace("Bearer ", "").trim()
+    const listingId = String(req.body?.listing_id || "").trim()
+
+    if (!token) {
+      return res.status(401).json({ error: "You must log in to vote." })
+    }
+
+    if (!listingId) {
+      return res.status(400).json({ error: "Missing listing_id." })
+    }
+
+    const {
+      data: { user },
+      error: userError,
+    } = await supabaseAdmin.auth.getUser(token)
+
+    if (userError || !user) {
+      return res.status(401).json({ error: "Your login session is invalid." })
+    }
+
+    const { data: listing, error: listingError } = await supabaseAdmin
+      .from("channel_listings")
+      .select("id, status, is_banned, votes_count")
+      .eq("id", listingId)
+      .single()
+
+    if (listingError || !listing) {
+      return res.status(404).json({ error: "Listing not found." })
+    }
+
+    if (listing.status !== "approved" || listing.is_banned) {
+      return res.status(404).json({ error: "This listing is unavailable." })
+    }
+
+    const email = String(user.email || "").toLowerCase()
+    const isAdmin = ADMIN_EMAILS.includes(email)
+
+    if (!isAdmin) {
+      const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString()
+
+      const { data: recentVote, error: recentVoteError } = await supabaseAdmin
+        .from("channel_votes")
+        .select("id, created_at")
+        .eq("user_id", user.id)
+        .gte("created_at", cutoff)
+        .limit(1)
+        .maybeSingle()
+
+      if (recentVoteError) throw recentVoteError
+
+      if (recentVote) {
+        return res.status(429).json({
+          error: "You can vote again after 24 hours.",
+          code: "VOTE_COOLDOWN",
+        })
+      }
+    }
+
+    const { error: insertError } = await supabaseAdmin
+      .from("channel_votes")
+      .insert({
+        user_id: user.id,
+        listing_id: listing.id,
+      })
+
+    if (insertError) throw insertError
+
+    const { count, error: countError } = await supabaseAdmin
+      .from("channel_votes")
+      .select("id", { count: "exact", head: true })
+      .eq("listing_id", listing.id)
+
+    if (countError) throw countError
+
+    const votesCount = Number(count || 0)
+    const now = new Date().toISOString()
+
+    const { error: updateError } = await supabaseAdmin
+      .from("channel_listings")
+      .update({
+        votes_count: votesCount,
+        updated_at: now,
+      })
+      .eq("id", listing.id)
+
+    if (updateError) throw updateError
+
+    try {
+      await updateHomepageListingCache()
+    } catch (cacheError) {
+      console.warn("Homepage cache refresh after vote failed:", cacheError.message)
+    }
+
+    return res.json({
+      ok: true,
+      listing_id: listing.id,
+      votes_count: votesCount,
+      is_admin: isAdmin,
+      message: isAdmin ? "Admin vote added." : "Vote added.",
+    })
+  } catch (err) {
+    console.error("Vote endpoint failed:", err)
+    return res.status(500).json({
+      error: err.message || "Vote failed.",
+    })
+  }
+})
+
 app.post("/api/discord/vote-feed", async (req, res) => {
   console.log("Discord vote feed route hit:", req.body)
 
