@@ -997,11 +997,10 @@ async function addCmsImageField(fieldData, fields, framer, fieldName, imageUrl, 
   }
 }
 
-function buildCmsText(listing) {
-  const name =
-    listing.telegram_title ||
-    listing.channel_name ||
-    "Telegram Listing"
+const name =
+  listing.channel_name ||
+  listing.telegram_title ||
+  "Telegram Listing"
 
   const listingType = String(listing.listing_type || "channel").toLowerCase()
   const typeTitle = listingType.charAt(0).toUpperCase() + listingType.slice(1)
