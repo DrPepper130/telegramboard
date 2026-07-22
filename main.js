@@ -5007,38 +5007,6 @@ app.get("/api/telegram/sync-hourly", async (req, res) => {
     return res.status(500).json({ error: err.message })
   }
 })
-      } catch (err) {
-        results.push({
-          id: listing.id,
-          ok: false,
-          error: err.message,
-        })
-      }
-    }
-
-    let homepageCache = null
-
-    try {
-      homepageCache = await updateHomepageListingCache()
-    } catch (cacheErr) {
-      console.error("Homepage cache refresh after sync failed:", cacheErr)
-    }
-
-    res.json({
-      ok: true,
-      results,
-      homepage_cache: homepageCache
-        ? {
-            updated_at: homepageCache.updated_at,
-            count: homepageCache.listings.length,
-          }
-        : null,
-    })
-      } catch (err) {
-        console.error("Hourly sync error:", err)
-        res.status(500).json({ error: err.message })
-      }
-    })
 
 
 
