@@ -514,7 +514,8 @@ async function runWithConcurrency(items, limit, worker) {
 
 // Lightweight hourly path:
 // - Uses the saved Telegram chat ID whenever available.
-// - Fetches only the member count.
+// - Falls back directly to the public username when no chat ID is saved.
+// - Calls getChatMemberCount only; it never calls getChat.
 // - Does not fetch metadata or avatars.
 // - Does not connect to Framer.
 // - Inserts the hourly member snapshot.
@@ -564,29 +565,10 @@ async function syncListingMemberCountFast(listing) {
     last_synced_at: now,
   }
 
-  // If a username fallback succeeded because the stored chat ID was missing,
-  // resolve getChat only once so future hourly runs can use the stable chat ID.
-  if (!listing.telegram_chat_id && successfulTarget) {
-    try {
-      const chat = await tg("getChat", { chat_id: successfulTarget })
-      updatePayload.telegram_chat_id = String(chat.id)
-      updatePayload.telegram_username = cleanUsername(chat.username)
-      updatePayload.telegram_title = chat.title || listing.telegram_title || null
-      updatePayload.telegram_description =
-        chat.description ||
-        chat.bio ||
-        listing.telegram_description ||
-        null
-
-      const detectedType = normalizeTelegramType(chat.type)
-      if (detectedType) updatePayload.listing_type = detectedType
-    } catch (err) {
-      console.warn("Could not backfill Telegram chat ID during fast sync:", {
-        listing_id: listing.id,
-        error: err.message,
-      })
-    }
-  }
+  // The hourly sync never calls getChat.
+  // New listings receive their Telegram chat ID and metadata during import.
+  // Older listings without a saved chat ID keep using their public username
+  // directly with getChatMemberCount.
 
   const { error: updateError } = await supabaseAdmin
     .from("channel_listings")
