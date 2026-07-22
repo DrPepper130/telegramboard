@@ -5519,19 +5519,50 @@ function extractPublicTelegramLinksFromTgstatHtml(html) {
 }
 
 async function createTgstatSession() {
-  const initialCookie = String(process.env.TGSTAT_COOKIE || "").trim()
+  const configuredCookie = String(
+    process.env.TGSTAT_COOKIE || ""
+  ).trim()
+
+  const configuredCsrf = String(
+    process.env.TGSTAT_CSRF_TOKEN || ""
+  ).trim()
+
+  // Prefer a browser session supplied through Render.
+  // This avoids the anonymous GET that TGStat blocks with HTTP 403.
+  if (configuredCookie && configuredCsrf) {
+    return {
+      cookie: configuredCookie,
+      csrf: configuredCsrf,
+      source: "environment",
+    }
+  }
+
   const response = await fetch(TGSTAT_SEARCH_URL, {
-    method: "GET",
+    method: "POST",
     headers: {
-      Accept: "text/html,application/xhtml+xml",
+      Accept: "*/*",
+      "Accept-Language": "en-US,en;q=0.9",
+      "Content-Type":
+        "application/x-www-form-urlencoded; charset=UTF-8",
+      Cookie: session.cookie,
+      Origin: "https://tgstat.com",
+      Referer: "https://tgstat.com/channels/search",
       "User-Agent": TGSTAT_DEFAULT_USER_AGENT,
-      ...(initialCookie ? { Cookie: initialCookie } : {}),
+      "X-Requested-With": "XMLHttpRequest",
     },
-    redirect: "follow",
+    body: form.toString(),
+    redirect: "manual",
   })
 
   if (!response.ok) {
-    throw new Error(`TGStat session request failed with HTTP ${response.status}.`)
+    const error = new Error(
+      `TGStat rejected the automatic session request with HTTP ${response.status}. Add TGSTAT_COOKIE and TGSTAT_CSRF_TOKEN from a fresh browser session.`
+    )
+
+    error.code = "TGSTAT_SESSION_BLOCKED"
+    error.status = response.status
+
+    throw error
   }
 
   const html = await response.text()
@@ -5539,15 +5570,21 @@ async function createTgstatSession() {
 
   if (!csrf) {
     throw new Error(
-      "TGStat CSRF token was not found. TGStat may have changed its page or blocked the request."
+      "TGStat CSRF token was not found in the search page."
     )
   }
 
-  const setCookieHeader = response.headers.get("set-cookie") || ""
-  const responseCookies = extractCookiePairs(setCookieHeader).join("; ")
-  const cookie = mergeCookieHeaders(initialCookie, responseCookies)
+  const setCookieHeader =
+    response.headers.get("set-cookie") || ""
 
-  return { csrf, cookie }
+  const responseCookies =
+    extractCookiePairs(setCookieHeader).join("; ")
+
+  return {
+    csrf,
+    cookie: responseCookies,
+    source: "automatic",
+  }
 }
 
 function appendTgstatFormValue(form, name, value) {
