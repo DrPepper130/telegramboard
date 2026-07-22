@@ -740,13 +740,88 @@ app.post("/api/listings/refresh-member-count", async (req, res) => {
   }
 })
 
+function isPermanentTelegramInviteError(message) {
+  const text = String(message || "").toLowerCase()
+
+  return (
+    text.includes("chat not found") ||
+    text.includes("username not found") ||
+    text.includes("user not found")
+  )
+}
+
+async function removeUnavailableListingFromPublicPages(listing) {
+  const now = new Date().toISOString()
+
+  const { error: updateError } = await supabaseAdmin
+    .from("channel_listings")
+    .update({
+      status: "needs_update",
+      admin_reviewed: false,
+      framer_sync_status: "not_synced",
+      framer_sync_error:
+        "Telegram invite is no longer reachable. The owner must provide an updated invite.",
+      updated_at: now,
+    })
+    .eq("id", listing.id)
+
+  if (updateError) throw updateError
+
+  let framerResult = null
+
+  try {
+    framerResult = await queueFramerSync(() =>
+      deleteListingFromFramerCMS(listing, { publish: false })
+    )
+  } catch (framerError) {
+    console.error("Could not remove unavailable listing from Framer CMS:", {
+      listing_id: listing.id,
+      error: framerError.message,
+    })
+
+    await supabaseAdmin
+      .from("channel_listings")
+      .update({
+        framer_sync_status: "failed",
+        framer_sync_error: framerError.message,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", listing.id)
+  }
+
+  return {
+    listing_id: listing.id,
+    status: "needs_update",
+    framer: framerResult,
+  }
+}
+
+async function publishFramerRemovalBatch() {
+  if (process.env.FRAMER_AUTO_DEPLOY === "false") return false
+  if (!process.env.FRAMER_API_KEY || !process.env.FRAMER_PROJECT_URL) return false
+
+  const { connect } = await import("framer-api")
+  const framer = await connect(
+    process.env.FRAMER_PROJECT_URL,
+    process.env.FRAMER_API_KEY
+  )
+
+  try {
+    const publication = await framer.publish()
+    await framer.deploy(publication.deployment.id)
+    return true
+  } finally {
+    await framer.disconnect()
+  }
+}
+
 async function runHourlyTelegramSync() {
   const startedAt = Date.now()
 
   const { data: listings, error } = await supabaseAdmin
     .from("channel_listings")
     .select(
-      "id, telegram_chat_id, telegram_username, telegram_link, telegram_title, telegram_description, listing_type, member_count"
+      "id, slug, short_invite, framer_cms_item_id, telegram_chat_id, telegram_username, telegram_link, telegram_title, telegram_description, listing_type, member_count"
     )
     .eq("status", "approved")
     .or("is_banned.is.null,is_banned.eq.false")
@@ -777,6 +852,41 @@ async function runHourlyTelegramSync() {
     }
   })
 
+  const permanentlyUnavailable = []
+
+  for (let index = 0; index < results.length; index += 1) {
+    const result = results[index]
+
+    if (!result.ok && isPermanentTelegramInviteError(result.error)) {
+      permanentlyUnavailable.push(listings[index])
+    }
+  }
+
+  const removedListings = []
+
+  for (const listing of permanentlyUnavailable) {
+    try {
+      removedListings.push(
+        await removeUnavailableListingFromPublicPages(listing)
+      )
+    } catch (removeError) {
+      console.error("Unavailable listing cleanup failed:", {
+        listing_id: listing.id,
+        error: removeError.message,
+      })
+    }
+  }
+
+  let framerRemovalBatchPublished = false
+
+  if (removedListings.some((item) => item?.framer?.deleted)) {
+    try {
+      framerRemovalBatchPublished = await publishFramerRemovalBatch()
+    } catch (publishError) {
+      console.error("Framer unavailable-listing publish failed:", publishError)
+    }
+  }
+
   let homepageCache = null
 
   try {
@@ -790,6 +900,9 @@ async function runHourlyTelegramSync() {
     count: results.length,
     succeeded: results.filter((item) => item.ok).length,
     failed: results.filter((item) => !item.ok).length,
+    removed_from_public_pages: removedListings.length,
+    removed_listing_ids: removedListings.map((item) => item.listing_id),
+    framer_removal_batch_published: framerRemovalBatchPublished,
     concurrency: TELEGRAM_SYNC_CONCURRENCY,
     duration_ms: Date.now() - startedAt,
     results,
@@ -828,122 +941,6 @@ app.post("/api/auth/is-admin", async (req, res) => {
   } catch (err) {
     console.error("Admin check error:", err)
     return res.status(500).json({ isAdmin: false })
-  }
-})
-
-
-// Authoritative voting endpoint.
-// Uses the service role so the vote row and cached votes_count stay consistent.
-// Normal users may cast one vote per 24 hours across TeleHub.
-// Admins may vote without the 24-hour restriction.
-app.post("/api/listings/vote", async (req, res) => {
-  try {
-    const authHeader = req.headers.authorization || ""
-    const token = authHeader.replace("Bearer ", "").trim()
-    const listingId = String(req.body?.listing_id || "").trim()
-
-    if (!token) {
-      return res.status(401).json({ error: "You must log in to vote." })
-    }
-
-    if (!listingId) {
-      return res.status(400).json({ error: "Missing listing_id." })
-    }
-
-    const {
-      data: { user },
-      error: userError,
-    } = await supabaseAdmin.auth.getUser(token)
-
-    if (userError || !user) {
-      return res.status(401).json({ error: "Your login session is invalid." })
-    }
-
-    const { data: listing, error: listingError } = await supabaseAdmin
-      .from("channel_listings")
-      .select("id, status, is_banned, votes_count")
-      .eq("id", listingId)
-      .single()
-
-    if (listingError || !listing) {
-      return res.status(404).json({ error: "Listing not found." })
-    }
-
-    if (listing.status !== "approved" || listing.is_banned) {
-      return res.status(404).json({ error: "This listing is unavailable." })
-    }
-
-    const email = String(user.email || "").toLowerCase()
-    const isAdmin = ADMIN_EMAILS.includes(email)
-
-    if (!isAdmin) {
-      const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString()
-
-      const { data: recentVote, error: recentVoteError } = await supabaseAdmin
-        .from("channel_votes")
-        .select("id, created_at")
-        .eq("user_id", user.id)
-        .gte("created_at", cutoff)
-        .limit(1)
-        .maybeSingle()
-
-      if (recentVoteError) throw recentVoteError
-
-      if (recentVote) {
-        return res.status(429).json({
-          error: "You can vote again after 24 hours.",
-          code: "VOTE_COOLDOWN",
-        })
-      }
-    }
-
-    const { error: insertError } = await supabaseAdmin
-      .from("channel_votes")
-      .insert({
-        user_id: user.id,
-        listing_id: listing.id,
-      })
-
-    if (insertError) throw insertError
-
-    const { count, error: countError } = await supabaseAdmin
-      .from("channel_votes")
-      .select("id", { count: "exact", head: true })
-      .eq("listing_id", listing.id)
-
-    if (countError) throw countError
-
-    const votesCount = Number(count || 0)
-    const now = new Date().toISOString()
-
-    const { error: updateError } = await supabaseAdmin
-      .from("channel_listings")
-      .update({
-        votes_count: votesCount,
-        updated_at: now,
-      })
-      .eq("id", listing.id)
-
-    if (updateError) throw updateError
-
-    try {
-      await updateHomepageListingCache()
-    } catch (cacheError) {
-      console.warn("Homepage cache refresh after vote failed:", cacheError.message)
-    }
-
-    return res.json({
-      ok: true,
-      listing_id: listing.id,
-      votes_count: votesCount,
-      is_admin: isAdmin,
-      message: isAdmin ? "Admin vote added." : "Vote added.",
-    })
-  } catch (err) {
-    console.error("Vote endpoint failed:", err)
-    return res.status(500).json({
-      error: err.message || "Vote failed.",
-    })
   }
 })
 
