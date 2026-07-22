@@ -651,6 +651,23 @@ async function refreshListingMemberCountOnDemand(listing) {
   }
 }
 
+// Every listing click also queues a one-item Framer CMS refresh and publish.
+// It runs after the response path is chosen so navigation is not blocked by Framer.
+// The live component still shows Supabase data immediately while Framer publishes.
+function queueFramerCmsUpdateFromClick(listingId) {
+  queueFramerSync(() =>
+    syncListingToFramerCMS(listingId, {
+      skipTelegramSync: true,
+      publish: true,
+    })
+  ).catch((err) => {
+    console.error("Framer CMS click update failed:", {
+      listing_id: listingId,
+      error: err.message,
+    })
+  })
+}
+
 // Called when a visitor opens a listing.
 // Returns cached data immediately when it is still fresh.
 // When stale, this same request waits for one Telegram member-count refresh,
@@ -680,6 +697,8 @@ app.post("/api/listings/refresh-member-count", async (req, res) => {
     }
 
     if (!isMemberCountStale(listing.last_synced_at)) {
+      queueFramerCmsUpdateFromClick(listing.id)
+
       return res.json({
         ok: true,
         listing_id: listing.id,
@@ -687,14 +706,18 @@ app.post("/api/listings/refresh-member-count", async (req, res) => {
         last_synced_at: listing.last_synced_at,
         refreshed: false,
         stale: false,
+        framer_cms_sync_queued: true,
       })
     }
 
     const result = await refreshListingMemberCountOnDemand(listing)
 
+    queueFramerCmsUpdateFromClick(listing.id)
+
     return res.json({
       ok: true,
       ...result,
+      framer_cms_sync_queued: true,
     })
   } catch (err) {
     console.error("On-demand member count refresh failed:", {
@@ -1670,7 +1693,12 @@ app.post("/api/framer/sync-listing", async (req, res) => {
       return res.status(403).json({ error: "You do not own this listing." })
     }
 
-    const result = await queueFramerSync(() => syncListingToFramerCMS(listing_id))
+    const result = await queueFramerSync(() =>
+      syncListingToFramerCMS(listing_id, {
+        skipTelegramSync: true,
+        publish: true,
+      })
+    )
 
     return res.json(result)
   } catch (err) {
@@ -1726,15 +1754,6 @@ app.post("/api/framer/sync-content-change", async (req, res) => {
       ? changed_fields.map((field) => String(field || "").trim()).filter(Boolean)
       : []
 
-    if (!shouldSyncFramerForChangedFields(cleanChangedFields)) {
-      return res.json({
-        ok: true,
-        synced: false,
-        reason: "No Framer-visible listing fields changed.",
-        changed_fields: cleanChangedFields,
-      })
-    }
-
     if (listing.status !== "approved" || listing.is_banned) {
       return res.json({
         ok: true,
@@ -1745,7 +1764,10 @@ app.post("/api/framer/sync-content-change", async (req, res) => {
     }
 
     const result = await queueFramerSync(() =>
-      syncListingToFramerCMS(listing_id)
+      syncListingToFramerCMS(listing_id, {
+        skipTelegramSync: true,
+        publish: true,
+      })
     )
 
     return res.json({
@@ -1760,6 +1782,119 @@ app.post("/api/framer/sync-content-change", async (req, res) => {
   }
 })
 
+
+
+// Admin-only CMS lifecycle endpoint.
+// Reject/ban removes the public CMS page. Unban recreates and publishes it.
+app.post("/api/admin/listings/lifecycle", async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || ""
+    const token = authHeader.replace("Bearer ", "")
+    const { listing_id, action, reason } = req.body || {}
+
+    if (!token) return res.status(401).json({ error: "Missing auth token." })
+    if (!listing_id) return res.status(400).json({ error: "Missing listing_id." })
+
+    const cleanAction = String(action || "").trim().toLowerCase()
+    if (!["reject", "ban", "unban"].includes(cleanAction)) {
+      return res.status(400).json({ error: "Invalid lifecycle action." })
+    }
+
+    const {
+      data: { user },
+      error: userError,
+    } = await supabaseAdmin.auth.getUser(token)
+
+    if (userError || !user) {
+      return res.status(401).json({ error: "Invalid auth token." })
+    }
+
+    const email = (user.email || "").toLowerCase()
+    if (!ADMIN_EMAILS.includes(email)) {
+      return res.status(403).json({ error: "Admin access required." })
+    }
+
+    const { data: listing, error: listingError } = await supabaseAdmin
+      .from("channel_listings")
+      .select("*")
+      .eq("id", listing_id)
+      .single()
+
+    if (listingError || !listing) {
+      return res.status(404).json({ error: "Listing not found." })
+    }
+
+    if (cleanAction === "reject" || cleanAction === "ban") {
+      const framer = await queueFramerSync(() =>
+        deleteListingFromFramerCMS(listing, { publish: true })
+      )
+
+      const updatePayload = cleanAction === "reject"
+        ? {
+            status: "rejected",
+            admin_reviewed: true,
+            framer_cms_item_id: null,
+            framer_sync_status: "not_synced",
+            framer_sync_error: null,
+            updated_at: new Date().toISOString(),
+          }
+        : {
+            is_banned: true,
+            admin_reviewed: true,
+            ban_reason: String(reason || "Temporarily banned by admin."),
+            framer_cms_item_id: null,
+            framer_sync_status: "not_synced",
+            framer_sync_error: null,
+            updated_at: new Date().toISOString(),
+          }
+
+      const { error: updateError } = await supabaseAdmin
+        .from("channel_listings")
+        .update(updatePayload)
+        .eq("id", listing_id)
+
+      if (updateError) throw updateError
+
+      return res.json({
+        ok: true,
+        action: cleanAction,
+        listing_id,
+        framer,
+      })
+    }
+
+    const { error: unbanError } = await supabaseAdmin
+      .from("channel_listings")
+      .update({
+        is_banned: false,
+        ban_reason: null,
+        status: "approved",
+        framer_sync_status: "not_synced",
+        framer_sync_error: null,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", listing_id)
+
+    if (unbanError) throw unbanError
+
+    const framer = await queueFramerSync(() =>
+      syncListingToFramerCMS(listing_id, {
+        skipTelegramSync: true,
+        publish: true,
+      })
+    )
+
+    return res.json({
+      ok: true,
+      action: cleanAction,
+      listing_id,
+      framer,
+    })
+  } catch (err) {
+    console.error("Admin listing lifecycle error:", err)
+    return res.status(500).json({ error: err.message })
+  }
+})
 
 app.post("/api/listings/delete", async (req, res) => {
   try {
@@ -1879,7 +2014,7 @@ app.post("/api/framer/sync-all-listings", async (req, res) => {
     for (const listing of listings || []) {
       try {
         const result = await queueFramerSync(() =>
-          syncListingToFramerCMS(listing.id, { publish: false })
+          syncListingToFramerCMS(listing.id, { publish: false, skipTelegramSync: false })
         )
         results.push({ id: listing.id, ok: true, slug: result.slug })
       } catch (err) {
@@ -1908,8 +2043,9 @@ app.post("/api/framer/sync-all-listings", async (req, res) => {
   }
 })
 
-// Schedule this endpoint once per day at midnight.
-// It performs the intentionally expensive full Telegram metadata + Framer CMS refresh.
+// Schedule this endpoint once per day at 12:00 AM America/Phoenix.
+// Render cron uses UTC, so Phoenix midnight is 07:00 UTC year-round.
+// It performs the full Telegram metadata + Framer CMS refresh and publishes once.
 app.get("/api/cron/daily-full-sync", async (req, res) => {
   try {
     if (req.query.secret !== process.env.CRON_SECRET) {
@@ -1931,7 +2067,7 @@ app.get("/api/cron/daily-full-sync", async (req, res) => {
     for (const listing of listings || []) {
       try {
         const result = await queueFramerSync(() =>
-          syncListingToFramerCMS(listing.id, { publish: false })
+          syncListingToFramerCMS(listing.id, { publish: false, skipTelegramSync: false })
         )
 
         results.push({
