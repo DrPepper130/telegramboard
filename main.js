@@ -549,13 +549,19 @@ async function syncListingMemberCountFast(listing) {
       break
     } catch (err) {
       lastError = err
+
+      // A Telegram flood wait applies to the bot, not just this identifier.
+      // Do not keep trying fallback identifiers after a 429.
+      if (err?.code === "TELEGRAM_RATE_LIMITED") {
+        throw err
+      }
     }
   }
 
   if (memberCount === null) {
+    if (lastError) throw lastError
     throw new Error(
-      lastError?.message ||
-        "Telegram member count could not be loaded using any stored identifier."
+      "Telegram member count could not be loaded using any stored identifier."
     )
   }
 
@@ -598,6 +604,118 @@ async function syncListingMemberCountFast(listing) {
     successfulTarget,
   }
 }
+
+
+const MEMBER_COUNT_STALE_MS = Math.max(
+  60 * 1000,
+  Number(process.env.MEMBER_COUNT_STALE_MS || 60 * 60 * 1000)
+)
+
+// Prevent simultaneous visitors from creating duplicate Telegram requests
+// for the same listing while the first refresh is still running.
+const memberRefreshLocks = new Map()
+
+function isMemberCountStale(lastSyncedAt) {
+  if (!lastSyncedAt) return true
+
+  const syncedAtMs = new Date(lastSyncedAt).getTime()
+  if (!Number.isFinite(syncedAtMs)) return true
+
+  return Date.now() - syncedAtMs >= MEMBER_COUNT_STALE_MS
+}
+
+async function refreshListingMemberCountOnDemand(listing) {
+  const existingLock = memberRefreshLocks.get(listing.id)
+  if (existingLock) return existingLock
+
+  const refreshPromise = (async () => {
+    const result = await syncListingMemberCountFast(listing)
+
+    return {
+      listing_id: listing.id,
+      member_count: result.memberCount,
+      last_synced_at: new Date().toISOString(),
+      refreshed: true,
+      stale: false,
+    }
+  })()
+
+  memberRefreshLocks.set(listing.id, refreshPromise)
+
+  try {
+    return await refreshPromise
+  } finally {
+    if (memberRefreshLocks.get(listing.id) === refreshPromise) {
+      memberRefreshLocks.delete(listing.id)
+    }
+  }
+}
+
+// Called when a visitor opens a listing.
+// Returns cached data immediately when it is still fresh.
+// When stale, this same request waits for one Telegram member-count refresh,
+// updates Supabase, and returns the fresh count to the first visitor.
+app.post("/api/listings/refresh-member-count", async (req, res) => {
+  try {
+    const listingId = String(req.body?.listing_id || "").trim()
+
+    if (!listingId) {
+      return res.status(400).json({ error: "Missing listing_id." })
+    }
+
+    const { data: listing, error } = await supabaseAdmin
+      .from("channel_listings")
+      .select(
+        "id, telegram_chat_id, telegram_username, telegram_link, telegram_title, telegram_description, listing_type, member_count, last_synced_at, status, is_banned"
+      )
+      .eq("id", listingId)
+      .single()
+
+    if (error || !listing) {
+      return res.status(404).json({ error: "Listing not found." })
+    }
+
+    if (listing.status !== "approved" || listing.is_banned) {
+      return res.status(404).json({ error: "Listing is unavailable." })
+    }
+
+    if (!isMemberCountStale(listing.last_synced_at)) {
+      return res.json({
+        ok: true,
+        listing_id: listing.id,
+        member_count: Number(listing.member_count || 0),
+        last_synced_at: listing.last_synced_at,
+        refreshed: false,
+        stale: false,
+      })
+    }
+
+    const result = await refreshListingMemberCountOnDemand(listing)
+
+    return res.json({
+      ok: true,
+      ...result,
+    })
+  } catch (err) {
+    console.error("On-demand member count refresh failed:", {
+      error: err.message,
+      code: err.code,
+      retry_after_seconds: err.retry_after_seconds,
+    })
+
+    if (err?.code === "TELEGRAM_RATE_LIMITED") {
+      return res.status(429).json({
+        error: err.message,
+        code: err.code,
+        retry_after_seconds: Number(err.retry_after_seconds || 0),
+      })
+    }
+
+    return res.status(500).json({
+      error: err.message || "Could not refresh member count.",
+    })
+  }
+})
 
 async function runHourlyTelegramSync() {
   const startedAt = Date.now()
