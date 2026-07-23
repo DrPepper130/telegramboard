@@ -958,6 +958,239 @@ app.post("/api/auth/is-admin", async (req, res) => {
   }
 })
 
+
+// Authenticated voting endpoint used by the Framer listing page.
+// Normal users may cast one vote across TeleHub every 24 hours.
+// Admins may vote without the 24-hour restriction.
+app.post("/api/listings/vote", async (req, res) => {
+  try {
+    const authHeader = String(req.headers.authorization || "")
+    const token = authHeader.replace(/^Bearer\s+/i, "").trim()
+    const listingId = String(req.body?.listing_id || "").trim()
+
+    if (!token) {
+      return res.status(401).json({ error: "You must be logged in to vote." })
+    }
+
+    if (!listingId) {
+      return res.status(400).json({ error: "Missing listing_id." })
+    }
+
+    const {
+      data: { user },
+      error: userError,
+    } = await supabaseAdmin.auth.getUser(token)
+
+    if (userError || !user) {
+      return res.status(401).json({ error: "Your login session is invalid." })
+    }
+
+    const { data: listing, error: listingError } = await supabaseAdmin
+      .from("channel_listings")
+      .select(
+        "id, slug, short_invite, channel_name, telegram_title, description, telegram_description, telegram_link, icon_url, image_url, member_count, votes_count, categories, status, is_banned"
+      )
+      .eq("id", listingId)
+      .single()
+
+    if (
+      listingError ||
+      !listing ||
+      listing.status !== "approved" ||
+      listing.is_banned
+    ) {
+      return res.status(404).json({ error: "Listing not found or unavailable." })
+    }
+
+    const email = String(user.email || "").toLowerCase()
+    const isAdmin = ADMIN_EMAILS.includes(email)
+
+    if (!isAdmin) {
+      const cutoff = new Date(
+        Date.now() - 24 * 60 * 60 * 1000
+      ).toISOString()
+
+      const { data: recentVote, error: recentVoteError } = await supabaseAdmin
+        .from("channel_votes")
+        .select("id, created_at")
+        .eq("user_id", user.id)
+        .gte("created_at", cutoff)
+        .order("created_at", { ascending: false })
+        .limit(1)
+        .maybeSingle()
+
+      if (recentVoteError) throw recentVoteError
+
+      if (recentVote) {
+        const nextVoteAt = new Date(
+          new Date(recentVote.created_at).getTime() +
+            24 * 60 * 60 * 1000
+        ).toISOString()
+
+        return res.status(429).json({
+          error: "You can vote again after 24 hours.",
+          code: "VOTE_COOLDOWN",
+          next_vote_at: nextVoteAt,
+        })
+      }
+    }
+
+    const { error: insertError } = await supabaseAdmin
+      .from("channel_votes")
+      .insert({
+        user_id: user.id,
+        listing_id: listing.id,
+      })
+
+    if (insertError) {
+      if (insertError.code === "23505") {
+        return res.status(409).json({
+          error: "This vote was already recorded.",
+          code: "DUPLICATE_VOTE",
+        })
+      }
+
+      throw insertError
+    }
+
+    // Count the source-of-truth vote rows after insertion, then mirror that
+    // total onto channel_listings for fast directory/ranking reads.
+    const { count: voteCount, error: countError } = await supabaseAdmin
+      .from("channel_votes")
+      .select("id", { count: "exact", head: true })
+      .eq("listing_id", listing.id)
+
+    if (countError) throw countError
+
+    const newVoteCount = Number(voteCount || 0)
+
+    const { error: listingUpdateError } = await supabaseAdmin
+      .from("channel_listings")
+      .update({
+        votes_count: newVoteCount,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", listing.id)
+
+    if (listingUpdateError) throw listingUpdateError
+
+    // Keep ranking/homepage data current, but do not block a successful vote
+    // if the cache refresh has a separate problem.
+    updateHomepageListingCache().catch((cacheError) => {
+      console.error("Homepage cache refresh after vote failed:", cacheError)
+    })
+
+    // Send the Discord notification directly from the backend. This is
+    // best-effort and never makes a valid vote fail.
+    const webhookUrl = process.env.DISCORD_VOTE_WEBHOOK_URL
+
+    if (webhookUrl) {
+      const listingUrl = listing.short_invite
+        ? `https://telehub.to/channel/${encodeURIComponent(listing.short_invite)}`
+        : `https://telehub.to/channel?slug=${encodeURIComponent(
+            listing.slug || listing.id
+          )}`
+
+      const discordPayload = {
+        username: "TeleHub",
+        content: `🔥 **${
+          listing.telegram_title ||
+          listing.channel_name ||
+          "A Telegram channel"
+        }** was just voted on TeleHub!`,
+        embeds: [
+          {
+            title:
+              listing.telegram_title ||
+              listing.channel_name ||
+              "Telegram Channel",
+            url: listingUrl,
+            description: String(
+              listing.telegram_description ||
+              listing.description ||
+              "A Telegram community was recently voted on TeleHub."
+            ).slice(0, 250),
+            color: 2260697,
+            image: listing.image_url
+              ? { url: listing.image_url }
+              : undefined,
+            fields: [
+              {
+                name: "Votes",
+                value: String(newVoteCount),
+                inline: true,
+              },
+              {
+                name: "Members",
+                value: listing.member_count
+                  ? Number(listing.member_count).toLocaleString()
+                  : "Updating",
+                inline: true,
+              },
+              {
+                name: "Categories",
+                value:
+                  Array.isArray(listing.categories) &&
+                  listing.categories.length
+                    ? listing.categories.slice(0, 5).join(", ")
+                    : "General",
+                inline: false,
+              },
+            ],
+            footer: {
+              text: "Recently voted on TeleHub",
+            },
+            timestamp: new Date().toISOString(),
+          },
+        ],
+        components: [
+          {
+            type: 1,
+            components: [
+              {
+                type: 2,
+                style: 5,
+                label: "View on TeleHub",
+                url: listingUrl,
+              },
+              {
+                type: 2,
+                style: 5,
+                label: "Join Telegram",
+                url: listing.telegram_link,
+              },
+            ],
+          },
+        ],
+      }
+
+      fetch(webhookUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(discordPayload),
+      }).catch((discordError) => {
+        console.error("Discord vote notification failed:", discordError)
+      })
+    }
+
+    return res.json({
+      ok: true,
+      listing_id: listing.id,
+      votes_count: newVoteCount,
+      is_admin: isAdmin,
+      message: isAdmin ? "Admin vote added." : "Vote added.",
+    })
+  } catch (err) {
+    console.error("Vote route error:", err)
+    return res.status(500).json({
+      error: err.message || "Vote failed.",
+    })
+  }
+})
+
+
 app.post("/api/discord/vote-feed", async (req, res) => {
   console.log("Discord vote feed route hit:", req.body)
 
