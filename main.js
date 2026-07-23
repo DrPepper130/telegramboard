@@ -2055,7 +2055,10 @@ app.post("/api/framer/sync-listing", async (req, res) => {
 
     const result = await queueFramerSync(() =>
       syncListingToFramerCMS(listing_id, {
-        skipTelegramSync: true,
+        // Newly created listings need Telegram metadata before the CMS item is built.
+        // This fills telegram_title, telegram_username, icon_url, member_count,
+        // telegram_chat_id, and listing_type before Framer publishes the page.
+        skipTelegramSync: false,
         publish: true,
       })
     )
