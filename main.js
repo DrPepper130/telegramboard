@@ -740,78 +740,59 @@ app.post("/api/listings/refresh-member-count", async (req, res) => {
   }
 })
 
-function isPermanentTelegramInviteError(message) {
-  const text = String(message || "").toLowerCase()
 
-  return (
-    text.includes("chat not found") ||
-    text.includes("username not found") ||
-    text.includes("user not found")
-  )
+function isPermanentTelegramListingFailure(errorMessage) {
+  const message = String(errorMessage || "").toLowerCase()
+
+  return [
+    "chat not found",
+    "user not found",
+    "username not occupied",
+    "chat_id is empty",
+    "not enough rights",
+    "bot was blocked",
+    "kicked from",
+  ].some((needle) => message.includes(needle))
 }
 
-async function removeUnavailableListingFromPublicPages(listing) {
+async function removeBrokenListingFromPublic(listing, errorMessage) {
   const now = new Date().toISOString()
 
-  const { error: updateError } = await supabaseAdmin
+  const { error: statusError } = await supabaseAdmin
     .from("channel_listings")
     .update({
       status: "needs_update",
       admin_reviewed: false,
-      framer_sync_status: "not_synced",
-      framer_sync_error:
-        "Telegram invite is no longer reachable. The owner must provide an updated invite.",
+      framer_sync_status: "removed",
+      framer_sync_error: String(errorMessage || "Telegram invite is no longer valid."),
       updated_at: now,
     })
     .eq("id", listing.id)
 
-  if (updateError) throw updateError
+  if (statusError) throw statusError
 
   let framerResult = null
 
   try {
-    framerResult = await queueFramerSync(() =>
-      deleteListingFromFramerCMS(listing, { publish: false })
-    )
-  } catch (framerError) {
-    console.error("Could not remove unavailable listing from Framer CMS:", {
-      listing_id: listing.id,
-      error: framerError.message,
+    framerResult = await deleteListingFromFramerCMS(listing, {
+      publish: false,
     })
-
+  } catch (framerError) {
     await supabaseAdmin
       .from("channel_listings")
       .update({
         framer_sync_status: "failed",
-        framer_sync_error: framerError.message,
+        framer_sync_error: `Telegram invite failed: ${errorMessage}. Framer removal failed: ${framerError.message}`,
         updated_at: new Date().toISOString(),
       })
       .eq("id", listing.id)
+
+    throw framerError
   }
 
   return {
     listing_id: listing.id,
-    status: "needs_update",
     framer: framerResult,
-  }
-}
-
-async function publishFramerRemovalBatch() {
-  if (process.env.FRAMER_AUTO_DEPLOY === "false") return false
-  if (!process.env.FRAMER_API_KEY || !process.env.FRAMER_PROJECT_URL) return false
-
-  const { connect } = await import("framer-api")
-  const framer = await connect(
-    process.env.FRAMER_PROJECT_URL,
-    process.env.FRAMER_API_KEY
-  )
-
-  try {
-    const publication = await framer.publish()
-    await framer.deploy(publication.deployment.id)
-    return true
-  } finally {
-    await framer.disconnect()
   }
 }
 
@@ -821,7 +802,7 @@ async function runHourlyTelegramSync() {
   const { data: listings, error } = await supabaseAdmin
     .from("channel_listings")
     .select(
-      "id, slug, short_invite, framer_cms_item_id, telegram_chat_id, telegram_username, telegram_link, telegram_title, telegram_description, listing_type, member_count"
+      "id, telegram_chat_id, telegram_username, telegram_link, telegram_title, telegram_description, listing_type, member_count, short_invite, slug, framer_cms_item_id"
     )
     .eq("status", "approved")
     .or("is_banned.is.null,is_banned.eq.false")
@@ -849,41 +830,69 @@ async function runHourlyTelegramSync() {
       id: listing.id,
       ok: false,
       error: result.error,
+      permanent_failure: isPermanentTelegramListingFailure(result.error),
     }
   })
 
-  const permanentlyUnavailable = []
+  const removedListings = []
+  const removalFailures = []
+  let anyCmsItemRemoved = false
 
+  // Handle permanent failures only after the Telegram scan completes.
+  // This keeps temporary network errors and rate limits from hiding listings.
   for (let index = 0; index < results.length; index += 1) {
     const result = results[index]
+    const listing = listings[index]
 
-    if (!result.ok && isPermanentTelegramInviteError(result.error)) {
-      permanentlyUnavailable.push(listings[index])
-    }
-  }
+    if (result.ok || !result.permanent_failure) continue
 
-  const removedListings = []
-
-  for (const listing of permanentlyUnavailable) {
     try {
-      removedListings.push(
-        await removeUnavailableListingFromPublicPages(listing)
+      const removal = await queueFramerSync(() =>
+        removeBrokenListingFromPublic(listing, result.error)
       )
+
+      const deleted = removal?.framer?.deleted === true
+      if (deleted) anyCmsItemRemoved = true
+
+      result.removed_from_public = true
+      result.framer_cms_deleted = deleted
+      removedListings.push({
+        id: listing.id,
+        error: result.error,
+        framer_cms_deleted: deleted,
+      })
     } catch (removeError) {
-      console.error("Unavailable listing cleanup failed:", {
-        listing_id: listing.id,
-        error: removeError.message,
+      result.removed_from_public = false
+      result.removal_error = removeError.message
+
+      removalFailures.push({
+        id: listing.id,
+        error: result.error,
+        removal_error: removeError.message,
       })
     }
   }
 
-  let framerRemovalBatchPublished = false
+  let framerDeployed = false
 
-  if (removedListings.some((item) => item?.framer?.deleted)) {
+  // deleteListingFromFramerCMS was called with publish:false for each item.
+  // Publish and deploy once after every broken CMS item has been removed.
+  if (
+    anyCmsItemRemoved &&
+    process.env.FRAMER_AUTO_DEPLOY !== "false"
+  ) {
+    const { connect } = await import("framer-api")
+    const framer = await connect(
+      process.env.FRAMER_PROJECT_URL,
+      process.env.FRAMER_API_KEY
+    )
+
     try {
-      framerRemovalBatchPublished = await publishFramerRemovalBatch()
-    } catch (publishError) {
-      console.error("Framer unavailable-listing publish failed:", publishError)
+      const publication = await framer.publish()
+      await framer.deploy(publication.deployment.id)
+      framerDeployed = true
+    } finally {
+      await framer.disconnect()
     }
   }
 
@@ -900,12 +909,17 @@ async function runHourlyTelegramSync() {
     count: results.length,
     succeeded: results.filter((item) => item.ok).length,
     failed: results.filter((item) => !item.ok).length,
-    removed_from_public_pages: removedListings.length,
-    removed_listing_ids: removedListings.map((item) => item.listing_id),
-    framer_removal_batch_published: framerRemovalBatchPublished,
+    permanently_invalid: results.filter(
+      (item) => !item.ok && item.permanent_failure
+    ).length,
+    removed_from_public: removedListings.length,
+    removal_failed: removalFailures.length,
+    framer_deployed: framerDeployed,
     concurrency: TELEGRAM_SYNC_CONCURRENCY,
     duration_ms: Date.now() - startedAt,
     results,
+    removed_listings: removedListings,
+    removal_failures: removalFailures,
     homepage_cache: homepageCache
       ? {
           updated_at: homepageCache.updated_at,
