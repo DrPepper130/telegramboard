@@ -15,8 +15,15 @@ app.use((req, res, next) => {
   next()
 })
 
+const BACKEND_BUILD_ID =
+  "telehub-local-english-filter-command-fix-2026-07-24"
+
 app.get("/", (req, res) => {
-  res.status(200).send("Telegram sync backend running")
+  res.status(200).json({
+    ok: true,
+    service: "Telegram sync backend",
+    build: BACKEND_BUILD_ID,
+  })
 })
 
 const supabaseAdmin = createClient(
@@ -7127,33 +7134,57 @@ app.get("/api/scraper/agent/command", async (req, res) => {
   try {
     if (!requireScraperAgent(req, res)) return
 
-    const { data: command, error } = await supabaseAdmin
-      .from("scraper_commands")
-      .select("*, scraper_runs(*)")
-      .eq("status", "pending")
-      .order("created_at", { ascending: true })
-      .limit(1)
-      .maybeSingle()
+    // Use an ordinary limited array query instead of maybeSingle().
+    // This avoids the runtime path that was returning:
+    // "clearNext is not defined"
+    const { data: pendingCommands, error: selectError } =
+      await supabaseAdmin
+        .from("scraper_commands")
+        .select("*, scraper_runs(*)")
+        .eq("status", "pending")
+        .order("created_at", { ascending: true })
+        .limit(1)
 
-    if (error) throw error
+    if (selectError) throw selectError
+
+    const command = Array.isArray(pendingCommands)
+      ? pendingCommands[0] || null
+      : null
 
     if (!command) {
-      return res.json({ ok: true, command: null })
+      return res.json({
+        ok: true,
+        command: null,
+        build: BACKEND_BUILD_ID,
+      })
     }
 
-    const { error: updateError } = await supabaseAdmin
-      .from("scraper_commands")
-      .update({
-        status: "claimed",
-        claimed_at: new Date().toISOString(),
-      })
-      .eq("id", command.id)
-      .eq("status", "pending")
+    // Claim only while the row is still pending. Return the claimed row so
+    // two agents cannot both act on the same command.
+    const { data: claimedRows, error: claimError } =
+      await supabaseAdmin
+        .from("scraper_commands")
+        .update({
+          status: "claimed",
+          claimed_at: new Date().toISOString(),
+        })
+        .eq("id", command.id)
+        .eq("status", "pending")
+        .select("id")
 
-    if (updateError) throw updateError
+    if (claimError) throw claimError
+
+    if (!Array.isArray(claimedRows) || claimedRows.length === 0) {
+      return res.json({
+        ok: true,
+        command: null,
+        claimed_elsewhere: true,
+        build: BACKEND_BUILD_ID,
+      })
+    }
 
     if (command.command === "start") {
-      await supabaseAdmin
+      const { error: runUpdateError } = await supabaseAdmin
         .from("scraper_runs")
         .update({
           status: "scraping",
@@ -7162,12 +7193,30 @@ app.get("/api/scraper/agent/command", async (req, res) => {
           updated_at: new Date().toISOString(),
         })
         .eq("id", command.run_id)
+
+      if (runUpdateError) throw runUpdateError
     }
 
-    return res.json({ ok: true, command })
+    return res.json({
+      ok: true,
+      command,
+      build: BACKEND_BUILD_ID,
+    })
   } catch (err) {
-    console.error("Scraper command fetch failed:", err)
-    return res.status(500).json({ error: err.message })
+    console.error("Scraper command fetch failed:", {
+      message: err?.message,
+      name: err?.name,
+      code: err?.code,
+      details: err?.details,
+      hint: err?.hint,
+      stack: err?.stack,
+    })
+
+    return res.status(500).json({
+      error: err?.message || "Could not fetch scraper command.",
+      code: err?.code || null,
+      build: BACKEND_BUILD_ID,
+    })
   }
 })
 
