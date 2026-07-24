@@ -5772,26 +5772,63 @@ function makeImportFallbackCategories(text, listingType) {
 function sanitizeAiImportContent(raw, fallback) {
   const source = raw && typeof raw === "object" ? raw : {}
 
-  let description = String(source.description || fallback.description || "").trim()
-  let longDescription = String(source.long_description || source.longDescription || fallback.long_description || "").trim()
-  let categories = Array.isArray(source.categories) ? source.categories : fallback.categories
+  let displayName = String(
+    source.display_name ||
+    source.displayName ||
+    fallback.display_name ||
+    ""
+  )
+    .replace(/\s+/g, " ")
+    .trim()
+
+  let description = String(
+    source.description ||
+    fallback.description ||
+    ""
+  ).trim()
+
+  let longDescription = String(
+    source.long_description ||
+    source.longDescription ||
+    fallback.long_description ||
+    ""
+  ).trim()
+
+  let categories = Array.isArray(source.categories)
+    ? source.categories
+    : fallback.categories
 
   categories = uniqueValues(
     (categories || [])
-      .map((cat) => String(cat || "").trim())
+      .map((cat) => String(cat || "").replace(/\s+/g, " ").trim())
       .filter(Boolean)
       .map((cat) => cat.charAt(0).toUpperCase() + cat.slice(1))
   ).slice(0, 5)
 
+  if (!displayName) displayName = fallback.display_name
   if (!categories.length) categories = fallback.categories
-
   if (!description) description = fallback.description
   if (!longDescription) longDescription = fallback.long_description
 
-  description = description.slice(0, 250)
-  longDescription = longDescription.slice(0, 2000)
+  // Keep generated names readable in cards and Framer CMS.
+  displayName = displayName
+    .replace(/[|•—–:/]\s*[|•—–:/]+/g, " • ")
+    .replace(/\s{2,}/g, " ")
+    .trim()
+    .slice(0, 95)
+
+  description = description
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 260)
+
+  longDescription = longDescription
+    .replace(/\n{3,}/g, "\n\n")
+    .trim()
+    .slice(0, 2000)
 
   return {
+    display_name: displayName,
     description,
     long_description: longDescription,
     categories,
@@ -5799,24 +5836,46 @@ function sanitizeAiImportContent(raw, fallback) {
   }
 }
 
-function fallbackImportContent({ title, username, telegramDescription, memberCount, listingType }) {
+function fallbackImportContent({
+  title,
+  username,
+  telegramDescription,
+  memberCount,
+  listingType,
+}) {
   const typeLabel = listingType === "group" ? "group" : "channel"
-  const name = title || username || "This Telegram community"
-  const baseText = [title, username, telegramDescription].filter(Boolean).join(" ")
+  const sourceName =
+    String(title || "").trim() ||
+    stripTelegramHandle(username) ||
+    "Telegram Community"
+
+  const displayName = sourceName
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 95)
+
+  const baseText = [title, username, telegramDescription]
+    .filter(Boolean)
+    .join(" ")
+
   const categories = makeImportFallbackCategories(baseText, listingType)
-  const memberText = memberCount ? `${Number(memberCount).toLocaleString()} members` : "an active audience"
+
+  const memberText = memberCount
+    ? `${Number(memberCount).toLocaleString()} members`
+    : "a growing audience"
 
   const description = telegramDescription
-    ? String(telegramDescription).slice(0, 240)
-    : `${name} is a Telegram ${typeLabel} listed on TeleHub with ${memberText}.`
+    ? String(telegramDescription).replace(/\s+/g, " ").slice(0, 240)
+    : `${displayName} is a Telegram ${typeLabel} with ${memberText}, listed on TeleHub for easier discovery.`
 
-  const long_description = telegramDescription
-    ? `${telegramDescription}\n\n${name} is listed on TeleHub so users can discover its Telegram link, category, member count, and community details.`
-    : `${name} is a Telegram ${typeLabel} listed on TeleHub. Explore this listing to view its Telegram link, member count, category, and community details before joining.`
+  const longDescription = telegramDescription
+    ? `${telegramDescription}\n\nBrowse the listing for its Telegram link, categories, member count, and other available community details before deciding whether it fits what you are looking for.`
+    : `${displayName} is a Telegram ${typeLabel} listed on TeleHub. Browse its public Telegram link, member count, categories, and available community information before joining.`
 
   return {
-    description: description.slice(0, 250),
-    long_description: long_description.slice(0, 2000),
+    display_name: displayName,
+    description: description.slice(0, 260),
+    long_description: longDescription.slice(0, 2000),
     categories,
     is_nsfw: false,
   }
@@ -5824,17 +5883,107 @@ function fallbackImportContent({ title, username, telegramDescription, memberCou
 
 async function generateAiImportContent(input) {
   const fallback = fallbackImportContent(input)
-  const styleAngles = ["direct utility listing", "casual Telegram promo", "clean directory summary", "community-focused listing", "creator/news update listing", "fan/community listing", "short punchy listing", "professional but not corporate listing"]
-  const styleAngle = styleAngles[Math.floor(Math.random() * styleAngles.length)]
-  
+
+  const creativeProfiles = [
+    {
+      name: "clean_directory",
+      title_style:
+        "Use a clean descriptive title with no unnecessary separator or emoji.",
+      tone: "clear, useful, neutral",
+      description_shape: "one concise factual sentence",
+      emoji_budget: "none",
+    },
+    {
+      name: "keyword_ribbon",
+      title_style:
+        "Keep the recognizable name, then add 3 to 6 short supported topic phrases using a pipe and bullets.",
+      tone: "energetic directory listing",
+      description_shape: "two short punchy sentences",
+      emoji_budget: "minimal",
+    },
+    {
+      name: "casual_community",
+      title_style:
+        "Create a friendly community title with one short descriptive phrase.",
+      tone: "casual and conversational",
+      description_shape:
+        "audience-first invitation without sounding salesy",
+      emoji_budget: "moderate",
+    },
+    {
+      name: "minimal_brand",
+      title_style:
+        "Preserve the recognizable original name and add no more than one useful descriptor.",
+      tone: "minimal and confident",
+      description_shape: "one compact sentence",
+      emoji_budget: "none",
+    },
+    {
+      name: "emoji_header",
+      title_style:
+        "Use one relevant emoji in the title, followed by the name and a concise supported descriptor.",
+      tone: "bright but not childish",
+      description_shape:
+        "topic-first sentence followed by a short benefit",
+      emoji_budget: "moderate",
+    },
+    {
+      name: "niche_hook",
+      title_style:
+        "Lead with the specific niche, then work the recognizable original name into the title naturally.",
+      tone: "specific and knowledgeable",
+      description_shape: "begin with a niche-specific hook",
+      emoji_budget: "minimal",
+    },
+    {
+      name: "social_listing",
+      title_style:
+        "Use a lively community-oriented title built from supported social topics or activities.",
+      tone: "friendly and lively",
+      description_shape: "question followed by a natural answer",
+      emoji_budget: "expressive",
+    },
+    {
+      name: "news_update",
+      title_style:
+        "Use a straightforward topic-and-updates title without keyword stuffing.",
+      tone: "informational and current",
+      description_shape:
+        "direct summary without promotional language",
+      emoji_budget: "none",
+    },
+    {
+      name: "short_punchy",
+      title_style:
+        "Create a short memorable title with no more than one separator.",
+      tone: "punchy and modern",
+      description_shape: "two compact fragments or short sentences",
+      emoji_budget: "minimal",
+    },
+    {
+      name: "resource_hub",
+      title_style:
+        "Use the recognizable name plus supported resources, guides, discussion, or updates.",
+      tone: "helpful and organized",
+      description_shape: "benefit-first informational sentence",
+      emoji_budget: "moderate",
+    },
+  ]
+
+  const creativeProfile =
+    creativeProfiles[Math.floor(Math.random() * creativeProfiles.length)]
+
+  const variationSeed = Math.random().toString(36).slice(2, 10)
+
   if (!process.env.OPENAI_API_KEY) {
     return {
       ...fallback,
       ai_used: false,
       ai_error: "OPENAI_API_KEY is not set; used fallback content.",
+      creative_profile: creativeProfile.name,
     }
   }
-  
+
   try {
     const prompt = {
       telegram_title: input.title || "",
@@ -5842,43 +5991,218 @@ async function generateAiImportContent(input) {
       telegram_description: input.telegramDescription || "",
       member_count: Number(input.memberCount || 0),
       listing_type: input.listingType || "channel",
-      writing_style: styleAngle,
+      creative_profile: creativeProfile,
+      variation_seed: variationSeed,
     }
 
-    const response = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model: OPENAI_IMPORT_MODEL,
-        response_format: { type: "json_object" },
-        temperature: 0.95,
-        presence_penalty: 0.6,
-        frequency_penalty: 0.5,
-        max_tokens: 900,
-        messages: [
-          {
-            role: "system",
-            content:
-              "You generate realistic, varied listing copy for TeleHub, a Telegram group/channel directory. Follow the writing_style provided in the user JSON. Return ONLY valid JSON: {\"description\":string,\"long_description\":string,\"categories\":string[],\"is_nsfw\":boolean}. The description must NOT use generic repeated openings like \"Join\", \"Stay updated\", \"Welcome to\", \"Discover\", \"This is\", \"A Telegram\", or \"[Name] is\" unless absolutely necessary. Every listing must use a different sentence structure and tone based on the source: some should sound like a fan/community listing, some like a clean directory summary, some like a direct utility listing, some like a creator/news listing, and some like a casual Telegram promo. Use the Telegram title, username, bio, member count, and listing type as the only source. Rewrite the bio into natural human copy; do not copy the bio word-for-word. Use 0-3 relevant emojis only when they fit the original vibe. Do not invent official status, guarantees, discounts, pricing, safety, verification, or trust claims. Only say official if the source clearly says official. description must be 120-240 characters, punchy, specific, and card-ready. long_description must be 500-1100 characters in 1-3 short paragraphs, explaining what users may find, who it is for, and why someone might join, without sounding corporate or AI-written. categories must be 2-5 short Title Case tags, specific first and broad second. is_nsfw is true only for clearly adult, explicit, sexual, gambling, drugs, or mature content.",
-          },
-          {
-            role: "user",
-            content: JSON.stringify(prompt),
-          },
-        ],
-      }),
-    })
+    const systemPrompt = `
+You create distinct, natural directory listings for TeleHub, a Telegram group and channel discovery website.
+
+The listings are generated independently, but each result must feel individually written. Follow the creative_profile in the user JSON closely. Do not default to the same title structure, opening phrase, sentence rhythm, emoji placement, or promotional wording.
+
+Return ONLY one valid JSON object with exactly these fields:
+{
+  "display_name": string,
+  "description": string,
+  "long_description": string,
+  "categories": string[],
+  "is_nsfw": boolean
+}
+
+GROUNDING RULES
+
+Use only the Telegram title, username, Telegram description or bio, member count, listing type, and creative_profile supplied by the user.
+
+You may infer the broad topic from the title and bio, but never invent unsupported details.
+
+Do not invent or imply:
+- official status unless the source clearly says it is official
+- guaranteed activity or an active community
+- voice chats, calls, events, giveaways, contests, or support
+- moderation quality, verification, safety, trust, or legitimacy
+- discounts, prices, earnings, performance, or guarantees
+- resources, guides, signals, news, memes, anime, networking, or other features unless the source supports them
+
+When the source is vague, write a restrained but appealing listing based on the broadest clearly supported topic. Never compensate for missing information by fabricating features.
+
+DISPLAY NAME
+
+Create an appealing directory title that helps users understand the topic or purpose. Do not simply copy the Telegram title unless it is already clear, useful, and distinctive.
+
+The display_name must:
+- be readable rather than a pile of keywords
+- remain grounded in the source
+- preserve a recognizable part of the original title when possible
+- contain 2 to 8 descriptive words or short phrases
+- stay at or below 95 characters
+- follow the assigned creative_profile title_style
+
+Possible structures include:
+- Original Name | Topic • Feature • Community
+- Emoji Original Name — Short Topic Phrase
+- Topic Hub • Community • Updates
+- Original Name | News, Discussion & Resources
+- Original Name — Topic Community
+- Original Name only when the clean name is strongest
+- Topic • Audience • Purpose
+- Emoji + Name + one short descriptor
+
+These are structural examples only. Do not copy them:
+- Socialize | Hangout • Voice Chat • Memes • Anime
+- 🎮 Mobile Gaming Hub — Squads, Tips & Updates
+- Crypto Signals & Market Discussion
+- Tokyo Travel | Food • Hotels • Local Tips
+- 📚 Study Circle — Notes, Motivation & Support
+- Daily Football News
+- Creators Lounge | Networking • Feedback • Growth
+
+Do not force every title into the pipe-and-bullet style. Across listings, use a varied mix of:
+- |
+- —
+- •
+- :
+- /
+- no separator
+
+Never use more than two separator types in one title. Do not repeat the same word in the title. Do not add a descriptor that merely restates the original name.
+
+EMOJIS
+
+Follow creative_profile.emoji_budget:
+- none: zero emojis anywhere
+- minimal: zero or one emoji across the entire result
+- moderate: one or two emojis across the entire result
+- expressive: two or three emojis across the entire result
+
+Emoji placement must vary. Some results may use one in the title, some only in a description, and many should use none. Never automatically begin every title or description with an emoji. Use only relevant emojis.
+
+SHORT DESCRIPTION
+
+description must be 110 to 260 characters and specific to this listing.
+
+Follow creative_profile.description_shape. Vary the structure using options such as:
+- one direct sentence
+- two short sentences
+- a question followed by an answer
+- a compact list-like sentence
+- an audience-first line
+- a factual directory summary
+- a casual recommendation
+- a niche-specific hook
+- a benefit-first opening
+- a topic-first opening
+
+Do not routinely begin with:
+- Join
+- Discover
+- Stay updated
+- Welcome to
+- Looking for
+- This is
+- A Telegram
+- Connect with
+- Get the latest
+- Your go-to
+- Whether you're
+- Dive into
+- Explore
+
+Do not routinely end with:
+- Join today
+- Check it out
+- Don't miss out
+- Become part of the community
+- Everything in one place
+
+LONG DESCRIPTION
+
+long_description must be 450 to 1050 characters in 1 to 3 short paragraphs.
+
+Explain only what can reasonably be supported:
+- the primary subject or purpose
+- the type of audience that may find it useful or entertaining
+- the general material or conversation users may expect
+
+Vary the structure. Some descriptions should begin with the audience, some with the subject, some with a concise observation, and some with the original community name. Use a mix of casual, informational, punchy, and restrained voices according to the profile.
+
+Avoid generic AI phrases such as:
+- vibrant community
+- like-minded individuals
+- valuable insights
+- engaging content
+- dynamic platform
+- perfect place
+- something for everyone
+- one-stop destination
+- thriving community
+- curated content
+- endless possibilities
+
+Do not repeat the short description verbatim in the long description.
+
+CATEGORIES
+
+Return 2 to 5 short Title Case categories. Put the most specific category first, then broader categories. Avoid redundant near-duplicates. Do not include "Telegram" as a category unless the source is specifically about Telegram itself.
+
+NSFW
+
+Set is_nsfw to true only for clearly adult, sexually explicit, pornographic, drug-focused, gambling-focused, or strongly mature content. Ordinary profanity, memes, dating, finance, cryptocurrency, and general discussion are not automatically NSFW.
+
+SILENT FINAL CHECK
+
+Before returning JSON, silently verify:
+- the title is grounded and not merely copied without improvement
+- the title style follows the assigned profile
+- emoji usage stays within the assigned budget
+- the short description avoids a generic repeated opening
+- the short and long descriptions do not repeat each other
+- every claim is supported by the supplied source
+- the output is valid JSON with all five required fields
+
+Return only the JSON object.
+`.trim()
+
+    const response = await fetch(
+      "https://api.openai.com/v1/chat/completions",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+        },
+        body: JSON.stringify({
+          model: OPENAI_IMPORT_MODEL,
+          response_format: { type: "json_object" },
+          temperature: 1.05,
+          presence_penalty: 0.85,
+          frequency_penalty: 0.65,
+          max_tokens: 1000,
+          messages: [
+            {
+              role: "system",
+              content: systemPrompt,
+            },
+            {
+              role: "user",
+              content: JSON.stringify(prompt),
+            },
+          ],
+        }),
+      }
+    )
 
     const json = await response.json()
 
     if (!response.ok) {
-      throw new Error(json?.error?.message || "OpenAI request failed")
+      throw new Error(
+        json?.error?.message ||
+        "OpenAI request failed"
+      )
     }
 
-    const content = json?.choices?.[0]?.message?.content || "{}"
+    const content =
+      json?.choices?.[0]?.message?.content || "{}"
+
     const parsed = JSON.parse(content)
     const sanitized = sanitizeAiImportContent(parsed, fallback)
 
@@ -5886,13 +6210,22 @@ async function generateAiImportContent(input) {
       ...sanitized,
       ai_used: true,
       ai_error: null,
+      creative_profile: creativeProfile.name,
+      variation_seed: variationSeed,
+      usage: json?.usage || null,
     }
   } catch (err) {
-    console.error("AI import content generation failed:", err.message)
+    console.error(
+      "AI import content generation failed:",
+      err.message
+    )
+
     return {
       ...fallback,
       ai_used: false,
       ai_error: err.message,
+      creative_profile: creativeProfile.name,
+      variation_seed: variationSeed,
     }
   }
 }
@@ -6010,6 +6343,7 @@ async function importSingleTelegramListing(
 
   await onStage("ai_generated", {
     generated_name:
+      aiContent.display_name ||
       chat.title ||
       stripTelegramHandle(telegramUsername) ||
       "Telegram Listing",
@@ -6021,6 +6355,9 @@ async function importSingleTelegramListing(
     is_nsfw: aiContent.is_nsfw,
     ai_used: aiContent.ai_used,
     ai_error: aiContent.ai_error || null,
+    creative_profile: aiContent.creative_profile || null,
+    variation_seed: aiContent.variation_seed || null,
+    token_usage: aiContent.usage || null,
   })
 
   const shortInviteBase = stripTelegramHandle(telegramUsername) || chat.title || "telegram-listing"
@@ -6034,7 +6371,11 @@ async function importSingleTelegramListing(
   const insertPayload = {
     user_id: adminUser.id,
     listing_type: listingType,
-    channel_name: chat.title || stripTelegramHandle(telegramUsername) || "Telegram Listing",
+    channel_name:
+      aiContent.display_name ||
+      chat.title ||
+      stripTelegramHandle(telegramUsername) ||
+      "Telegram Listing",
     telegram_link: normalizedTelegramLink,
     description: aiContent.description,
     long_description: aiContent.long_description,
@@ -6155,6 +6496,9 @@ async function importSingleTelegramListing(
     avatar_available: Boolean(chat.photo?.big_file_id),
     ai_used: aiContent.ai_used,
     ai_error: aiContent.ai_error,
+    creative_profile: aiContent.creative_profile || null,
+    generated_display_name: aiContent.display_name,
+    ai_token_usage: aiContent.usage || null,
     icon_url: iconUrl,
     icon_error: iconError,
     framer_synced: !!framerResult?.ok,
