@@ -6252,6 +6252,22 @@ async function findDuplicateImportListing({ telegramChatId, telegramUsername, te
   return null
 }
 
+function shouldRejectNonLatinTelegramTitle(title) {
+  const cleanTitle = String(title || "").trim()
+
+  // Check only the title Telegram returned. Never inspect the t.me URL,
+  // invite link, or username because those are normally Latin characters.
+  const letters = cleanTitle.match(/\p{L}/gu) || []
+
+  // Do not reject titles consisting only of numbers, symbols, or emojis.
+  if (!letters.length) return false
+
+  const latinLetters = cleanTitle.match(/\p{Script=Latin}/gu) || []
+
+  // Reject only when the title contains letters and every letter is non-Latin.
+  return latinLetters.length === 0
+}
+
 async function importSingleTelegramListing(
   link,
   options,
@@ -6291,6 +6307,26 @@ async function importSingleTelegramListing(
       ok: false,
       link: telegramLink,
       error: "Could not detect whether this Telegram link is a group or channel.",
+    }
+  }
+
+  if (shouldRejectNonLatinTelegramTitle(chat.title)) {
+    await onStage("title_filtered", {
+      reason: "non_latin_telegram_title",
+      telegram_title: chat.title || "",
+      listing_type: listingType,
+    })
+
+    return {
+      ok: true,
+      created: false,
+      skipped: true,
+      filtered: true,
+      reason: "non_latin_telegram_title",
+      link: telegramLink,
+      telegram_title: chat.title || "",
+      telegram_username: cleanUsername(chat.username) || username,
+      listing_type: listingType,
     }
   }
 
@@ -6619,7 +6655,10 @@ app.post("/api/admin/import-telegram-listings", async (req, res) => {
       total_received: links.length,
       processed: processedCount,
       created: results.filter((item) => item.created).length,
-      duplicates: results.filter((item) => item.skipped).length,
+      duplicates: results.filter(
+        (item) => item.skipped && !item.filtered
+      ).length,
+      filtered: results.filter((item) => item.filtered).length,
       failed: results.filter((item) => item.ok === false).length,
       framer_synced: results.filter((item) => item.framer_synced).length,
       deployed,
