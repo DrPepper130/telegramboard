@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 })
 
 const BACKEND_BUILD_ID =
-  "telehub-local-english-filter-cleantext-fix-2026-07-24"
+  "telehub-conservative-english-filter-2026-07-24"
 
 app.get("/", (req, res) => {
   res.status(200).json({
@@ -6343,7 +6343,7 @@ async function importSingleTelegramListing(
       skipped: true,
       filtered: true,
       reason: "non_english",
-      error: "Listing filtered because the Telegram title/content does not look English.",
+      error: "Listing filtered because the Telegram title is fully non-Latin or the content is overwhelmingly non-Latin.",
       link: normalizedTelegramLink,
       telegram_username: telegramUsername,
       telegram_title: chat.title || null,
@@ -7354,12 +7354,6 @@ const COMMON_ENGLISH_WORDS = new Set([
   "able","account","across","action","activity","actually","add","again","against","air","almost","along","already","also","always","american","another","any","anyone","anything","around","ask","available","away","back","based","before","best","better","big","book","both","brand","bring","build","built","call","care","case","check","city","class","come","content","country","course","create","current","day","days","detail","different","done","each","easy","end","enjoy","event","every","everything","example","experience","family","fast","find","first","follow","found","friends","full","general","get","give","good","great","group","guide","help","high","home","idea","info","information","join","keep","know","latest","learn","life","like","live","look","made","make","market","media","member","message","money","more","most","move","music","need","network","next","now","open","other","page","part","people","place","plan","post","public","quick","real","release","report","right","school","service","share","show","simple","small","social","start","step","story","system","team","tech","things","time","today","top","topic","update","use","user","video","view","watch","way","week","welcome","what","when","where","work","world"
 ])
 
-function cleanText(value) {
-  return String(value || "")
-    .replace(/\s+/g, " ")
-    .trim()
-}
-
 function normalizeLanguageText(value) {
   return String(value || "")
     .normalize("NFKD")
@@ -7419,195 +7413,88 @@ function countTokenMatches(tokens, dictionary) {
 function analyzeDiscoveryEnglishTitle(title) {
   const cleanTitle = cleanText(title)
   const scripts = countScriptLetters(cleanTitle)
-  const tokens = extractLanguageTokens(cleanTitle)
-  const functionHits = countTokenMatches(tokens, ENGLISH_FUNCTION_WORDS)
-  const topicHits = countTokenMatches(tokens, ENGLISH_TOPIC_WORDS)
-  const commonHits = countTokenMatches(tokens, COMMON_ENGLISH_WORDS)
 
   if (!cleanTitle) {
     return {
       isEnglish: false,
       reason: "empty_title",
       scripts,
-      token_count: 0,
-      function_hits: 0,
-      topic_hits: 0,
-      common_hits: 0,
     }
   }
 
+  // Reject only clearly non-Latin titles at discovery time.
+  // Any title containing Latin letters is allowed through for the stricter
+  // Telegram metadata check later.
   if (scripts.total > 0 && scripts.latin === 0) {
     return {
       isEnglish: false,
-      reason: "title_is_non_latin",
+      reason: "title_is_fully_non_latin",
       scripts,
-      token_count: tokens.length,
-      function_hits: functionHits,
-      topic_hits: topicHits,
-      common_hits: commonHits,
     }
   }
 
   if (
     scripts.total > 0 &&
-    scripts.non_latin >= 4 &&
-    scripts.non_latin / scripts.total >= 0.35
+    scripts.non_latin >= 8 &&
+    scripts.non_latin / scripts.total >= 0.75
   ) {
     return {
       isEnglish: false,
-      reason: "title_mixed_with_heavy_non_latin",
+      reason: "title_is_mostly_non_latin",
       scripts,
-      token_count: tokens.length,
-      function_hits: functionHits,
-      topic_hits: topicHits,
-      common_hits: commonHits,
-    }
-  }
-
-  if (tokens.length === 1) {
-    return {
-      isEnglish: true,
-      ambiguous: true,
-      reason: "single_latin_word_allowed",
-      scripts,
-      token_count: 1,
-      function_hits: functionHits,
-      topic_hits: topicHits,
-      common_hits: commonHits,
-    }
-  }
-
-  const evidence = functionHits + topicHits + commonHits
-
-  if (functionHits >= 1 || topicHits >= 1 || commonHits >= 2) {
-    return {
-      isEnglish: true,
-      ambiguous: false,
-      reason: "title_has_english_signal",
-      scripts,
-      token_count: tokens.length,
-      function_hits: functionHits,
-      topic_hits: topicHits,
-      common_hits: commonHits,
-      evidence,
     }
   }
 
   return {
-    isEnglish: false,
-    reason: "multiword_title_without_english_signal",
+    isEnglish: true,
+    ambiguous: true,
+    reason: "latin_title_allowed",
     scripts,
-    token_count: tokens.length,
-    function_hits: functionHits,
-    topic_hits: topicHits,
-    common_hits: commonHits,
-    evidence,
   }
 }
 
 function analyzeLikelyEnglishListingContent({ title, description }) {
-  const titleAnalysis = analyzeDiscoveryEnglishTitle(title)
+  const cleanTitle = cleanText(title)
+  const cleanDescription = cleanText(description)
+  const titleScripts = countScriptLetters(cleanTitle)
+  const combinedScripts = countScriptLetters(
+    `${cleanTitle} ${cleanDescription}`
+  )
 
+  // Reject only when the actual Telegram title is entirely non-Latin.
+  if (titleScripts.total > 0 && titleScripts.latin === 0) {
+    return {
+      isEnglish: false,
+      reason: "telegram_title_is_fully_non_latin",
+      title_scripts: titleScripts,
+      combined_scripts: combinedScripts,
+    }
+  }
+
+  // Mixed titles are allowed unless the combined Telegram metadata is
+  // overwhelmingly non-Latin.
   if (
-    !titleAnalysis.isEnglish &&
-    ["title_is_non_latin", "title_mixed_with_heavy_non_latin", "multiword_title_without_english_signal"].includes(
-      titleAnalysis.reason
-    )
+    combinedScripts.total >= 20 &&
+    combinedScripts.non_latin >= 15 &&
+    combinedScripts.non_latin / combinedScripts.total >= 0.8
   ) {
     return {
       isEnglish: false,
-      reason: titleAnalysis.reason,
-      title_analysis: titleAnalysis,
-    }
-  }
-
-  const combinedText = cleanText(`${title || ""} ${description || ""}`)
-  const scripts = countScriptLetters(combinedText)
-  const tokens = extractLanguageTokens(combinedText)
-  const functionHits = countTokenMatches(tokens, ENGLISH_FUNCTION_WORDS)
-  const topicHits = countTokenMatches(tokens, ENGLISH_TOPIC_WORDS)
-  const commonHits = countTokenMatches(tokens, COMMON_ENGLISH_WORDS)
-  const evidence = functionHits + topicHits + commonHits
-
-  if (scripts.total > 0 && scripts.latin === 0) {
-    return {
-      isEnglish: false,
-      reason: "content_is_non_latin",
-      scripts,
-      token_count: tokens.length,
-      function_hits: functionHits,
-      topic_hits: topicHits,
-      common_hits: commonHits,
-      evidence,
-      title_analysis: titleAnalysis,
-    }
-  }
-
-  if (
-    scripts.total > 0 &&
-    scripts.non_latin >= 6 &&
-    scripts.non_latin / scripts.total >= 0.3
-  ) {
-    return {
-      isEnglish: false,
-      reason: "content_has_heavy_non_latin",
-      scripts,
-      token_count: tokens.length,
-      function_hits: functionHits,
-      topic_hits: topicHits,
-      common_hits: commonHits,
-      evidence,
-      title_analysis: titleAnalysis,
-    }
-  }
-
-  if (
-    functionHits >= 2 ||
-    (functionHits >= 1 && topicHits >= 1) ||
-    topicHits >= 2 ||
-    commonHits >= 4 ||
-    evidence >= 5
-  ) {
-    return {
-      isEnglish: true,
-      reason: "content_has_english_signal",
-      scripts,
-      token_count: tokens.length,
-      function_hits: functionHits,
-      topic_hits: topicHits,
-      common_hits: commonHits,
-      evidence,
-      title_analysis: titleAnalysis,
-    }
-  }
-
-  if (titleAnalysis.isEnglish && titleAnalysis.ambiguous && !description) {
-    return {
-      isEnglish: true,
-      ambiguous: true,
-      reason: "single_word_title_without_description_allowed",
-      scripts,
-      token_count: tokens.length,
-      function_hits: functionHits,
-      topic_hits: topicHits,
-      common_hits: commonHits,
-      evidence,
-      title_analysis: titleAnalysis,
+      reason: "telegram_content_is_overwhelmingly_non_latin",
+      title_scripts: titleScripts,
+      combined_scripts: combinedScripts,
     }
   }
 
   return {
-    isEnglish: false,
-    reason: "not_enough_english_signal",
-    scripts,
-    token_count: tokens.length,
-    function_hits: functionHits,
-    topic_hits: topicHits,
-    common_hits: commonHits,
-    evidence,
-    title_analysis: titleAnalysis,
+    isEnglish: true,
+    ambiguous: true,
+    reason: "latin_or_mixed_listing_allowed",
+    title_scripts: titleScripts,
+    combined_scripts: combinedScripts,
   }
 }
+
 
 async function loadExistingTelegramUsernames() {
   const usernames = new Set()
