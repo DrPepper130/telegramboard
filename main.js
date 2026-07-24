@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 })
 
 const BACKEND_BUILD_ID =
-  "telehub-manual-import-queue-fix-2026-07-24"
+  "telehub-first-click-midnight-framer-fix-2026-07-24"
 
 app.get("/", (req, res) => {
   res.status(200).json({
@@ -658,22 +658,6 @@ async function refreshListingMemberCountOnDemand(listing) {
   }
 }
 
-// Every listing click also queues a one-item Framer CMS refresh and publish.
-// It runs after the response path is chosen so navigation is not blocked by Framer.
-// The live component still shows Supabase data immediately while Framer publishes.
-function queueFramerCmsUpdateFromClick(listingId) {
-  queueFramerSync(() =>
-    syncListingToFramerCMS(listingId, {
-      skipTelegramSync: true,
-      publish: true,
-    })
-  ).catch((err) => {
-    console.error("Framer CMS click update failed:", {
-      listing_id: listingId,
-      error: err.message,
-    })
-  })
-}
 
 // Called when a visitor opens a listing.
 // Returns cached data immediately when it is still fresh.
@@ -703,31 +687,33 @@ app.post("/api/listings/refresh-member-count", async (req, res) => {
       return res.status(404).json({ error: "Listing is unavailable." })
     }
 
-    if (!isMemberCountStale(listing.last_synced_at)) {
-      queueFramerCmsUpdateFromClick(listing.id)
+    // The first visit may initialize an older listing that has never been
+    // synced. This updates Supabase only and never publishes Framer.
+    if (!listing.last_synced_at) {
+      const result = await refreshListingMemberCountOnDemand(listing)
 
       return res.json({
         ok: true,
-        listing_id: listing.id,
-        member_count: Number(listing.member_count || 0),
-        last_synced_at: listing.last_synced_at,
-        refreshed: false,
-        stale: false,
-        framer_cms_sync_queued: true,
+        ...result,
+        first_sync: true,
+        framer_cms_sync_queued: false,
       })
     }
 
-    const result = await refreshListingMemberCountOnDemand(listing)
-
-    queueFramerCmsUpdateFromClick(listing.id)
-
+    // Every later visit uses the cached value. The midnight daily full-sync
+    // refreshes Telegram data, updates Framer CMS, and publishes only once.
     return res.json({
       ok: true,
-      ...result,
-      framer_cms_sync_queued: true,
+      listing_id: listing.id,
+      member_count: Number(listing.member_count || 0),
+      last_synced_at: listing.last_synced_at,
+      refreshed: false,
+      first_sync: false,
+      stale: false,
+      framer_cms_sync_queued: false,
     })
   } catch (err) {
-    console.error("On-demand member count refresh failed:", {
+    console.error("First-visit member count initialization failed:", {
       error: err.message,
       code: err.code,
       retry_after_seconds: err.retry_after_seconds,
@@ -742,11 +728,10 @@ app.post("/api/listings/refresh-member-count", async (req, res) => {
     }
 
     return res.status(500).json({
-      error: err.message || "Could not refresh member count.",
+      error: err.message || "Could not initialize member count.",
     })
   }
 })
-
 
 function isPermanentTelegramListingFailure(errorMessage) {
   const message = String(errorMessage || "").toLowerCase()
