@@ -6805,33 +6805,18 @@ const PORT = process.env.PORT || 3000
 
 
 // ========================================
-// LIVE SCRAPER COMMAND CENTER
+// TELEMETR API IMPORT COMMAND CENTER
 // ========================================
 
-const SCRAPER_AGENT_SECRET = String(
-  process.env.SCRAPER_AGENT_SECRET || ""
-).trim()
+const TELEMETR_API_BASE = "https://api.telemetr.io"
+const TELEMETR_API_KEY = String(process.env.TELEMETR_API_KEY || "").trim()
 
 const SCRAPER_EVENT_LIMIT = Math.max(
   50,
   Math.min(Number(process.env.SCRAPER_EVENT_LIMIT || 300), 1000)
 )
 
-function requireScraperAgent(req, res) {
-  const supplied = String(
-    req.headers["x-scraper-secret"] ||
-      req.body?.secret ||
-      req.query?.secret ||
-      ""
-  ).trim()
-
-  if (!SCRAPER_AGENT_SECRET || supplied !== SCRAPER_AGENT_SECRET) {
-    res.status(401).json({ error: "Invalid scraper agent secret." })
-    return false
-  }
-
-  return true
-}
+const activeTelemetrRuns = new Set()
 
 async function getAdminUserFromRequest(req) {
   const authHeader = String(req.headers.authorization || "")
@@ -6868,7 +6853,7 @@ async function logScraperEvent({
   })
 
   if (error) {
-    console.error("Scraper event insert failed:", error.message)
+    console.error("Telemetr event insert failed:", error.message)
   }
 }
 
@@ -6960,6 +6945,942 @@ async function publishScraperRunFramerBatch(runId) {
   }
 }
 
+async function telemetrRequest(path, params = {}) {
+  if (!TELEMETR_API_KEY) {
+    const error = new Error(
+      "Missing TELEMETR_API_KEY in the Render environment."
+    )
+    error.code = "TELEMETR_KEY_MISSING"
+    throw error
+  }
+
+  const url = new URL(path, TELEMETR_API_BASE)
+
+  for (const [key, rawValue] of Object.entries(params)) {
+    if (rawValue === undefined || rawValue === null || rawValue === "") continue
+    url.searchParams.set(key, String(rawValue))
+  }
+
+  const response = await fetch(url, {
+    headers: {
+      Accept: "application/json",
+      "x-api-key": TELEMETR_API_KEY,
+    },
+  })
+
+  const body = await response.json().catch(() => ({}))
+
+  if (!response.ok) {
+    const message =
+      body?.message ||
+      body?.error ||
+      body?.detail ||
+      `Telemetr API request failed with status ${response.status}.`
+
+    const error = new Error(
+      typeof message === "string" ? message : JSON.stringify(message)
+    )
+    error.status = response.status
+    error.code =
+      response.status === 401
+        ? "TELEMETR_UNAUTHORIZED"
+        : response.status === 403
+          ? "TELEMETR_FORBIDDEN"
+          : response.status === 412
+            ? "TELEMETR_SUBSCRIPTION_INACTIVE"
+            : response.status === 426
+              ? "TELEMETR_QUOTA_REACHED"
+              : "TELEMETR_API_ERROR"
+    error.response = body
+    throw error
+  }
+
+  return body
+}
+
+function telemetrResultRows(payload) {
+  if (Array.isArray(payload)) return payload
+
+  const possibleArrays = [
+    payload?.channels,
+    payload?.items,
+    payload?.results,
+    payload?.data,
+    payload?.list,
+  ]
+
+  return possibleArrays.find(Array.isArray) || []
+}
+
+function firstNonEmpty(...values) {
+  for (const value of values) {
+    if (value !== undefined && value !== null && String(value).trim()) {
+      return value
+    }
+  }
+  return null
+}
+
+function normalizeTelemetrLink(item) {
+  const rawLink = firstNonEmpty(
+    item?.telegram_link,
+    item?.telegram_url,
+    item?.link,
+    item?.url,
+    item?.invite_link
+  )
+
+  const rawUsername = firstNonEmpty(
+    item?.username,
+    item?.telegram_username,
+    item?.screen_name,
+    item?.name_username
+  )
+
+  if (rawLink) {
+    const cleaned = cleanImportTelegramLink(String(rawLink))
+    if (cleaned && extractUsernameFromLink(cleaned)) return cleaned
+  }
+
+  if (!rawUsername) return ""
+
+  const username = String(rawUsername)
+    .trim()
+    .replace(/^@/, "")
+    .replace(/^https?:\/\/(?:www\.)?t\.me\//i, "")
+    .split(/[/?#]/)[0]
+
+  return username ? `https://t.me/${username}` : ""
+}
+
+function telemetrItemMetadata(item) {
+  const title = firstNonEmpty(
+    item?.title,
+    item?.name,
+    item?.channel_name,
+    item?.telegram_title
+  )
+
+  const subscribers = Number(
+    firstNonEmpty(
+      item?.members,
+      item?.subscribers,
+      item?.member_count,
+      item?.participants_count,
+      item?.audience
+    ) || 0
+  )
+
+  const categoryValue = firstNonEmpty(
+    item?.category?.name,
+    item?.category_name,
+    item?.category,
+    item?.categories?.[0]?.name,
+    item?.categories?.[0]
+  )
+
+  const avatarUrl = firstNonEmpty(
+    item?.avatar_url,
+    item?.photo_url,
+    item?.image_url,
+    item?.avatar,
+    item?.photo
+  )
+
+  return {
+    telemetr_internal_id: firstNonEmpty(
+      item?.internal_id,
+      item?.id,
+      item?.channel_id
+    ),
+    title: title ? String(title) : null,
+    subscribers: Number.isFinite(subscribers) ? subscribers : 0,
+    category: categoryValue ? String(categoryValue) : null,
+    avatar_url:
+      avatarUrl && /^https?:\/\//i.test(String(avatarUrl))
+        ? String(avatarUrl)
+        : null,
+    raw: item,
+  }
+}
+
+async function getTelemetrUsage() {
+  return await telemetrRequest("/v1/usage/info")
+}
+
+async function getTelemetrPage({
+  peerType,
+  skip,
+  country,
+  language,
+  category,
+  membersMin,
+  sortBy,
+}) {
+  if (peerType === "Group") {
+    return await telemetrRequest("/v1/channels/search", {
+      peer_type: "Group",
+      country,
+      language,
+      category,
+      limit: 30,
+      skip: Math.min(skip, 900),
+    })
+  }
+
+  return await telemetrRequest("/v1/catalog/search", {
+    country,
+    language,
+    category,
+    members_min: membersMin,
+    privacy: "Public",
+    sort_by: sortBy || "Members",
+    sort_direction: "Desc",
+    limit: 100,
+    skip: Math.min(skip, 1000),
+  })
+}
+
+async function getTelemetrRunState(runId) {
+  const { data, error } = await supabaseAdmin
+    .from("scraper_runs")
+    .select(
+      "id, status, discovery_stop_requested, stop_all_requested, requested_target, sync_to_framer, use_icon_as_background, created_by, country_id, sort"
+    )
+    .eq("id", runId)
+    .single()
+
+  if (error) throw error
+  return data
+}
+
+async function waitWhileTelemetrPaused(runId) {
+  while (true) {
+    const run = await getTelemetrRunState(runId)
+
+    if (
+      run.stop_all_requested === true ||
+      run.discovery_stop_requested === true ||
+      run.status === "stopped" ||
+      run.status === "cleared"
+    ) {
+      return { stopped: true, run }
+    }
+
+    if (run.status !== "paused") {
+      return { stopped: false, run }
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 1200))
+  }
+}
+
+async function telemetrQueueAlreadyContains(runId, telegramLink) {
+  const { data, error } = await supabaseAdmin
+    .from("scraper_queue")
+    .select("id")
+    .eq("run_id", runId)
+    .eq("telegram_link", telegramLink)
+    .limit(1)
+    .maybeSingle()
+
+  if (error) throw error
+  return Boolean(data)
+}
+
+async function telemetrListingAlreadyExists(telegramLink) {
+  const username = extractUsernameFromLink(telegramLink)
+  const normalizedUsername = username ? cleanUsername(username) : null
+
+  let query = supabaseAdmin
+    .from("channel_listings")
+    .select("id, channel_name, short_invite")
+    .limit(1)
+
+  if (normalizedUsername) {
+    query = query.or(
+      `telegram_link.eq.${telegramLink},telegram_username.eq.${normalizedUsername}`
+    )
+  } else {
+    query = query.eq("telegram_link", telegramLink)
+  }
+
+  const { data, error } = await query.maybeSingle()
+  if (error) throw error
+  return data || null
+}
+
+async function updateTelemetrQueueStage(queueItemId, runId, stage, link) {
+  await Promise.all([
+    supabaseAdmin
+      .from("scraper_queue")
+      .update({
+        stage,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", queueItemId),
+    supabaseAdmin
+      .from("scraper_runs")
+      .update({
+        status: "importing",
+        current_stage: stage,
+        current_link: link,
+        agent_last_seen_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", runId),
+  ])
+}
+
+async function processTelemetrQueueItem(run, queueItem) {
+  const runId = run.id
+
+  const { data: claimed, error: claimError } = await supabaseAdmin
+    .from("scraper_queue")
+    .update({
+      status: "processing",
+      stage: "telegram_verification",
+      started_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", queueItem.id)
+    .eq("status", "queued")
+    .select("*")
+    .maybeSingle()
+
+  if (claimError) throw claimError
+  if (!claimed) return null
+
+  await updateTelemetrQueueStage(
+    queueItem.id,
+    runId,
+    "telegram_verification",
+    queueItem.telegram_link
+  )
+
+  await logScraperEvent({
+    runId,
+    level: "info",
+    stage: "telegram_verification",
+    message: `Verifying ${queueItem.telegram_link} with Telegram.`,
+    telegramLink: queueItem.telegram_link,
+    metadata: {
+      source: "telemetr_api",
+      source_title: queueItem.title || null,
+      source_category: queueItem.category || null,
+      source_subscribers: Number(queueItem.subscribers || 0),
+    },
+  })
+
+  const stageMessages = {
+    telegram_verified: (data) =>
+      `Telegram verified ${data.telegram_title || data.telegram_username}.`,
+    telegram_metadata: (data) =>
+      `${Number(data.member_count || 0).toLocaleString()} members · ${
+        data.listing_type || "unknown type"
+      }.`,
+    language_filtered: (data) =>
+      `Filtered as non-English: ${data.reason || "language filter"}.`,
+    ai_generation_started: () =>
+      "Generating listing content, categories, safety label, and SEO fields.",
+    ai_generated: (data) =>
+      `AI generated "${data.generated_name}" · ${(data.categories || []).join(
+        ", "
+      ) || "General"} · NSFW ${data.is_nsfw ? "Yes" : "No"}.`,
+    slug_selected: (data) => `Selected ${data.public_path}.`,
+    supabase_created: (data) =>
+      `Supabase listing created: ${data.channel_name}.`,
+    avatar_downloaded: (data) =>
+      `Telegram avatar saved${
+        data.background_applied ? " and applied as background" : ""
+      }.`,
+    framer_sync_started: () => "Creating Framer CMS item.",
+    framer_synced: (data) => `Framer CMS ready: ${data.public_url}.`,
+    framer_sync_failed: (data) => `Framer sync failed: ${data.error}.`,
+  }
+
+  try {
+    const result = await importSingleTelegramListing(
+      queueItem.telegram_link,
+      {
+        syncToFramer: run.sync_to_framer !== false,
+        useIconAsBackground: run.use_icon_as_background !== false,
+      },
+      { id: run.created_by },
+      async (stage, metadata) => {
+        const stageMap = {
+          telegram_verified: "telegram_verified",
+          telegram_metadata: "telegram_verified",
+          language_filtered: "filtered",
+          ai_generation_started: "ai_generation",
+          ai_generated: "ai_generated",
+          slug_selected: "slug_selected",
+          supabase_created: "supabase_created",
+          avatar_downloaded: "avatar_downloaded",
+          framer_sync_started: "framer_sync",
+          framer_synced: "framer_synced",
+          framer_sync_failed: "framer_failed",
+        }
+
+        const nextStage = stageMap[stage] || stage
+
+        await updateTelemetrQueueStage(
+          queueItem.id,
+          runId,
+          nextStage,
+          queueItem.telegram_link
+        )
+
+        await logScraperEvent({
+          runId,
+          level:
+            stage === "framer_sync_failed"
+              ? "error"
+              : ["ai_generated", "supabase_created", "framer_synced"].includes(
+                    stage
+                  )
+                ? "success"
+                : stage === "language_filtered"
+                  ? "warning"
+                  : "info",
+          stage,
+          message: stageMessages[stage]
+            ? stageMessages[stage](metadata || {})
+            : stage,
+          telegramLink: queueItem.telegram_link,
+          listingId: metadata?.listing_id || null,
+          metadata: {
+            queue_item_id: queueItem.id,
+            ...metadata,
+          },
+        })
+      }
+    )
+
+    const finalStatus = result.filtered
+      ? "failed"
+      : result.skipped
+        ? "duplicate"
+        : result.created
+          ? "created"
+          : "failed"
+
+    const finalStage = result.filtered
+      ? "filtered"
+      : result.skipped
+        ? "duplicate"
+        : result.created
+          ? "completed"
+          : "failed"
+
+    const { error: updateError } = await supabaseAdmin
+      .from("scraper_queue")
+      .update({
+        status: finalStatus,
+        stage: finalStage,
+        listing_id: result.listing_id || result.existing_listing_id || null,
+        result,
+        framer_synced: Boolean(result.framer_synced),
+        error:
+          finalStatus === "failed"
+            ? result.error || "Listing import failed."
+            : null,
+        completed_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", queueItem.id)
+
+    if (updateError) throw updateError
+
+    await logScraperEvent({
+      runId,
+      level:
+        finalStatus === "created"
+          ? "success"
+          : finalStatus === "duplicate"
+            ? "warning"
+            : "error",
+      stage:
+        finalStatus === "created"
+          ? "listing_created"
+          : finalStatus === "duplicate"
+            ? "duplicate"
+            : "import_failed",
+      message:
+        finalStatus === "created"
+          ? `Listing created: ${result.channel_name || queueItem.title || queueItem.telegram_link}.`
+          : finalStatus === "duplicate"
+            ? `Duplicate skipped: ${result.existing_name || queueItem.title || queueItem.telegram_link}.`
+            : result.error || `Import failed for ${queueItem.telegram_link}.`,
+      telegramLink: queueItem.telegram_link,
+      listingId: result.listing_id || result.existing_listing_id || null,
+      metadata: result,
+    })
+
+    await refreshScraperRunCounters(runId)
+    return result
+  } catch (error) {
+    const isTelegramRateLimit = error?.code === "TELEGRAM_RATE_LIMITED"
+
+    await supabaseAdmin
+      .from("scraper_queue")
+      .update({
+        status: isTelegramRateLimit ? "queued" : "failed",
+        stage: isTelegramRateLimit ? "rate_limited" : "failed",
+        error: error.message || "Import failed.",
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", queueItem.id)
+
+    await supabaseAdmin
+      .from("scraper_runs")
+      .update({
+        status: isTelegramRateLimit ? "rate_limited" : "importing",
+        retry_after_seconds: isTelegramRateLimit
+          ? Number(error.retry_after_seconds || 60)
+          : 0,
+        current_stage: isTelegramRateLimit
+          ? "rate_limited"
+          : "failed_item",
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", runId)
+
+    await logScraperEvent({
+      runId,
+      level: "error",
+      stage: isTelegramRateLimit ? "rate_limited" : "import_failed",
+      message: error.message || "Import failed.",
+      telegramLink: queueItem.telegram_link,
+      metadata: {
+        code: error?.code || null,
+        retry_after_seconds: Number(error?.retry_after_seconds || 0),
+      },
+    })
+
+    await refreshScraperRunCounters(runId).catch(() => {})
+
+    if (isTelegramRateLimit) throw error
+    return null
+  }
+}
+
+async function finishTelemetrRun(runId) {
+  const counts = await refreshScraperRunCounters(runId)
+
+  let deployed = false
+  try {
+    deployed = await publishScraperRunFramerBatch(runId)
+  } catch (error) {
+    await logScraperEvent({
+      runId,
+      level: "error",
+      stage: "framer_deploy_failed",
+      message: error.message,
+    })
+  }
+
+  let homepageCache = null
+  try {
+    homepageCache = await updateHomepageListingCache()
+  } catch (error) {
+    console.error("Telemetr homepage cache refresh failed:", error)
+  }
+
+  const finalStatus =
+    counts.failed > 0 ? "completed_with_errors" : "completed"
+
+  const { error } = await supabaseAdmin
+    .from("scraper_runs")
+    .update({
+      status: finalStatus,
+      current_stage: "completed",
+      current_link: null,
+      framer_deployed: deployed,
+      completed_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", runId)
+
+  if (error) throw error
+
+  await logScraperEvent({
+    runId,
+    level: "success",
+    stage: "run_completed",
+    message: `Telemetr run complete: ${counts.created} created, ${counts.duplicate} duplicates, ${counts.failed} failed.`,
+    metadata: {
+      counters: counts,
+      framer_deployed: deployed,
+      homepage_cache_count: homepageCache?.listings?.length || null,
+    },
+  })
+}
+
+async function runTelemetrImport(runId) {
+  if (activeTelemetrRuns.has(runId)) return
+  activeTelemetrRuns.add(runId)
+
+  try {
+    let run = await getTelemetrRunState(runId)
+    const config =
+      run?.metadata && typeof run.metadata === "object" ? run.metadata : {}
+
+    // Older scraper_runs schemas may not expose metadata through the selected
+    // columns above, so fetch the complete row once.
+    const { data: fullRun, error: fullRunError } = await supabaseAdmin
+      .from("scraper_runs")
+      .select("*")
+      .eq("id", runId)
+      .single()
+
+    if (fullRunError) throw fullRunError
+    run = fullRun
+
+    const target = Math.max(
+      1,
+      Math.min(Number(run.requested_target || 100), 10000)
+    )
+    const sourceParts = String(run.source || "").split(":")
+    const fallbackPeerType = ["Channel", "Group", "All"].includes(sourceParts[1])
+      ? sourceParts[1]
+      : "Channel"
+    const fallbackMembersMin = Math.max(0, Number(sourceParts[2] || 0))
+
+    const options =
+      run.metadata && typeof run.metadata === "object"
+        ? run.metadata
+        : {
+            peer_type: fallbackPeerType,
+            members_min: fallbackMembersMin,
+            country: run.country_id || "",
+            sort_by: run.sort || "Members",
+          }
+
+    const peerTypes =
+      options.peer_type === "Group"
+        ? ["Group"]
+        : options.peer_type === "All"
+          ? ["Channel", "Group"]
+          : ["Channel"]
+
+    await supabaseAdmin
+      .from("scraper_runs")
+      .update({
+        status: "scraping",
+        current_stage: "telemetr_connecting",
+        started_at: run.started_at || new Date().toISOString(),
+        agent_last_seen_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", runId)
+
+    await logScraperEvent({
+      runId,
+      level: "info",
+      stage: "telemetr_connecting",
+      message: "Connected directly to the Telemetr API. No VM or browser scraper is being used.",
+      metadata: {
+        peer_types: peerTypes,
+        target,
+      },
+    })
+
+    let usage = null
+    try {
+      usage = await getTelemetrUsage()
+      await logScraperEvent({
+        runId,
+        level: "info",
+        stage: "telemetr_usage",
+        message: "Telemetr account usage loaded.",
+        metadata: usage,
+      })
+    } catch (error) {
+      await logScraperEvent({
+        runId,
+        level: "warning",
+        stage: "telemetr_usage_unavailable",
+        message: `Could not load Telemetr usage: ${error.message}`,
+      })
+    }
+
+    let accepted = 0
+    let exhaustedSources = 0
+
+    for (const peerType of peerTypes) {
+      if (accepted >= target) break
+
+      let skip = 0
+      const pageLimit = peerType === "Group" ? 30 : 100
+      const maximumSkip = peerType === "Group" ? 900 : 1000
+
+      while (accepted < target && skip <= maximumSkip) {
+        const pauseState = await waitWhileTelemetrPaused(runId)
+        if (pauseState.stopped) {
+          await logScraperEvent({
+            runId,
+            level: "warning",
+            stage: "run_stopped",
+            message: "Telemetr import stopped. Existing imported listings were preserved.",
+          })
+          return
+        }
+
+        await supabaseAdmin
+          .from("scraper_runs")
+          .update({
+            status: "scraping",
+            current_stage: "telemetr_catalog",
+            current_link: null,
+            agent_last_seen_at: new Date().toISOString(),
+            updated_at: new Date().toISOString(),
+          })
+          .eq("id", runId)
+
+        const payload = await getTelemetrPage({
+          peerType,
+          skip,
+          country: options.country || "",
+          language: options.language || "",
+          category: options.category || "",
+          membersMin: Number(options.members_min || 0),
+          sortBy: options.sort_by || "Members",
+        })
+
+        const rows = telemetrResultRows(payload)
+
+        await logScraperEvent({
+          runId,
+          level: "info",
+          stage: "telemetr_catalog_page",
+          message: `Telemetr returned ${rows.length} ${peerType.toLowerCase()} result(s) at offset ${skip}.`,
+          metadata: {
+            peer_type: peerType,
+            skip,
+            returned: rows.length,
+            total: payload?.total ?? payload?.count ?? null,
+            audience_count: payload?.audience_count ?? null,
+          },
+        })
+
+        if (!rows.length) {
+          exhaustedSources += 1
+          break
+        }
+
+        for (const item of rows) {
+          if (accepted >= target) break
+
+          const pauseState = await waitWhileTelemetrPaused(runId)
+          if (pauseState.stopped) return
+
+          const telegramLink = normalizeTelemetrLink(item)
+          if (!telegramLink) continue
+
+          if (await telemetrQueueAlreadyContains(runId, telegramLink)) continue
+
+          const existingListing = await telemetrListingAlreadyExists(telegramLink)
+          const metadata = telemetrItemMetadata(item)
+
+          if (existingListing) {
+            const { data: duplicateRow, error: duplicateInsertError } =
+              await supabaseAdmin
+                .from("scraper_queue")
+                .insert({
+                  run_id: runId,
+                  telegram_link: telegramLink,
+                  username: extractUsernameFromLink(telegramLink),
+                  title: metadata.title,
+                  subscribers: metadata.subscribers,
+                  category: metadata.category,
+                  avatar_url: metadata.avatar_url,
+                  status: "duplicate",
+                  stage: "duplicate",
+                  listing_id: existingListing.id,
+                  result: {
+                    ok: true,
+                    skipped: true,
+                    reason: "duplicate",
+                    existing_listing_id: existingListing.id,
+                    existing_name: existingListing.channel_name,
+                    source: "telemetr_api",
+                    telemetr_internal_id: metadata.telemetr_internal_id,
+                  },
+                  completed_at: new Date().toISOString(),
+                  updated_at: new Date().toISOString(),
+                })
+                .select("*")
+                .single()
+
+            if (duplicateInsertError) throw duplicateInsertError
+
+            await logScraperEvent({
+              runId,
+              level: "warning",
+              stage: "duplicate",
+              message: `Already on TeleHub: ${metadata.title || telegramLink}.`,
+              telegramLink,
+              listingId: existingListing.id,
+              metadata: {
+                queue_item_id: duplicateRow.id,
+                telemetr_internal_id: metadata.telemetr_internal_id,
+              },
+            })
+
+            await refreshScraperRunCounters(runId)
+            continue
+          }
+
+          const { data: queueItem, error: queueError } = await supabaseAdmin
+            .from("scraper_queue")
+            .insert({
+              run_id: runId,
+              telegram_link: telegramLink,
+              username: extractUsernameFromLink(telegramLink),
+              title: metadata.title,
+              subscribers: metadata.subscribers,
+              category: metadata.category,
+              avatar_url: metadata.avatar_url,
+              status: "queued",
+              stage: "telemetr_discovered",
+              result: {
+                source: "telemetr_api",
+                telemetr_internal_id: metadata.telemetr_internal_id,
+              },
+              updated_at: new Date().toISOString(),
+            })
+            .select("*")
+            .single()
+
+          if (queueError) throw queueError
+
+          accepted += 1
+
+          await logScraperEvent({
+            runId,
+            level: "success",
+            stage: "telemetr_discovered",
+            message: `Discovered ${metadata.title || telegramLink} through Telemetr.`,
+            telegramLink,
+            metadata: {
+              queue_item_id: queueItem.id,
+              peer_type: peerType,
+              telemetr_internal_id: metadata.telemetr_internal_id,
+              subscribers: metadata.subscribers,
+              category: metadata.category,
+            },
+          })
+
+          await refreshScraperRunCounters(runId)
+
+          try {
+            await processTelemetrQueueItem(run, queueItem)
+          } catch (error) {
+            if (error?.code === "TELEGRAM_RATE_LIMITED") {
+              const retrySeconds = Math.max(
+                1,
+                Number(error.retry_after_seconds || 60)
+              )
+
+              await logScraperEvent({
+                runId,
+                level: "warning",
+                stage: "rate_limit_wait",
+                message: `Telegram rate limit reached. Waiting ${retrySeconds} seconds before continuing.`,
+                metadata: { retry_after_seconds: retrySeconds },
+              })
+
+              await new Promise((resolve) =>
+                setTimeout(resolve, retrySeconds * 1000)
+              )
+
+              await supabaseAdmin
+                .from("scraper_runs")
+                .update({
+                  status: "importing",
+                  retry_after_seconds: 0,
+                  current_stage: "resuming_after_rate_limit",
+                  updated_at: new Date().toISOString(),
+                })
+                .eq("id", runId)
+
+              const { data: queuedAgain } = await supabaseAdmin
+                .from("scraper_queue")
+                .select("*")
+                .eq("id", queueItem.id)
+                .single()
+
+              if (queuedAgain?.status === "queued") {
+                await processTelemetrQueueItem(run, queuedAgain)
+              }
+            }
+          }
+        }
+
+        skip += pageLimit
+      }
+    }
+
+    if (accepted < target && exhaustedSources === peerTypes.length) {
+      await logScraperEvent({
+        runId,
+        level: "warning",
+        stage: "telemetr_exhausted",
+        message: `Telemetr returned ${accepted.toLocaleString()} new public links before the available search pages were exhausted.`,
+        metadata: { accepted, target },
+      })
+    }
+
+    await finishTelemetrRun(runId)
+  } catch (error) {
+    console.error("Telemetr import run failed:", error)
+
+    await supabaseAdmin
+      .from("scraper_runs")
+      .update({
+        status: "failed",
+        current_stage: "telemetr_failed",
+        current_link: null,
+        updated_at: new Date().toISOString(),
+        completed_at: new Date().toISOString(),
+      })
+      .eq("id", runId)
+
+    await logScraperEvent({
+      runId,
+      level: "error",
+      stage: "telemetr_failed",
+      message: error.message || "Telemetr import failed.",
+      metadata: {
+        code: error?.code || null,
+        status: error?.status || null,
+        response: error?.response || null,
+      },
+    })
+  } finally {
+    activeTelemetrRuns.delete(runId)
+  }
+}
+
+app.get("/api/admin/telemetr/usage", async (req, res) => {
+  try {
+    const user = await getAdminUserFromRequest(req)
+
+    if (!user) {
+      return res.status(403).json({ error: "Admin access required." })
+    }
+
+    const usage = await getTelemetrUsage()
+    return res.json({ ok: true, usage })
+  } catch (error) {
+    return res.status(error?.status || 500).json({
+      error: error.message,
+      code: error?.code || null,
+    })
+  }
+})
+
 app.post("/api/admin/scraper/start", async (req, res) => {
   try {
     const user = await getAdminUserFromRequest(req)
@@ -6968,69 +7889,132 @@ app.post("/api/admin/scraper/start", async (req, res) => {
       return res.status(403).json({ error: "Admin access required." })
     }
 
+    if (!TELEMETR_API_KEY) {
+      return res.status(500).json({
+        error: "TELEMETR_API_KEY is missing from Render.",
+      })
+    }
+
     const requestedTarget = Number(req.body?.target || 100)
     const target = Math.max(1, Math.min(requestedTarget, 10000))
+    const peerType = ["Channel", "Group", "All"].includes(req.body?.peer_type)
+      ? req.body.peer_type
+      : "Channel"
 
     const { data: activeRun } = await supabaseAdmin
       .from("scraper_runs")
       .select("id, status")
-      .in("status", ["queued", "scraping", "paused"])
+      .in("status", [
+        "queued",
+        "scraping",
+        "importing",
+        "paused",
+        "rate_limited",
+      ])
       .order("created_at", { ascending: false })
       .limit(1)
       .maybeSingle()
 
     if (activeRun) {
       return res.status(409).json({
-        error: "A discovery run is already active.",
+        error: "A Telemetr import run is already active.",
         run_id: activeRun.id,
         status: activeRun.status,
       })
     }
 
+    const now = new Date().toISOString()
+    const metadata = {
+      peer_type: peerType,
+      country: String(req.body?.country || "").trim(),
+      language: String(req.body?.language || "").trim(),
+      category: String(req.body?.category || "").trim(),
+      members_min: Math.max(0, Number(req.body?.members_min || 0)),
+      sort_by: String(req.body?.sort_by || "Members").trim(),
+      provider: "telemetr",
+    }
+
     const { data: run, error: runError } = await supabaseAdmin
       .from("scraper_runs")
       .insert({
-        source: "tlgrm_directory_discovery",
+        source: "telemetr_api",
         status: "queued",
         requested_target: target,
-        country_id: "",
-        sort: "members",
-        sync_to_framer: false,
-        use_icon_as_background: false,
+        country_id: metadata.country,
+        sort: metadata.sort_by,
+        sync_to_framer: req.body?.sync_to_framer !== false,
+        use_icon_as_background:
+          req.body?.use_icon_as_background !== false,
         created_by: user.id,
         discovery_stop_requested: false,
         stop_all_requested: false,
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
+        current_stage: "queued",
+        metadata,
+        created_at: now,
+        updated_at: now,
       })
       .select("*")
       .single()
 
-    if (runError) throw runError
+    if (runError) {
+      // Compatibility for an older scraper_runs table without metadata.
+      if (
+        String(runError.message || "").toLowerCase().includes("metadata")
+      ) {
+        const fallback = await supabaseAdmin
+          .from("scraper_runs")
+          .insert({
+            source: `telemetr_api:${peerType}:${metadata.members_min}`,
+            status: "queued",
+            requested_target: target,
+            country_id: metadata.country,
+            sort: metadata.sort_by,
+            sync_to_framer: req.body?.sync_to_framer !== false,
+            use_icon_as_background:
+              req.body?.use_icon_as_background !== false,
+            created_by: user.id,
+            discovery_stop_requested: false,
+            stop_all_requested: false,
+            current_stage: "queued",
+            created_at: now,
+            updated_at: now,
+          })
+          .select("*")
+          .single()
 
-    const { error: commandError } = await supabaseAdmin
-      .from("scraper_commands")
-      .insert({
-        run_id: run.id,
-        command: "start",
-        payload: { target, mode: "discovery_only" },
-        status: "pending",
-      })
+        if (fallback.error) throw fallback.error
+        fallback.data.metadata = metadata
 
-    if (commandError) throw commandError
+        // Persist config in the first event when no metadata column exists.
+        await logScraperEvent({
+          runId: fallback.data.id,
+          level: "info",
+          stage: "telemetr_config",
+          message: "Telemetr run configuration saved.",
+          metadata,
+        })
+
+        setImmediate(() => runTelemetrImport(fallback.data.id))
+        return res.json({ ok: true, run: fallback.data })
+      }
+
+      throw runError
+    }
 
     await logScraperEvent({
       runId: run.id,
       level: "info",
-      stage: "discovery_queued",
-      message: `TGStat ratings discovery queued for up to ${target.toLocaleString()} new links.`,
-      metadata: { target, mode: "discovery_only" },
+      stage: "telemetr_queued",
+      message: `Telemetr API import queued for up to ${target.toLocaleString()} new ${peerType.toLowerCase()} listing(s).`,
+      metadata,
     })
 
+    setImmediate(() => runTelemetrImport(run.id))
+
     return res.json({ ok: true, run })
-  } catch (err) {
-    console.error("Start discovery run failed:", err)
-    return res.status(500).json({ error: err.message })
+  } catch (error) {
+    console.error("Start Telemetr run failed:", error)
+    return res.status(500).json({ error: error.message })
   }
 })
 
@@ -7044,8 +8028,6 @@ app.post("/api/admin/scraper/control", async (req, res) => {
 
     const runId = String(req.body?.run_id || "").trim()
     const rawAction = String(req.body?.action || "").trim().toLowerCase()
-
-    // Backward compatibility with the older Framer command center.
     const action =
       rawAction === "stop_all"
         ? "stop_discovery"
@@ -7061,7 +8043,7 @@ app.post("/api/admin/scraper/control", async (req, res) => {
     ) {
       return res.status(400).json({
         error:
-          "Provide run_id and action: pause, resume, stop_discovery, clear_results, stop_all, or clear_queue.",
+          "Provide run_id and action: pause, resume, stop_discovery, or clear_results.",
       })
     }
 
@@ -7080,7 +8062,7 @@ app.post("/api/admin/scraper/control", async (req, res) => {
 
       if (deleteError) throw deleteError
 
-      const { error: runError } = await supabaseAdmin
+      const { data: run, error: runError } = await supabaseAdmin
         .from("scraper_runs")
         .update({
           status: "cleared",
@@ -7090,6 +8072,7 @@ app.post("/api/admin/scraper/control", async (req, res) => {
           stop_all_requested: true,
           discovered_count: 0,
           queued_count: 0,
+          processing_count: 0,
           processed_count: 0,
           created_count: 0,
           duplicate_count: 0,
@@ -7097,6 +8080,8 @@ app.post("/api/admin/scraper/control", async (req, res) => {
           updated_at: new Date().toISOString(),
         })
         .eq("id", runId)
+        .select("*")
+        .single()
 
       if (runError) throw runError
 
@@ -7104,7 +8089,7 @@ app.post("/api/admin/scraper/control", async (req, res) => {
         runId,
         level: "warning",
         stage: "results_cleared",
-        message: `Cleared ${Number(count || 0)} discovered link(s).`,
+        message: `Cleared ${Number(count || 0)} Telemetr result(s).`,
         metadata: {
           cleared_count: Number(count || 0),
           requested_by: user.id,
@@ -7114,8 +8099,8 @@ app.post("/api/admin/scraper/control", async (req, res) => {
       return res.json({
         ok: true,
         action,
-        requested_action: rawAction,
         cleared_count: Number(count || 0),
+        run,
       })
     }
 
@@ -7128,13 +8113,13 @@ app.post("/api/admin/scraper/control", async (req, res) => {
         : action === "resume"
           ? {
               status: "scraping",
-              current_stage: "resuming_discovery",
+              current_stage: "resuming_telemetr",
               discovery_stop_requested: false,
               stop_all_requested: false,
             }
           : {
               status: "stopped",
-              current_stage: "discovery_stopped",
+              current_stage: "stopped",
               discovery_stop_requested: true,
               stop_all_requested: true,
             }
@@ -7151,23 +8136,27 @@ app.post("/api/admin/scraper/control", async (req, res) => {
 
     if (error) throw error
 
+    if (action === "resume" && !activeTelemetrRuns.has(runId)) {
+      setImmediate(() => runTelemetrImport(runId))
+    }
+
     await logScraperEvent({
       runId,
       level: action === "stop_discovery" ? "warning" : "info",
-      stage: `discovery_${action}`,
+      stage: `telemetr_${action}`,
       message:
         action === "pause"
-          ? "Discovery paused after the current ratings page."
+          ? "Telemetr import paused after the current item."
           : action === "resume"
-            ? "Discovery resumed from the next ratings source."
-            : "Discovery stopped. Existing results were preserved for review.",
+            ? "Telemetr import resumed."
+            : "Telemetr import stopped. Created listings were preserved.",
       metadata: { requested_by: user.id },
     })
 
-    return res.json({ ok: true, action, requested_action: rawAction, run })
-  } catch (err) {
-    console.error("Discovery control failed:", err)
-    return res.status(500).json({ error: err.message })
+    return res.json({ ok: true, action, run })
+  } catch (error) {
+    console.error("Telemetr control failed:", error)
+    return res.status(500).json({ error: error.message })
   }
 })
 
@@ -7236,1025 +8225,12 @@ app.get("/api/admin/scraper/status", async (req, res) => {
       events: (events || []).reverse(),
       queue: queue || [],
     })
-  } catch (err) {
-    console.error("Scraper status failed:", err)
-    return res.status(500).json({ error: err.message })
+  } catch (error) {
+    console.error("Telemetr status failed:", error)
+    return res.status(500).json({ error: error.message })
   }
 })
 
-app.get("/api/scraper/agent/command", async (req, res) => {
-  try {
-    if (!requireScraperAgent(req, res)) return
-
-    // Use an ordinary limited array query instead of maybeSingle().
-    // This avoids the runtime path that was returning:
-    // "clearNext is not defined"
-    const { data: pendingCommands, error: selectError } =
-      await supabaseAdmin
-        .from("scraper_commands")
-        .select("*, scraper_runs(*)")
-        .eq("status", "pending")
-        .order("created_at", { ascending: true })
-        .limit(1)
-
-    if (selectError) throw selectError
-
-    const command = Array.isArray(pendingCommands)
-      ? pendingCommands[0] || null
-      : null
-
-    if (!command) {
-      return res.json({
-        ok: true,
-        command: null,
-        build: BACKEND_BUILD_ID,
-      })
-    }
-
-    // Claim only while the row is still pending. Return the claimed row so
-    // two agents cannot both act on the same command.
-    const { data: claimedRows, error: claimError } =
-      await supabaseAdmin
-        .from("scraper_commands")
-        .update({
-          status: "claimed",
-          claimed_at: new Date().toISOString(),
-        })
-        .eq("id", command.id)
-        .eq("status", "pending")
-        .select("id")
-
-    if (claimError) throw claimError
-
-    if (!Array.isArray(claimedRows) || claimedRows.length === 0) {
-      return res.json({
-        ok: true,
-        command: null,
-        claimed_elsewhere: true,
-        build: BACKEND_BUILD_ID,
-      })
-    }
-
-    if (command.command === "start") {
-      const { error: runUpdateError } = await supabaseAdmin
-        .from("scraper_runs")
-        .update({
-          status: "scraping",
-          started_at: new Date().toISOString(),
-          agent_last_seen_at: new Date().toISOString(),
-          updated_at: new Date().toISOString(),
-        })
-        .eq("id", command.run_id)
-
-      if (runUpdateError) throw runUpdateError
-    }
-
-    return res.json({
-      ok: true,
-      command,
-      build: BACKEND_BUILD_ID,
-    })
-  } catch (err) {
-    console.error("Scraper command fetch failed:", {
-      message: err?.message,
-      name: err?.name,
-      code: err?.code,
-      details: err?.details,
-      hint: err?.hint,
-      stack: err?.stack,
-    })
-
-    return res.status(500).json({
-      error: err?.message || "Could not fetch scraper command.",
-      code: err?.code || null,
-      build: BACKEND_BUILD_ID,
-    })
-  }
-})
-
-app.post("/api/scraper/agent/command-complete", async (req, res) => {
-  try {
-    if (!requireScraperAgent(req, res)) return
-
-    const commandId = String(req.body?.command_id || "").trim()
-    const status = String(req.body?.status || "completed").trim()
-
-    if (!commandId) {
-      return res.status(400).json({ error: "Missing command_id." })
-    }
-
-    const { error } = await supabaseAdmin
-      .from("scraper_commands")
-      .update({
-        status,
-        completed_at: new Date().toISOString(),
-        error: req.body?.error || null,
-      })
-      .eq("id", commandId)
-
-    if (error) throw error
-    return res.json({ ok: true })
-  } catch (err) {
-    return res.status(500).json({ error: err.message })
-  }
-})
-
-
-app.post("/api/scraper/agent/event", async (req, res) => {
-  try {
-    if (!requireScraperAgent(req, res)) return
-
-    const runId = String(req.body?.run_id || "").trim()
-    const level = String(req.body?.level || "info").trim()
-    const stage = String(req.body?.stage || "agent_event").trim()
-    const message = String(req.body?.message || "").trim()
-    const metadata =
-      req.body?.metadata && typeof req.body.metadata === "object"
-        ? req.body.metadata
-        : {}
-
-    if (!runId || !message) {
-      return res.status(400).json({
-        error: "Missing run_id or message.",
-      })
-    }
-
-    await logScraperEvent({
-      runId,
-      level,
-      stage,
-      message,
-      telegramLink: req.body?.telegram_link || null,
-      listingId: req.body?.listing_id || null,
-      metadata,
-    })
-
-    return res.json({ ok: true })
-  } catch (err) {
-    console.error("Scraper agent event failed:", err)
-    return res.status(500).json({ error: err.message })
-  }
-})
-
-app.post("/api/scraper/agent/heartbeat", async (req, res) => {
-  try {
-    if (!requireScraperAgent(req, res)) return
-
-    const runId = String(req.body?.run_id || "").trim()
-    if (!runId) return res.status(400).json({ error: "Missing run_id." })
-
-    const { data: run, error } = await supabaseAdmin
-      .from("scraper_runs")
-      .update({
-        agent_last_seen_at: new Date().toISOString(),
-        current_stage: req.body?.stage || null,
-        current_link: req.body?.telegram_link || null,
-        updated_at: new Date().toISOString(),
-      })
-      .eq("id", runId)
-      .select(
-        "id, status, discovery_stop_requested, stop_all_requested"
-      )
-      .single()
-
-    if (error) throw error
-    return res.json({
-      ok: true,
-      status: run.status,
-      discovery_stop_requested:
-        run.discovery_stop_requested === true,
-      stop_all_requested: run.stop_all_requested === true,
-    })
-  } catch (err) {
-    return res.status(500).json({ error: err.message })
-  }
-})
-
-
-function normalizedTelegramUsername(value) {
-  const cleaned = cleanImportTelegramLink(value)
-  if (!cleaned) return ""
-
-  try {
-    const url = new URL(cleaned)
-    return String(url.pathname || "")
-      .replace(/^\/+/, "")
-      .split(/[/?#]/)[0]
-      .replace(/^@/, "")
-      .trim()
-      .toLowerCase()
-  } catch {
-    return String(value || "")
-      .replace(/^https?:\/\/(?:www\.)?t\.me\//i, "")
-      .replace(/^@/, "")
-      .split(/[/?#]/)[0]
-      .trim()
-      .toLowerCase()
-  }
-}
-
-
-const ENGLISH_FUNCTION_WORDS = new Set([
-  "a","about","after","all","and","are","as","at","be","but","by","for","from","in","into","is","it","its","of","on","or","our","the","their","this","to","with","your","you","we","an","new","official","daily"
-])
-
-const ENGLISH_TOPIC_WORDS = new Set([
-  "active","alerts","analysis","anime","app","apps","art","beauty","bitcoin","blockchain","blog","books","business","call","calls","career","channel","chat","chats","children","club","coding","coin","coins","community","course","courses","crypto","daily","deals","design","discussion","download","education","english","entertainment","fashion","film","finance","fitness","food","forex","free","fun","game","games","gaming","group","guide","guides","health","humor","jobs","learn","learning","magazine","marketing","media","members","memes","music","news","official","photos","podcast","politics","quotes","recipes","resources","sales","science","series","signals","software","sport","sports","startup","stocks","study","support","tech","technology","tips","trading","travel","updates","video","videos","voice","wallet","web3"
-])
-
-const COMMON_ENGLISH_WORDS = new Set([
-  "able","account","across","action","activity","actually","add","again","against","air","almost","along","already","also","always","american","another","any","anyone","anything","around","ask","available","away","back","based","before","best","better","big","book","both","brand","bring","build","built","call","care","case","check","city","class","come","content","country","course","create","current","day","days","detail","different","done","each","easy","end","enjoy","event","every","everything","example","experience","family","fast","find","first","follow","found","friends","full","general","get","give","good","great","group","guide","help","high","home","idea","info","information","join","keep","know","latest","learn","life","like","live","look","made","make","market","media","member","message","money","more","most","move","music","need","network","next","now","open","other","page","part","people","place","plan","post","public","quick","real","release","report","right","school","service","share","show","simple","small","social","start","step","story","system","team","tech","things","time","today","top","topic","update","use","user","video","view","watch","way","week","welcome","what","when","where","work","world"
-])
-
-function cleanText(value) {
-  return String(value || "")
-    .replace(/\s+/g, " ")
-    .trim()
-}
-
-function normalizeLanguageText(value) {
-  return String(value || "")
-    .normalize("NFKD")
-    .replace(/[\u0300-\u036f]/g, "")
-}
-
-function extractLanguageTokens(value) {
-  return normalizeLanguageText(value)
-    .toLowerCase()
-    .replace(/[^a-z'\-\s]/g, " ")
-    .split(/\s+/)
-    .map((token) => token.replace(/^['-]+|['-]+$/g, ""))
-    .filter(Boolean)
-}
-
-function countScriptLetters(value) {
-  const counts = {
-    latin: 0,
-    cyrillic: 0,
-    arabic: 0,
-    hebrew: 0,
-    greek: 0,
-    other: 0,
-  }
-
-  for (const char of String(value || "")) {
-    if (!/\p{L}/u.test(char)) continue
-
-    if (/\p{Script=Latin}/u.test(char)) counts.latin += 1
-    else if (/\p{Script=Cyrillic}/u.test(char)) counts.cyrillic += 1
-    else if (/\p{Script=Arabic}/u.test(char)) counts.arabic += 1
-    else if (/\p{Script=Hebrew}/u.test(char)) counts.hebrew += 1
-    else if (/\p{Script=Greek}/u.test(char)) counts.greek += 1
-    else counts.other += 1
-  }
-
-  counts.total =
-    counts.latin +
-    counts.cyrillic +
-    counts.arabic +
-    counts.hebrew +
-    counts.greek +
-    counts.other
-
-  counts.non_latin = counts.total - counts.latin
-  return counts
-}
-
-function countTokenMatches(tokens, dictionary) {
-  let count = 0
-  for (const token of tokens) {
-    if (dictionary.has(token)) count += 1
-  }
-  return count
-}
-
-function analyzeDiscoveryEnglishTitle(title) {
-  const cleanTitle = cleanText(title)
-  const scripts = countScriptLetters(cleanTitle)
-
-  if (!cleanTitle) {
-    return {
-      isEnglish: false,
-      reason: "empty_title",
-      scripts,
-    }
-  }
-
-  // Reject only clearly non-Latin titles at discovery time.
-  // Any title containing Latin letters is allowed through for the stricter
-  // Telegram metadata check later.
-  if (scripts.total > 0 && scripts.latin === 0) {
-    return {
-      isEnglish: false,
-      reason: "title_is_fully_non_latin",
-      scripts,
-    }
-  }
-
-  if (
-    scripts.total > 0 &&
-    scripts.non_latin >= 8 &&
-    scripts.non_latin / scripts.total >= 0.75
-  ) {
-    return {
-      isEnglish: false,
-      reason: "title_is_mostly_non_latin",
-      scripts,
-    }
-  }
-
-  return {
-    isEnglish: true,
-    ambiguous: true,
-    reason: "latin_title_allowed",
-    scripts,
-  }
-}
-
-function analyzeLikelyEnglishListingContent({ title, description }) {
-  const cleanTitle = cleanText(title)
-  const cleanDescription = cleanText(description)
-  const titleScripts = countScriptLetters(cleanTitle)
-  const combinedScripts = countScriptLetters(
-    `${cleanTitle} ${cleanDescription}`
-  )
-
-  // Reject only when the actual Telegram title is entirely non-Latin.
-  if (titleScripts.total > 0 && titleScripts.latin === 0) {
-    return {
-      isEnglish: false,
-      reason: "telegram_title_is_fully_non_latin",
-      title_scripts: titleScripts,
-      combined_scripts: combinedScripts,
-    }
-  }
-
-  // Mixed titles are allowed unless the combined Telegram metadata is
-  // overwhelmingly non-Latin.
-  if (
-    combinedScripts.total >= 20 &&
-    combinedScripts.non_latin >= 15 &&
-    combinedScripts.non_latin / combinedScripts.total >= 0.8
-  ) {
-    return {
-      isEnglish: false,
-      reason: "telegram_content_is_overwhelmingly_non_latin",
-      title_scripts: titleScripts,
-      combined_scripts: combinedScripts,
-    }
-  }
-
-  return {
-    isEnglish: true,
-    ambiguous: true,
-    reason: "latin_or_mixed_listing_allowed",
-    title_scripts: titleScripts,
-    combined_scripts: combinedScripts,
-  }
-}
-
-
-async function loadExistingTelegramUsernames() {
-  const usernames = new Set()
-  const pageSize = 1000
-  let offset = 0
-
-  while (true) {
-    const { data, error } = await supabaseAdmin
-      .from("channel_listings")
-      .select(
-        "telegram_username, telegram_link, short_invite"
-      )
-      .range(offset, offset + pageSize - 1)
-
-    if (error) throw error
-
-    for (const listing of data || []) {
-      for (const value of [
-        listing.telegram_username,
-        listing.telegram_link,
-        listing.short_invite,
-      ]) {
-        const username = normalizedTelegramUsername(value)
-        if (username) usernames.add(username)
-      }
-    }
-
-    if (!data || data.length < pageSize) break
-    offset += pageSize
-  }
-
-  return usernames
-}
-
-app.post("/api/scraper/agent/discovered", async (req, res) => {
-  try {
-    if (!requireScraperAgent(req, res)) return
-
-    const runId = String(req.body?.run_id || "").trim()
-    const rows = Array.isArray(req.body?.rows) ? req.body.rows : []
-    const requestedMaxNew = Number(req.body?.max_new || rows.length)
-    const maxNew = Math.max(
-      1,
-      Math.min(
-        Number.isFinite(requestedMaxNew) ? requestedMaxNew : rows.length,
-        rows.length
-      )
-    )
-
-    if (!runId || !rows.length) {
-      return res.status(400).json({ error: "Missing run_id or rows." })
-    }
-
-    const existingUsernames = await loadExistingTelegramUsernames()
-    const seenBatch = new Set()
-
-    let invalidCount = 0
-    let existingCount = 0
-    let repeatedCount = 0
-
-    const queueRows = []
-
-    for (const row of rows) {
-      const telegramLink = cleanImportTelegramLink(
-        row.telegram_link || row.username
-      )
-      const username = normalizedTelegramUsername(telegramLink)
-
-      if (!telegramLink || !username) {
-        invalidCount += 1
-        continue
-      }
-
-      if (existingUsernames.has(username)) {
-        existingCount += 1
-        continue
-      }
-
-      if (seenBatch.has(username)) {
-        repeatedCount += 1
-        continue
-      }
-
-      const discoveryLanguageCheck = analyzeDiscoveryEnglishTitle(
-        row.title || username
-      )
-
-      if (!discoveryLanguageCheck.isEnglish) {
-        invalidCount += 1
-        continue
-      }
-
-      seenBatch.add(username)
-
-      if (queueRows.length >= maxNew) break
-
-      queueRows.push({
-        run_id: runId,
-        telegram_link: `https://t.me/${username}`,
-        username: `@${username}`,
-        title: row.title || username,
-        subscribers: Number(row.subscribers || 0),
-        category: row.category || null,
-        avatar_url: row.avatar_url || null,
-        source_url: row.source_url || row.tlgrm_url || row.tgstat_url || null,
-        source_page: Number(row.source_page || 0),
-        status: "ready_for_ai",
-        stage: "ready_for_ai",
-        result: {
-          source_type: row.source_type || null,
-          source_sort: row.source_sort || null,
-          source_category: row.category || null,
-          source_visibility: row.source_visibility || null,
-          ratings_source_url:
-            row.source_page_url || row.ratings_source_url || null,
-        },
-      })
-    }
-
-    let inserted = []
-
-    if (queueRows.length) {
-      const result = await supabaseAdmin
-        .from("scraper_queue")
-        .upsert(queueRows, {
-          onConflict: "run_id,telegram_link",
-          ignoreDuplicates: true,
-        })
-        .select("id, telegram_link")
-
-      if (result.error) throw result.error
-      inserted = result.data || []
-    }
-
-    const runDuplicates =
-      Math.max(0, queueRows.length - inserted.length) + repeatedCount
-
-    const { count: totalReady, error: readyError } =
-      await supabaseAdmin
-        .from("scraper_queue")
-        .select("id", { count: "exact", head: true })
-        .eq("run_id", runId)
-        .eq("status", "ready_for_ai")
-
-    if (readyError) throw readyError
-
-    const { error: runError } = await supabaseAdmin
-      .from("scraper_runs")
-      .update({
-        status: "scraping",
-        current_stage: "ready_for_ai",
-        discovered_count: Number(totalReady || 0),
-        queued_count: Number(totalReady || 0),
-        duplicate_count:
-          Number(existingCount || 0) + Number(runDuplicates || 0),
-        updated_at: new Date().toISOString(),
-      })
-      .eq("id", runId)
-
-    if (runError) throw runError
-
-    await logScraperEvent({
-      runId,
-      level: "success",
-      stage: "links_filtered",
-      message: `${inserted.length} new link(s) added to Ready to Send to AI.`,
-      metadata: {
-        cards_received: rows.length,
-        new_links: inserted.length,
-        existing_on_telehub: existingCount,
-        repeated_in_run: runDuplicates,
-        filtered_or_invalid: invalidCount,
-        filter_note:
-          "Only listings with likely English titles are added to Ready to Send to AI.",
-        total_ready_for_ai: Number(totalReady || 0),
-        max_new_requested: maxNew,
-      },
-    })
-
-    return res.json({
-      ok: true,
-      received: rows.length,
-      inserted: inserted.length,
-      existing: existingCount,
-      duplicates: runDuplicates,
-      invalid: invalidCount,
-      total_ready_for_ai: Number(totalReady || 0),
-      counters: {
-        total: Number(totalReady || 0),
-        queued: Number(totalReady || 0),
-        processing: 0,
-        created: 0,
-        duplicate: Number(existingCount || 0) + Number(runDuplicates || 0),
-        failed: invalidCount,
-      },
-    })
-  } catch (err) {
-    console.error("Discovery filter failed:", err)
-    return res.status(500).json({ error: err.message })
-  }
-})
-
-
-app.post("/api/scraper/agent/discovery-complete", async (req, res) => {
-  try {
-    if (!requireScraperAgent(req, res)) return
-
-    const runId = String(req.body?.run_id || "").trim()
-    const stopped = req.body?.stopped === true
-
-    if (!runId) {
-      return res.status(400).json({ error: "Missing run_id." })
-    }
-
-    const { count: readyCount, error: countError } =
-      await supabaseAdmin
-        .from("scraper_queue")
-        .select("id", { count: "exact", head: true })
-        .eq("run_id", runId)
-        .eq("status", "ready_for_ai")
-
-    if (countError) throw countError
-
-    const nextStatus = stopped ? "stopped" : "completed"
-
-    const { error: runError } = await supabaseAdmin
-      .from("scraper_runs")
-      .update({
-        status: nextStatus,
-        current_stage: "ready_for_ai",
-        current_link: null,
-        discovered_count: Number(readyCount || 0),
-        queued_count: Number(readyCount || 0),
-        processed_count: 0,
-        created_count: 0,
-        failed_count: 0,
-        updated_at: new Date().toISOString(),
-        completed_at: new Date().toISOString(),
-      })
-      .eq("id", runId)
-
-    if (runError) throw runError
-
-    await logScraperEvent({
-      runId,
-      level: "success",
-      stage: "discovery_complete",
-      message: `${Number(
-        readyCount || 0
-      )} new link(s) are ready for manual AI import.`,
-      metadata: {
-        ready_for_ai: Number(readyCount || 0),
-        stopped,
-      },
-    })
-
-    return res.json({
-      ok: true,
-      status: nextStatus,
-      ready_for_ai: Number(readyCount || 0),
-    })
-  } catch (err) {
-    console.error("Complete discovery failed:", err)
-    return res.status(500).json({ error: err.message })
-  }
-})
-
-app.post("/api/scraper/agent/process-next", async (req, res) => {
-  let queueItem = null
-
-  try {
-    if (!requireScraperAgent(req, res)) return
-
-    const runId = String(req.body?.run_id || "").trim()
-    if (!runId) return res.status(400).json({ error: "Missing run_id." })
-
-    const { data: run, error: runError } = await supabaseAdmin
-      .from("scraper_runs")
-      .select("*")
-      .eq("id", runId)
-      .single()
-
-    if (runError || !run) {
-      return res.status(404).json({ error: "Scraper run not found." })
-    }
-
-    if (run.status === "paused") {
-      return res.json({ ok: true, paused: true })
-    }
-
-    if (
-      run.stop_all_requested === true ||
-      ["stopping", "stopped", "completed", "failed", "cleared"].includes(
-        run.status
-      )
-    ) {
-      return res.json({
-        ok: true,
-        stopped: true,
-        status: run.status,
-      })
-    }
-
-    const { data: candidate, error: candidateError } = await supabaseAdmin
-      .from("scraper_queue")
-      .select("*")
-      .eq("run_id", runId)
-      .eq("status", "queued")
-      .order("created_at", { ascending: true })
-      .limit(1)
-      .maybeSingle()
-
-    if (candidateError) throw candidateError
-
-    if (!candidate) {
-      const counts = await refreshScraperRunCounters(runId)
-      return res.json({ ok: true, empty: true, counters: counts })
-    }
-
-    const { data: claimed, error: claimError } = await supabaseAdmin
-      .from("scraper_queue")
-      .update({
-        status: "processing",
-        stage: "telegram_verification",
-        started_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-      })
-      .eq("id", candidate.id)
-      .eq("status", "queued")
-      .select("*")
-      .maybeSingle()
-
-    if (claimError) throw claimError
-    if (!claimed) return res.json({ ok: true, claimed_elsewhere: true })
-
-    queueItem = claimed
-
-    await supabaseAdmin
-      .from("scraper_runs")
-      .update({
-        status: "importing",
-        current_stage: "telegram_verification",
-        current_link: queueItem.telegram_link,
-        agent_last_seen_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-      })
-      .eq("id", runId)
-
-    await logScraperEvent({
-      runId,
-      level: "info",
-      stage: "telegram_verification",
-      message: `Checking ${queueItem.telegram_link}`,
-      telegramLink: queueItem.telegram_link,
-      metadata: {
-        source_title: queueItem.title || null,
-        source_category: queueItem.category || null,
-        source_subscribers: Number(queueItem.subscribers || 0),
-        source_avatar_url: queueItem.avatar_url || null,
-      },
-    })
-
-    const adminUser = { id: run.created_by }
-
-    const stageMessages = {
-      telegram_verified: (data) =>
-        `Telegram found: ${
-          data.telegram_title ||
-          data.telegram_username ||
-          queueItem.telegram_link
-        }`,
-      telegram_metadata: (data) =>
-        `${Number(data.member_count || 0).toLocaleString()} members · ${
-          data.listing_type || "unknown type"
-        } · avatar ${data.avatar_available ? "available" : "not found"}`,
-      language_filtered: (data) =>
-        `Filtered as non-English: ${data.reason || "language filter"}`,
-      ai_generation_started: () =>
-        "Generating display content, categories, safety label, and SEO fields.",
-      ai_generated: (data) =>
-        `Applied name "${data.generated_name}" · ${(data.categories || []).join(
-          ", "
-        ) || "General"} · NSFW ${data.is_nsfw ? "Yes" : "No"}`,
-      slug_selected: (data) =>
-        `Selected public path ${data.public_path}`,
-      supabase_created: (data) =>
-        `Supabase listing created: ${data.channel_name}`,
-      avatar_downloaded: (data) =>
-        `Avatar downloaded${
-          data.background_applied ? " and applied as background" : ""
-        }.`,
-      framer_sync_started: () =>
-        "Creating Framer CMS item.",
-      framer_synced: (data) =>
-        `Framer CMS ready: ${data.public_url}`,
-      framer_sync_failed: (data) =>
-        `Framer sync failed: ${data.error}`,
-    }
-
-    const result = await importSingleTelegramListing(
-      queueItem.telegram_link,
-      {
-        syncToFramer: run.sync_to_framer !== false,
-        useIconAsBackground: run.use_icon_as_background !== false,
-      },
-      adminUser,
-      async (stage, metadata) => {
-        const queueStageMap = {
-          telegram_verified: "telegram_verified",
-          telegram_metadata: "telegram_verified",
-          language_filtered: "filtered",
-          ai_generation_started: "ai_generation",
-          ai_generated: "ai_generated",
-          slug_selected: "slug_selected",
-          supabase_created: "supabase_created",
-          avatar_downloaded: "avatar_downloaded",
-          framer_sync_started: "framer_sync",
-          framer_synced: "framer_synced",
-          framer_sync_failed: "framer_failed",
-        }
-
-        const nextStage = queueStageMap[stage] || stage
-
-        await supabaseAdmin
-          .from("scraper_queue")
-          .update({
-            stage: nextStage,
-            updated_at: new Date().toISOString(),
-          })
-          .eq("id", queueItem.id)
-
-        await supabaseAdmin
-          .from("scraper_runs")
-          .update({
-            current_stage: nextStage,
-            current_link: queueItem.telegram_link,
-            updated_at: new Date().toISOString(),
-          })
-          .eq("id", runId)
-
-        const messageBuilder = stageMessages[stage]
-        const message = messageBuilder
-          ? messageBuilder(metadata || {})
-          : stage
-
-        await logScraperEvent({
-          runId,
-          level:
-            stage === "framer_sync_failed"
-              ? "error"
-              : stage === "ai_generated" ||
-                  stage === "supabase_created" ||
-                  stage === "framer_synced"
-                ? "success"
-                : "info",
-          stage,
-          message,
-          telegramLink: queueItem.telegram_link,
-          listingId: metadata?.listing_id || null,
-          metadata: {
-            queue_item_id: queueItem.id,
-            ...metadata,
-          },
-        })
-      }
-    )
-
-    const finalStatus = result.filtered
-      ? "failed"
-      : result.skipped
-        ? "duplicate"
-        : "created"
-
-    const finalStage = result.filtered
-      ? "filtered"
-      : result.skipped
-        ? "duplicate"
-        : "completed"
-
-    const { error: queueUpdateError } = await supabaseAdmin
-      .from("scraper_queue")
-      .update({
-        status: finalStatus,
-        stage: finalStage,
-        listing_id: result.listing_id || result.existing_listing_id || null,
-        result,
-        framer_synced: Boolean(result.framer_synced),
-        error: result.ok === false ? result.error : null,
-        completed_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-      })
-      .eq("id", queueItem.id)
-
-    if (queueUpdateError) throw queueUpdateError
-
-    await logScraperEvent({
-      runId,
-      level: result.filtered ? "warning" : result.skipped ? "warning" : "success",
-      stage: result.filtered
-        ? "language_filtered"
-        : result.skipped
-          ? "duplicate"
-          : "listing_created",
-      message: result.filtered
-        ? `Filtered non-English listing: ${result.telegram_title || queueItem.telegram_link}`
-        : result.skipped
-          ? `Duplicate skipped: ${result.existing_name || queueItem.telegram_link}`
-          : `Listing created: ${result.channel_name || queueItem.telegram_link}`,
-      telegramLink: queueItem.telegram_link,
-      listingId: result.listing_id || result.existing_listing_id || null,
-      metadata: result,
-    })
-
-    const counters = await refreshScraperRunCounters(runId)
-
-    return res.json({
-      ok: true,
-      queue_item_id: queueItem.id,
-      result,
-      counters,
-    })
-  } catch (err) {
-    console.error("Scraper process-next failed:", err)
-
-    const isRateLimit = err?.code === "TELEGRAM_RATE_LIMITED"
-    const runId = String(req.body?.run_id || "").trim()
-
-    if (queueItem?.id) {
-      await supabaseAdmin
-        .from("scraper_queue")
-        .update({
-          status: isRateLimit ? "queued" : "failed",
-          stage: isRateLimit ? "rate_limited" : "failed",
-          error: err.message || "Import failed.",
-          updated_at: new Date().toISOString(),
-        })
-        .eq("id", queueItem.id)
-    }
-
-    if (runId) {
-      await supabaseAdmin
-        .from("scraper_runs")
-        .update({
-          status: isRateLimit ? "rate_limited" : "importing",
-          retry_after_seconds: isRateLimit
-            ? Number(err.retry_after_seconds || 60)
-            : 0,
-          current_stage: isRateLimit ? "rate_limited" : "failed_item",
-          updated_at: new Date().toISOString(),
-        })
-        .eq("id", runId)
-
-      await logScraperEvent({
-        runId,
-        level: "error",
-        stage: isRateLimit ? "rate_limited" : "import_failed",
-        message: err.message || "Import failed.",
-        telegramLink: queueItem?.telegram_link || null,
-        metadata: {
-          code: err?.code || null,
-          retry_after_seconds: Number(err?.retry_after_seconds || 0),
-        },
-      })
-
-      await refreshScraperRunCounters(runId).catch(() => {})
-    }
-
-    return res.status(isRateLimit ? 429 : 500).json({
-      error: err.message || "Import failed.",
-      code: err?.code || null,
-      retry_after_seconds: Number(err?.retry_after_seconds || 0),
-    })
-  }
-})
-
-app.post("/api/scraper/agent/complete", async (req, res) => {
-  try {
-    if (!requireScraperAgent(req, res)) return
-
-    const runId = String(req.body?.run_id || "").trim()
-    if (!runId) return res.status(400).json({ error: "Missing run_id." })
-
-    const counts = await refreshScraperRunCounters(runId)
-
-    let deployed = false
-    try {
-      deployed = await publishScraperRunFramerBatch(runId)
-    } catch (deployError) {
-      await logScraperEvent({
-        runId,
-        level: "error",
-        stage: "framer_deploy_failed",
-        message: deployError.message,
-      })
-    }
-
-    let homepageCache = null
-    try {
-      homepageCache = await updateHomepageListingCache()
-    } catch (cacheError) {
-      console.error("Scraper homepage cache refresh failed:", cacheError)
-    }
-
-    const finalStatus = counts.failed > 0 ? "completed_with_errors" : "completed"
-
-    const { error } = await supabaseAdmin
-      .from("scraper_runs")
-      .update({
-        status: finalStatus,
-        current_stage: "completed",
-        current_link: null,
-        framer_deployed: deployed,
-        completed_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-      })
-      .eq("id", runId)
-
-    if (error) throw error
-
-    await logScraperEvent({
-      runId,
-      level: "success",
-      stage: "run_completed",
-      message: `Run complete: ${counts.created} created, ${counts.duplicate} duplicates, ${counts.failed} failed.`,
-      metadata: {
-        counters: counts,
-        framer_deployed: deployed,
-        homepage_cache_count: homepageCache?.listings?.length || null,
-      },
-    })
-
-    return res.json({
-      ok: true,
-      status: finalStatus,
-      counters: counts,
-      framer_deployed: deployed,
-    })
-  } catch (err) {
-    console.error("Scraper complete failed:", err)
-    return res.status(500).json({ error: err.message })
-  }
-})
 
 
 app.listen(PORT, () => {
