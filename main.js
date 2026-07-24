@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 })
 
 const BACKEND_BUILD_ID =
-  "telehub-tlgrm-scraper-2026-07-24"
+  "telehub-tlgrm-payload-size-fix-2026-07-24"
 
 app.get("/", (req, res) => {
   res.status(200).json({
@@ -188,7 +188,7 @@ app.post(
   }
 )
 
-app.use(express.json())
+app.use(express.json({ limit: "2mb" }))
 const RANK_PRICE_IDS = {
   silver: "price_1TWUrs7OqwgduKJFky8xGosP",
   gold: "price_1TWUtJ7OqwgduKJFU5ghC6Md",
