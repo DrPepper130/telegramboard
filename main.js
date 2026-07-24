@@ -6481,29 +6481,18 @@ app.post("/api/admin/scraper/start", async (req, res) => {
 
     const requestedTarget = Number(req.body?.target || 100)
     const target = Math.max(1, Math.min(requestedTarget, 10000))
-    const countryId = String(req.body?.country_id || "29").trim()
-    const sort = String(req.body?.sort || "participants").trim()
-    const syncToFramer = req.body?.sync_to_framer !== false
-    const useIconAsBackground =
-      req.body?.use_icon_as_background !== false
 
     const { data: activeRun } = await supabaseAdmin
       .from("scraper_runs")
       .select("id, status")
-      .in("status", [
-        "queued",
-        "scraping",
-        "importing",
-        "paused",
-        "rate_limited",
-      ])
+      .in("status", ["queued", "scraping", "paused"])
       .order("created_at", { ascending: false })
       .limit(1)
       .maybeSingle()
 
     if (activeRun) {
       return res.status(409).json({
-        error: "A scraper run is already active.",
+        error: "A discovery run is already active.",
         run_id: activeRun.id,
         status: activeRun.status,
       })
@@ -6512,13 +6501,13 @@ app.post("/api/admin/scraper/start", async (req, res) => {
     const { data: run, error: runError } = await supabaseAdmin
       .from("scraper_runs")
       .insert({
-        source: "tgstat",
+        source: "tgstat_ratings_discovery",
         status: "queued",
         requested_target: target,
-        country_id: countryId,
-        sort,
-        sync_to_framer: syncToFramer,
-        use_icon_as_background: useIconAsBackground,
+        country_id: "",
+        sort: "members",
+        sync_to_framer: false,
+        use_icon_as_background: false,
         created_by: user.id,
         discovery_stop_requested: false,
         stop_all_requested: false,
@@ -6535,11 +6524,7 @@ app.post("/api/admin/scraper/start", async (req, res) => {
       .insert({
         run_id: run.id,
         command: "start",
-        payload: {
-          target,
-          country_id: countryId,
-          sort,
-        },
+        payload: { target, mode: "discovery_only" },
         status: "pending",
       })
 
@@ -6548,14 +6533,14 @@ app.post("/api/admin/scraper/start", async (req, res) => {
     await logScraperEvent({
       runId: run.id,
       level: "info",
-      stage: "run_queued",
-      message: `TGStat run queued for ${target.toLocaleString()} listings.`,
-      metadata: { target, country_id: countryId, sort },
+      stage: "discovery_queued",
+      message: `TGStat ratings discovery queued for up to ${target.toLocaleString()} new links.`,
+      metadata: { target, mode: "discovery_only" },
     })
 
     return res.json({ ok: true, run })
   } catch (err) {
-    console.error("Start scraper run failed:", err)
+    console.error("Start discovery run failed:", err)
     return res.status(500).json({ error: err.message })
   }
 })
@@ -6571,89 +6556,60 @@ app.post("/api/admin/scraper/control", async (req, res) => {
     const runId = String(req.body?.run_id || "").trim()
     const action = String(req.body?.action || "").trim().toLowerCase()
 
-    const allowedActions = [
-      "pause",
-      "resume",
-      "stop_discovery",
-      "stop_all",
-      "clear_queue",
-    ]
-
-    if (!runId || !allowedActions.includes(action)) {
+    if (
+      !runId ||
+      !["pause", "resume", "stop_discovery", "clear_results"].includes(
+        action
+      )
+    ) {
       return res.status(400).json({
         error:
-          "Provide run_id and action: pause, resume, stop_discovery, stop_all, or clear_queue.",
+          "Provide run_id and action: pause, resume, stop_discovery, or clear_results.",
       })
     }
 
-    if (action === "clear_queue") {
-      const { count: clearableCount, error: countError } =
-        await supabaseAdmin
-          .from("scraper_queue")
-          .select("id", { count: "exact", head: true })
-          .eq("run_id", runId)
-          .in("status", [
-            "queued",
-            "processing",
-            "failed",
-            "duplicate",
-            "stopped",
-          ])
+    if (action === "clear_results") {
+      const { count, error: countError } = await supabaseAdmin
+        .from("scraper_queue")
+        .select("id", { count: "exact", head: true })
+        .eq("run_id", runId)
 
       if (countError) throw countError
-
-      const { error: resetProcessingError } = await supabaseAdmin
-        .from("scraper_queue")
-        .update({
-          status: "queued",
-          stage: "queued",
-          started_at: null,
-          updated_at: new Date().toISOString(),
-        })
-        .eq("run_id", runId)
-        .eq("status", "processing")
-
-      if (resetProcessingError) throw resetProcessingError
 
       const { error: deleteError } = await supabaseAdmin
         .from("scraper_queue")
         .delete()
         .eq("run_id", runId)
-        .in("status", [
-          "queued",
-          "failed",
-          "duplicate",
-          "stopped",
-        ])
 
       if (deleteError) throw deleteError
 
-      const counters = await refreshScraperRunCounters(runId)
-
-      const { error: runUpdateError } = await supabaseAdmin
+      const { error: runError } = await supabaseAdmin
         .from("scraper_runs")
         .update({
           status: "cleared",
-          current_stage: "queue_cleared",
+          current_stage: "results_cleared",
           current_link: null,
           discovery_stop_requested: true,
           stop_all_requested: true,
-          retry_after_seconds: 0,
+          discovered_count: 0,
+          queued_count: 0,
+          processed_count: 0,
+          created_count: 0,
+          duplicate_count: 0,
+          failed_count: 0,
           updated_at: new Date().toISOString(),
         })
         .eq("id", runId)
 
-      if (runUpdateError) throw runUpdateError
+      if (runError) throw runError
 
       await logScraperEvent({
         runId,
         level: "warning",
-        stage: "queue_cleared",
-        message: `Cleared ${Number(
-          clearableCount || 0
-        )} remaining queue item(s). Created listings were preserved.`,
+        stage: "results_cleared",
+        message: `Cleared ${Number(count || 0)} discovered link(s).`,
         metadata: {
-          cleared_count: Number(clearableCount || 0),
+          cleared_count: Number(count || 0),
           requested_by: user.id,
         },
       })
@@ -6661,88 +6617,58 @@ app.post("/api/admin/scraper/control", async (req, res) => {
       return res.json({
         ok: true,
         action,
-        cleared_count: Number(clearableCount || 0),
-        counters,
+        cleared_count: Number(count || 0),
       })
     }
 
-    let updatePayload = {
-      updated_at: new Date().toISOString(),
-    }
+    const update =
+      action === "pause"
+        ? {
+            status: "paused",
+            current_stage: "paused",
+          }
+        : action === "resume"
+          ? {
+              status: "scraping",
+              current_stage: "resuming_discovery",
+              discovery_stop_requested: false,
+              stop_all_requested: false,
+            }
+          : {
+              status: "stopped",
+              current_stage: "discovery_stopped",
+              discovery_stop_requested: true,
+              stop_all_requested: true,
+            }
 
-    if (action === "pause") {
-      updatePayload = {
-        ...updatePayload,
-        status: "paused",
-        current_stage: "paused",
-      }
-    }
-
-    if (action === "resume") {
-      updatePayload = {
-        ...updatePayload,
-        status: "importing",
-        current_stage: "resuming_queue",
-        stop_all_requested: false,
-        retry_after_seconds: 0,
-      }
-    }
-
-    if (action === "stop_discovery") {
-      updatePayload = {
-        ...updatePayload,
-        discovery_stop_requested: true,
-        current_stage: "discovery_stopping",
-      }
-    }
-
-    if (action === "stop_all") {
-      updatePayload = {
-        ...updatePayload,
-        status: "stopped",
-        current_stage: "stopped",
-        current_link: null,
-        discovery_stop_requested: true,
-        stop_all_requested: true,
-      }
-    }
-
-    const { data: updatedRun, error: runError } = await supabaseAdmin
+    const { data: run, error } = await supabaseAdmin
       .from("scraper_runs")
-      .update(updatePayload)
+      .update({
+        ...update,
+        updated_at: new Date().toISOString(),
+      })
       .eq("id", runId)
       .select("*")
       .single()
 
-    if (runError) throw runError
+    if (error) throw error
 
     await logScraperEvent({
       runId,
-      level:
-        action === "stop_all" || action === "stop_discovery"
-          ? "warning"
-          : "info",
-      stage: `run_${action}`,
+      level: action === "stop_discovery" ? "warning" : "info",
+      stage: `discovery_${action}`,
       message:
         action === "pause"
-          ? "Queue paused after the current listing."
+          ? "Discovery paused after the current ratings page."
           : action === "resume"
-            ? "Existing queue resumed without scraping TGStat again."
-            : action === "stop_discovery"
-              ? "TGStat discovery stop requested. Existing queue will continue importing."
-              : "All work stopped. Remaining queue was preserved.",
-      metadata: {
-        requested_by: user.id,
-      },
+            ? "Discovery resumed from the next ratings source."
+            : "Discovery stopped. Existing results were preserved for review.",
+      metadata: { requested_by: user.id },
     })
 
-    return res.json({
-      ok: true,
-      action,
-      run: updatedRun,
-    })
+    return res.json({ ok: true, action, run })
   } catch (err) {
-    console.error("Scraper control failed:", err)
+    console.error("Discovery control failed:", err)
     return res.status(500).json({ error: err.message })
   }
 })
@@ -6964,6 +6890,61 @@ app.post("/api/scraper/agent/heartbeat", async (req, res) => {
   }
 })
 
+
+function normalizedTelegramUsername(value) {
+  const cleaned = cleanImportTelegramLink(value)
+  if (!cleaned) return ""
+
+  try {
+    const url = new URL(cleaned)
+    return String(url.pathname || "")
+      .replace(/^\/+/, "")
+      .split(/[/?#]/)[0]
+      .replace(/^@/, "")
+      .trim()
+      .toLowerCase()
+  } catch {
+    return String(value || "")
+      .replace(/^https?:\/\/(?:www\.)?t\.me\//i, "")
+      .replace(/^@/, "")
+      .split(/[/?#]/)[0]
+      .trim()
+      .toLowerCase()
+  }
+}
+
+async function loadExistingTelegramUsernames() {
+  const usernames = new Set()
+  const pageSize = 1000
+  let offset = 0
+
+  while (true) {
+    const { data, error } = await supabaseAdmin
+      .from("channel_listings")
+      .select(
+        "telegram_username, telegram_link, short_invite, old_slug, slug"
+      )
+      .range(offset, offset + pageSize - 1)
+
+    if (error) throw error
+
+    for (const listing of data || []) {
+      for (const value of [
+        listing.telegram_username,
+        listing.telegram_link,
+      ]) {
+        const username = normalizedTelegramUsername(value)
+        if (username) usernames.add(username)
+      }
+    }
+
+    if (!data || data.length < pageSize) break
+    offset += pageSize
+  }
+
+  return usernames
+}
+
 app.post("/api/scraper/agent/discovered", async (req, res) => {
   try {
     if (!requireScraperAgent(req, res)) return
@@ -6975,56 +6956,199 @@ app.post("/api/scraper/agent/discovered", async (req, res) => {
       return res.status(400).json({ error: "Missing run_id or rows." })
     }
 
-    const queueRows = rows
-      .map((row) => ({
+    const existingUsernames = await loadExistingTelegramUsernames()
+    const seenBatch = new Set()
+
+    let invalidCount = 0
+    let existingCount = 0
+    let repeatedCount = 0
+
+    const queueRows = []
+
+    for (const row of rows) {
+      const telegramLink = cleanImportTelegramLink(
+        row.telegram_link || row.username
+      )
+      const username = normalizedTelegramUsername(telegramLink)
+
+      if (!telegramLink || !username) {
+        invalidCount += 1
+        continue
+      }
+
+      if (existingUsernames.has(username)) {
+        existingCount += 1
+        continue
+      }
+
+      if (seenBatch.has(username)) {
+        repeatedCount += 1
+        continue
+      }
+
+      seenBatch.add(username)
+
+      queueRows.push({
         run_id: runId,
-        telegram_link: cleanImportTelegramLink(
-          row.telegram_link || row.username
-        ),
-        username: row.username || null,
-        title: row.title || null,
+        telegram_link: `https://t.me/${username}`,
+        username: `@${username}`,
+        title: row.title || username,
         subscribers: Number(row.subscribers || 0),
         category: row.category || null,
         avatar_url: row.avatar_url || null,
         source_url: row.tgstat_url || null,
         source_page: Number(row.source_page || 0),
-        status: "queued",
-        stage: "discovered",
-      }))
-      .filter((row) => row.telegram_link)
-
-    const { data: inserted, error } = await supabaseAdmin
-      .from("scraper_queue")
-      .upsert(queueRows, {
-        onConflict: "run_id,telegram_link",
-        ignoreDuplicates: true,
+        status: "ready_for_ai",
+        stage: "ready_for_ai",
+        result: {
+          source_type: row.source_type || null,
+          source_sort: row.source_sort || null,
+          source_category: row.category || null,
+        },
       })
-      .select("id, telegram_link")
+    }
 
-    if (error) throw error
+    let inserted = []
 
-    const counts = await refreshScraperRunCounters(runId)
+    if (queueRows.length) {
+      const result = await supabaseAdmin
+        .from("scraper_queue")
+        .upsert(queueRows, {
+          onConflict: "run_id,telegram_link",
+          ignoreDuplicates: true,
+        })
+        .select("id, telegram_link")
+
+      if (result.error) throw result.error
+      inserted = result.data || []
+    }
+
+    const runDuplicates =
+      Math.max(0, queueRows.length - inserted.length) + repeatedCount
+
+    const { count: totalReady, error: readyError } =
+      await supabaseAdmin
+        .from("scraper_queue")
+        .select("id", { count: "exact", head: true })
+        .eq("run_id", runId)
+        .eq("status", "ready_for_ai")
+
+    if (readyError) throw readyError
+
+    const { error: runError } = await supabaseAdmin
+      .from("scraper_runs")
+      .update({
+        status: "scraping",
+        current_stage: "ready_for_ai",
+        discovered_count: Number(totalReady || 0),
+        queued_count: Number(totalReady || 0),
+        duplicate_count:
+          Number(existingCount || 0) + Number(runDuplicates || 0),
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", runId)
+
+    if (runError) throw runError
 
     await logScraperEvent({
       runId,
       level: "success",
-      stage: "page_discovered",
-      message: `Queued ${inserted?.length || 0} new Telegram links.`,
+      stage: "links_filtered",
+      message: `${inserted.length} new link(s) added to Ready to Send to AI.`,
       metadata: {
-        received: rows.length,
-        inserted: inserted?.length || 0,
-        total_discovered: counts.total,
+        cards_received: rows.length,
+        new_links: inserted.length,
+        existing_on_telehub: existingCount,
+        repeated_in_run: runDuplicates,
+        invalid: invalidCount,
+        total_ready_for_ai: Number(totalReady || 0),
       },
     })
 
     return res.json({
       ok: true,
       received: rows.length,
-      inserted: inserted?.length || 0,
-      counters: counts,
+      inserted: inserted.length,
+      existing: existingCount,
+      duplicates: runDuplicates,
+      invalid: invalidCount,
+      total_ready_for_ai: Number(totalReady || 0),
+      counters: {
+        total: Number(totalReady || 0),
+        queued: Number(totalReady || 0),
+        processing: 0,
+        created: 0,
+        duplicate: Number(existingCount || 0) + Number(runDuplicates || 0),
+        failed: invalidCount,
+      },
     })
   } catch (err) {
-    console.error("Scraper discovered batch failed:", err)
+    console.error("Discovery filter failed:", err)
+    return res.status(500).json({ error: err.message })
+  }
+})
+
+
+app.post("/api/scraper/agent/discovery-complete", async (req, res) => {
+  try {
+    if (!requireScraperAgent(req, res)) return
+
+    const runId = String(req.body?.run_id || "").trim()
+    const stopped = req.body?.stopped === true
+
+    if (!runId) {
+      return res.status(400).json({ error: "Missing run_id." })
+    }
+
+    const { count: readyCount, error: countError } =
+      await supabaseAdmin
+        .from("scraper_queue")
+        .select("id", { count: "exact", head: true })
+        .eq("run_id", runId)
+        .eq("status", "ready_for_ai")
+
+    if (countError) throw countError
+
+    const nextStatus = stopped ? "stopped" : "completed"
+
+    const { error: runError } = await supabaseAdmin
+      .from("scraper_runs")
+      .update({
+        status: nextStatus,
+        current_stage: "ready_for_ai",
+        current_link: null,
+        discovered_count: Number(readyCount || 0),
+        queued_count: Number(readyCount || 0),
+        processed_count: 0,
+        created_count: 0,
+        failed_count: 0,
+        updated_at: new Date().toISOString(),
+        completed_at: new Date().toISOString(),
+      })
+      .eq("id", runId)
+
+    if (runError) throw runError
+
+    await logScraperEvent({
+      runId,
+      level: "success",
+      stage: "discovery_complete",
+      message: `${Number(
+        readyCount || 0
+      )} new link(s) are ready for manual AI import.`,
+      metadata: {
+        ready_for_ai: Number(readyCount || 0),
+        stopped,
+      },
+    })
+
+    return res.json({
+      ok: true,
+      status: nextStatus,
+      ready_for_ai: Number(readyCount || 0),
+    })
+  } catch (err) {
+    console.error("Complete discovery failed:", err)
     return res.status(500).json({ error: err.message })
   }
 })
