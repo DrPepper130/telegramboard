@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 })
 
 const BACKEND_BUILD_ID =
-  "telehub-20-link-diverse-descriptions-2026-07-24"
+  "telehub-tlgrm-scraper-2026-07-24"
 
 app.get("/", (req, res) => {
   res.status(200).json({
@@ -6942,7 +6942,7 @@ app.post("/api/admin/scraper/start", async (req, res) => {
     const { data: run, error: runError } = await supabaseAdmin
       .from("scraper_runs")
       .insert({
-        source: "tgstat_ratings_discovery",
+        source: "tlgrm_directory_discovery",
         status: "queued",
         requested_target: target,
         country_id: "",
@@ -7669,7 +7669,7 @@ app.post("/api/scraper/agent/discovered", async (req, res) => {
         subscribers: Number(row.subscribers || 0),
         category: row.category || null,
         avatar_url: row.avatar_url || null,
-        source_url: row.tgstat_url || null,
+        source_url: row.source_url || row.tlgrm_url || row.tgstat_url || null,
         source_page: Number(row.source_page || 0),
         status: "ready_for_ai",
         stage: "ready_for_ai",
@@ -7678,7 +7678,8 @@ app.post("/api/scraper/agent/discovered", async (req, res) => {
           source_sort: row.source_sort || null,
           source_category: row.category || null,
           source_visibility: row.source_visibility || null,
-          ratings_source_url: row.ratings_source_url || null,
+          ratings_source_url:
+            row.source_page_url || row.ratings_source_url || null,
         },
       })
     }
