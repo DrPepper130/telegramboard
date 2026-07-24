@@ -6922,7 +6922,7 @@ async function loadExistingTelegramUsernames() {
     const { data, error } = await supabaseAdmin
       .from("channel_listings")
       .select(
-        "telegram_username, telegram_link, short_invite, old_slug, slug"
+        "telegram_username, telegram_link, short_invite"
       )
       .range(offset, offset + pageSize - 1)
 
@@ -6932,6 +6932,7 @@ async function loadExistingTelegramUsernames() {
       for (const value of [
         listing.telegram_username,
         listing.telegram_link,
+        listing.short_invite,
       ]) {
         const username = normalizedTelegramUsername(value)
         if (username) usernames.add(username)
