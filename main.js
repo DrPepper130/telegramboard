@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 })
 
 const BACKEND_BUILD_ID =
-  "telehub-local-english-filter-command-fix-2026-07-24"
+  "telehub-local-english-filter-cleantext-fix-2026-07-24"
 
 app.get("/", (req, res) => {
   res.status(200).json({
@@ -7353,6 +7353,12 @@ const ENGLISH_TOPIC_WORDS = new Set([
 const COMMON_ENGLISH_WORDS = new Set([
   "able","account","across","action","activity","actually","add","again","against","air","almost","along","already","also","always","american","another","any","anyone","anything","around","ask","available","away","back","based","before","best","better","big","book","both","brand","bring","build","built","call","care","case","check","city","class","come","content","country","course","create","current","day","days","detail","different","done","each","easy","end","enjoy","event","every","everything","example","experience","family","fast","find","first","follow","found","friends","full","general","get","give","good","great","group","guide","help","high","home","idea","info","information","join","keep","know","latest","learn","life","like","live","look","made","make","market","media","member","message","money","more","most","move","music","need","network","next","now","open","other","page","part","people","place","plan","post","public","quick","real","release","report","right","school","service","share","show","simple","small","social","start","step","story","system","team","tech","things","time","today","top","topic","update","use","user","video","view","watch","way","week","welcome","what","when","where","work","world"
 ])
+
+function cleanText(value) {
+  return String(value || "")
+    .replace(/\s+/g, " ")
+    .trim()
+}
 
 function normalizeLanguageText(value) {
   return String(value || "")
