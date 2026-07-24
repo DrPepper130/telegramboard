@@ -6554,7 +6554,15 @@ app.post("/api/admin/scraper/control", async (req, res) => {
     }
 
     const runId = String(req.body?.run_id || "").trim()
-    const action = String(req.body?.action || "").trim().toLowerCase()
+    const rawAction = String(req.body?.action || "").trim().toLowerCase()
+
+    // Backward compatibility with the older Framer command center.
+    const action =
+      rawAction === "stop_all"
+        ? "stop_discovery"
+        : rawAction === "clear_queue"
+          ? "clear_results"
+          : rawAction
 
     if (
       !runId ||
@@ -6564,7 +6572,7 @@ app.post("/api/admin/scraper/control", async (req, res) => {
     ) {
       return res.status(400).json({
         error:
-          "Provide run_id and action: pause, resume, stop_discovery, or clear_results.",
+          "Provide run_id and action: pause, resume, stop_discovery, clear_results, stop_all, or clear_queue.",
       })
     }
 
@@ -6617,6 +6625,7 @@ app.post("/api/admin/scraper/control", async (req, res) => {
       return res.json({
         ok: true,
         action,
+        requested_action: rawAction,
         cleared_count: Number(count || 0),
       })
     }
@@ -6666,7 +6675,7 @@ app.post("/api/admin/scraper/control", async (req, res) => {
       metadata: { requested_by: user.id },
     })
 
-    return res.json({ ok: true, action, run })
+    return res.json({ ok: true, action, requested_action: rawAction, run })
   } catch (err) {
     console.error("Discovery control failed:", err)
     return res.status(500).json({ error: err.message })
@@ -6952,6 +6961,14 @@ app.post("/api/scraper/agent/discovered", async (req, res) => {
 
     const runId = String(req.body?.run_id || "").trim()
     const rows = Array.isArray(req.body?.rows) ? req.body.rows : []
+    const requestedMaxNew = Number(req.body?.max_new || rows.length)
+    const maxNew = Math.max(
+      1,
+      Math.min(
+        Number.isFinite(requestedMaxNew) ? requestedMaxNew : rows.length,
+        rows.length
+      )
+    )
 
     if (!runId || !rows.length) {
       return res.status(400).json({ error: "Missing run_id or rows." })
@@ -6989,6 +7006,8 @@ app.post("/api/scraper/agent/discovered", async (req, res) => {
 
       seenBatch.add(username)
 
+      if (queueRows.length >= maxNew) break
+
       queueRows.push({
         run_id: runId,
         telegram_link: `https://t.me/${username}`,
@@ -7005,6 +7024,8 @@ app.post("/api/scraper/agent/discovered", async (req, res) => {
           source_type: row.source_type || null,
           source_sort: row.source_sort || null,
           source_category: row.category || null,
+          source_visibility: row.source_visibility || null,
+          ratings_source_url: row.ratings_source_url || null,
         },
       })
     }
@@ -7063,6 +7084,7 @@ app.post("/api/scraper/agent/discovered", async (req, res) => {
         repeated_in_run: runDuplicates,
         invalid: invalidCount,
         total_ready_for_ai: Number(totalReady || 0),
+        max_new_requested: maxNew,
       },
     })
 
