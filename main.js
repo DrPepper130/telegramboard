@@ -6252,22 +6252,6 @@ async function findDuplicateImportListing({ telegramChatId, telegramUsername, te
   return null
 }
 
-function shouldRejectNonLatinTelegramTitle(title) {
-  const cleanTitle = String(title || "").trim()
-
-  // Check only the title Telegram returned. Never inspect the t.me URL,
-  // invite link, or username because those are normally Latin characters.
-  const letters = cleanTitle.match(/\p{L}/gu) || []
-
-  // Do not reject titles consisting only of numbers, symbols, or emojis.
-  if (!letters.length) return false
-
-  const latinLetters = cleanTitle.match(/\p{Script=Latin}/gu) || []
-
-  // Reject only when the title contains letters and every letter is non-Latin.
-  return latinLetters.length === 0
-}
-
 async function importSingleTelegramListing(
   link,
   options,
@@ -6310,26 +6294,6 @@ async function importSingleTelegramListing(
     }
   }
 
-  if (shouldRejectNonLatinTelegramTitle(chat.title)) {
-    await onStage("title_filtered", {
-      reason: "non_latin_telegram_title",
-      telegram_title: chat.title || "",
-      listing_type: listingType,
-    })
-
-    return {
-      ok: true,
-      created: false,
-      skipped: true,
-      filtered: true,
-      reason: "non_latin_telegram_title",
-      link: telegramLink,
-      telegram_title: chat.title || "",
-      telegram_username: cleanUsername(chat.username) || username,
-      listing_type: listingType,
-    }
-  }
-
   const telegramUsername = cleanUsername(chat.username) || username
   const normalizedTelegramLink = chat.username
     ? `https://t.me/${chat.username}`
@@ -6353,8 +6317,34 @@ async function importSingleTelegramListing(
     }
   }
 
-  const memberCount = await tg("getChatMemberCount", { chat_id: chat.id })
   const telegramDescription = chat.description || chat.bio || ""
+  const languageCheck = analyzeLikelyEnglishListingContent({
+    title: chat.title || telegramUsername,
+    description: telegramDescription,
+  })
+
+  if (!languageCheck.isEnglish) {
+    await onStage("language_filtered", {
+      telegram_username: telegramUsername,
+      telegram_title: chat.title || null,
+      reason: languageCheck.reason,
+      language_check: languageCheck,
+    })
+
+    return {
+      ok: true,
+      skipped: true,
+      filtered: true,
+      reason: "non_english",
+      error: "Listing filtered because the Telegram title/content does not look English.",
+      link: normalizedTelegramLink,
+      telegram_username: telegramUsername,
+      telegram_title: chat.title || null,
+      language_check: languageCheck,
+    }
+  }
+
+  const memberCount = await tg("getChatMemberCount", { chat_id: chat.id })
 
   await onStage("telegram_metadata", {
     telegram_username: telegramUsername,
@@ -6655,10 +6645,7 @@ app.post("/api/admin/import-telegram-listings", async (req, res) => {
       total_received: links.length,
       processed: processedCount,
       created: results.filter((item) => item.created).length,
-      duplicates: results.filter(
-        (item) => item.skipped && !item.filtered
-      ).length,
-      filtered: results.filter((item) => item.filtered).length,
+      duplicates: results.filter((item) => item.skipped).length,
       failed: results.filter((item) => item.ok === false).length,
       framer_synced: results.filter((item) => item.framer_synced).length,
       deployed,
@@ -7305,6 +7292,268 @@ function normalizedTelegramUsername(value) {
   }
 }
 
+
+const ENGLISH_FUNCTION_WORDS = new Set([
+  "a","about","after","all","and","are","as","at","be","but","by","for","from","in","into","is","it","its","of","on","or","our","the","their","this","to","with","your","you","we","an","new","official","daily"
+])
+
+const ENGLISH_TOPIC_WORDS = new Set([
+  "active","alerts","analysis","anime","app","apps","art","beauty","bitcoin","blockchain","blog","books","business","call","calls","career","channel","chat","chats","children","club","coding","coin","coins","community","course","courses","crypto","daily","deals","design","discussion","download","education","english","entertainment","fashion","film","finance","fitness","food","forex","free","fun","game","games","gaming","group","guide","guides","health","humor","jobs","learn","learning","magazine","marketing","media","members","memes","music","news","official","photos","podcast","politics","quotes","recipes","resources","sales","science","series","signals","software","sport","sports","startup","stocks","study","support","tech","technology","tips","trading","travel","updates","video","videos","voice","wallet","web3"
+])
+
+const COMMON_ENGLISH_WORDS = new Set([
+  "able","account","across","action","activity","actually","add","again","against","air","almost","along","already","also","always","american","another","any","anyone","anything","around","ask","available","away","back","based","before","best","better","big","book","both","brand","bring","build","built","call","care","case","check","city","class","come","content","country","course","create","current","day","days","detail","different","done","each","easy","end","enjoy","event","every","everything","example","experience","family","fast","find","first","follow","found","friends","full","general","get","give","good","great","group","guide","help","high","home","idea","info","information","join","keep","know","latest","learn","life","like","live","look","made","make","market","media","member","message","money","more","most","move","music","need","network","next","now","open","other","page","part","people","place","plan","post","public","quick","real","release","report","right","school","service","share","show","simple","small","social","start","step","story","system","team","tech","things","time","today","top","topic","update","use","user","video","view","watch","way","week","welcome","what","when","where","work","world"
+])
+
+function normalizeLanguageText(value) {
+  return String(value || "")
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+}
+
+function extractLanguageTokens(value) {
+  return normalizeLanguageText(value)
+    .toLowerCase()
+    .replace(/[^a-z'\-\s]/g, " ")
+    .split(/\s+/)
+    .map((token) => token.replace(/^['-]+|['-]+$/g, ""))
+    .filter(Boolean)
+}
+
+function countScriptLetters(value) {
+  const counts = {
+    latin: 0,
+    cyrillic: 0,
+    arabic: 0,
+    hebrew: 0,
+    greek: 0,
+    other: 0,
+  }
+
+  for (const char of String(value || "")) {
+    if (!/\p{L}/u.test(char)) continue
+
+    if (/\p{Script=Latin}/u.test(char)) counts.latin += 1
+    else if (/\p{Script=Cyrillic}/u.test(char)) counts.cyrillic += 1
+    else if (/\p{Script=Arabic}/u.test(char)) counts.arabic += 1
+    else if (/\p{Script=Hebrew}/u.test(char)) counts.hebrew += 1
+    else if (/\p{Script=Greek}/u.test(char)) counts.greek += 1
+    else counts.other += 1
+  }
+
+  counts.total =
+    counts.latin +
+    counts.cyrillic +
+    counts.arabic +
+    counts.hebrew +
+    counts.greek +
+    counts.other
+
+  counts.non_latin = counts.total - counts.latin
+  return counts
+}
+
+function countTokenMatches(tokens, dictionary) {
+  let count = 0
+  for (const token of tokens) {
+    if (dictionary.has(token)) count += 1
+  }
+  return count
+}
+
+function analyzeDiscoveryEnglishTitle(title) {
+  const cleanTitle = cleanText(title)
+  const scripts = countScriptLetters(cleanTitle)
+  const tokens = extractLanguageTokens(cleanTitle)
+  const functionHits = countTokenMatches(tokens, ENGLISH_FUNCTION_WORDS)
+  const topicHits = countTokenMatches(tokens, ENGLISH_TOPIC_WORDS)
+  const commonHits = countTokenMatches(tokens, COMMON_ENGLISH_WORDS)
+
+  if (!cleanTitle) {
+    return {
+      isEnglish: false,
+      reason: "empty_title",
+      scripts,
+      token_count: 0,
+      function_hits: 0,
+      topic_hits: 0,
+      common_hits: 0,
+    }
+  }
+
+  if (scripts.total > 0 && scripts.latin === 0) {
+    return {
+      isEnglish: false,
+      reason: "title_is_non_latin",
+      scripts,
+      token_count: tokens.length,
+      function_hits: functionHits,
+      topic_hits: topicHits,
+      common_hits: commonHits,
+    }
+  }
+
+  if (
+    scripts.total > 0 &&
+    scripts.non_latin >= 4 &&
+    scripts.non_latin / scripts.total >= 0.35
+  ) {
+    return {
+      isEnglish: false,
+      reason: "title_mixed_with_heavy_non_latin",
+      scripts,
+      token_count: tokens.length,
+      function_hits: functionHits,
+      topic_hits: topicHits,
+      common_hits: commonHits,
+    }
+  }
+
+  if (tokens.length === 1) {
+    return {
+      isEnglish: true,
+      ambiguous: true,
+      reason: "single_latin_word_allowed",
+      scripts,
+      token_count: 1,
+      function_hits: functionHits,
+      topic_hits: topicHits,
+      common_hits: commonHits,
+    }
+  }
+
+  const evidence = functionHits + topicHits + commonHits
+
+  if (functionHits >= 1 || topicHits >= 1 || commonHits >= 2) {
+    return {
+      isEnglish: true,
+      ambiguous: false,
+      reason: "title_has_english_signal",
+      scripts,
+      token_count: tokens.length,
+      function_hits: functionHits,
+      topic_hits: topicHits,
+      common_hits: commonHits,
+      evidence,
+    }
+  }
+
+  return {
+    isEnglish: false,
+    reason: "multiword_title_without_english_signal",
+    scripts,
+    token_count: tokens.length,
+    function_hits: functionHits,
+    topic_hits: topicHits,
+    common_hits: commonHits,
+    evidence,
+  }
+}
+
+function analyzeLikelyEnglishListingContent({ title, description }) {
+  const titleAnalysis = analyzeDiscoveryEnglishTitle(title)
+
+  if (
+    !titleAnalysis.isEnglish &&
+    ["title_is_non_latin", "title_mixed_with_heavy_non_latin", "multiword_title_without_english_signal"].includes(
+      titleAnalysis.reason
+    )
+  ) {
+    return {
+      isEnglish: false,
+      reason: titleAnalysis.reason,
+      title_analysis: titleAnalysis,
+    }
+  }
+
+  const combinedText = cleanText(`${title || ""} ${description || ""}`)
+  const scripts = countScriptLetters(combinedText)
+  const tokens = extractLanguageTokens(combinedText)
+  const functionHits = countTokenMatches(tokens, ENGLISH_FUNCTION_WORDS)
+  const topicHits = countTokenMatches(tokens, ENGLISH_TOPIC_WORDS)
+  const commonHits = countTokenMatches(tokens, COMMON_ENGLISH_WORDS)
+  const evidence = functionHits + topicHits + commonHits
+
+  if (scripts.total > 0 && scripts.latin === 0) {
+    return {
+      isEnglish: false,
+      reason: "content_is_non_latin",
+      scripts,
+      token_count: tokens.length,
+      function_hits: functionHits,
+      topic_hits: topicHits,
+      common_hits: commonHits,
+      evidence,
+      title_analysis: titleAnalysis,
+    }
+  }
+
+  if (
+    scripts.total > 0 &&
+    scripts.non_latin >= 6 &&
+    scripts.non_latin / scripts.total >= 0.3
+  ) {
+    return {
+      isEnglish: false,
+      reason: "content_has_heavy_non_latin",
+      scripts,
+      token_count: tokens.length,
+      function_hits: functionHits,
+      topic_hits: topicHits,
+      common_hits: commonHits,
+      evidence,
+      title_analysis: titleAnalysis,
+    }
+  }
+
+  if (
+    functionHits >= 2 ||
+    (functionHits >= 1 && topicHits >= 1) ||
+    topicHits >= 2 ||
+    commonHits >= 4 ||
+    evidence >= 5
+  ) {
+    return {
+      isEnglish: true,
+      reason: "content_has_english_signal",
+      scripts,
+      token_count: tokens.length,
+      function_hits: functionHits,
+      topic_hits: topicHits,
+      common_hits: commonHits,
+      evidence,
+      title_analysis: titleAnalysis,
+    }
+  }
+
+  if (titleAnalysis.isEnglish && titleAnalysis.ambiguous && !description) {
+    return {
+      isEnglish: true,
+      ambiguous: true,
+      reason: "single_word_title_without_description_allowed",
+      scripts,
+      token_count: tokens.length,
+      function_hits: functionHits,
+      topic_hits: topicHits,
+      common_hits: commonHits,
+      evidence,
+      title_analysis: titleAnalysis,
+    }
+  }
+
+  return {
+    isEnglish: false,
+    reason: "not_enough_english_signal",
+    scripts,
+    token_count: tokens.length,
+    function_hits: functionHits,
+    topic_hits: topicHits,
+    common_hits: commonHits,
+    evidence,
+    title_analysis: titleAnalysis,
+  }
+}
+
 async function loadExistingTelegramUsernames() {
   const usernames = new Set()
   const pageSize = 1000
@@ -7387,6 +7636,15 @@ app.post("/api/scraper/agent/discovered", async (req, res) => {
         continue
       }
 
+      const discoveryLanguageCheck = analyzeDiscoveryEnglishTitle(
+        row.title || username
+      )
+
+      if (!discoveryLanguageCheck.isEnglish) {
+        invalidCount += 1
+        continue
+      }
+
       seenBatch.add(username)
 
       if (queueRows.length >= maxNew) break
@@ -7465,7 +7723,9 @@ app.post("/api/scraper/agent/discovered", async (req, res) => {
         new_links: inserted.length,
         existing_on_telehub: existingCount,
         repeated_in_run: runDuplicates,
-        invalid: invalidCount,
+        filtered_or_invalid: invalidCount,
+        filter_note:
+          "Only listings with likely English titles are added to Ready to Send to AI.",
         total_ready_for_ai: Number(totalReady || 0),
         max_new_requested: maxNew,
       },
@@ -7667,6 +7927,8 @@ app.post("/api/scraper/agent/process-next", async (req, res) => {
         `${Number(data.member_count || 0).toLocaleString()} members · ${
           data.listing_type || "unknown type"
         } · avatar ${data.avatar_available ? "available" : "not found"}`,
+      language_filtered: (data) =>
+        `Filtered as non-English: ${data.reason || "language filter"}`,
       ai_generation_started: () =>
         "Generating display content, categories, safety label, and SEO fields.",
       ai_generated: (data) =>
@@ -7700,6 +7962,7 @@ app.post("/api/scraper/agent/process-next", async (req, res) => {
         const queueStageMap = {
           telegram_verified: "telegram_verified",
           telegram_metadata: "telegram_verified",
+          language_filtered: "filtered",
           ai_generation_started: "ai_generation",
           ai_generated: "ai_generated",
           slug_selected: "slug_selected",
@@ -7756,13 +8019,23 @@ app.post("/api/scraper/agent/process-next", async (req, res) => {
       }
     )
 
-    const finalStatus = result.skipped ? "duplicate" : "created"
+    const finalStatus = result.filtered
+      ? "failed"
+      : result.skipped
+        ? "duplicate"
+        : "created"
+
+    const finalStage = result.filtered
+      ? "filtered"
+      : result.skipped
+        ? "duplicate"
+        : "completed"
 
     const { error: queueUpdateError } = await supabaseAdmin
       .from("scraper_queue")
       .update({
         status: finalStatus,
-        stage: result.skipped ? "duplicate" : "completed",
+        stage: finalStage,
         listing_id: result.listing_id || result.existing_listing_id || null,
         result,
         framer_synced: Boolean(result.framer_synced),
@@ -7776,11 +8049,17 @@ app.post("/api/scraper/agent/process-next", async (req, res) => {
 
     await logScraperEvent({
       runId,
-      level: result.skipped ? "warning" : "success",
-      stage: result.skipped ? "duplicate" : "listing_created",
-      message: result.skipped
-        ? `Duplicate skipped: ${result.existing_name || queueItem.telegram_link}`
-        : `Listing created: ${result.channel_name || queueItem.telegram_link}`,
+      level: result.filtered ? "warning" : result.skipped ? "warning" : "success",
+      stage: result.filtered
+        ? "language_filtered"
+        : result.skipped
+          ? "duplicate"
+          : "listing_created",
+      message: result.filtered
+        ? `Filtered non-English listing: ${result.telegram_title || queueItem.telegram_link}`
+        : result.skipped
+          ? `Duplicate skipped: ${result.existing_name || queueItem.telegram_link}`
+          : `Listing created: ${result.channel_name || queueItem.telegram_link}`,
       telegramLink: queueItem.telegram_link,
       listingId: result.listing_id || result.existing_listing_id || null,
       metadata: result,
