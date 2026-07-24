@@ -5919,7 +5919,12 @@ async function findDuplicateImportListing({ telegramChatId, telegramUsername, te
   return null
 }
 
-async function importSingleTelegramListing(link, options, adminUser) {
+async function importSingleTelegramListing(
+  link,
+  options,
+  adminUser,
+  onStage = async () => {}
+) {
   const telegramLink = cleanImportTelegramLink(link)
 
   if (!telegramLink) {
@@ -5938,6 +5943,15 @@ async function importSingleTelegramListing(link, options, adminUser) {
 
   const chat = await tg("getChat", { chat_id: username })
   const listingType = normalizeTelegramType(chat.type)
+
+  await onStage("telegram_verified", {
+    telegram_username: cleanUsername(chat.username) || username,
+    telegram_title: chat.title || null,
+    telegram_description: chat.description || chat.bio || "",
+    listing_type: listingType,
+    telegram_chat_id: String(chat.id),
+    avatar_available: Boolean(chat.photo?.big_file_id),
+  })
 
   if (!listingType) {
     return {
@@ -5973,6 +5987,19 @@ async function importSingleTelegramListing(link, options, adminUser) {
   const memberCount = await tg("getChatMemberCount", { chat_id: chat.id })
   const telegramDescription = chat.description || chat.bio || ""
 
+  await onStage("telegram_metadata", {
+    telegram_username: telegramUsername,
+    telegram_title: chat.title || null,
+    member_count: memberCount,
+    listing_type: listingType,
+    avatar_available: Boolean(chat.photo?.big_file_id),
+  })
+
+  await onStage("ai_generation_started", {
+    source_title: chat.title || telegramUsername,
+    source_description_length: telegramDescription.length,
+  })
+
   const aiContent = await generateAiImportContent({
     title: chat.title || telegramUsername,
     username: telegramUsername,
@@ -5981,8 +6008,28 @@ async function importSingleTelegramListing(link, options, adminUser) {
     listingType,
   })
 
+  await onStage("ai_generated", {
+    generated_name:
+      chat.title ||
+      stripTelegramHandle(telegramUsername) ||
+      "Telegram Listing",
+    description: aiContent.description,
+    long_description_length: String(
+      aiContent.long_description || ""
+    ).length,
+    categories: aiContent.categories,
+    is_nsfw: aiContent.is_nsfw,
+    ai_used: aiContent.ai_used,
+    ai_error: aiContent.ai_error || null,
+  })
+
   const shortInviteBase = stripTelegramHandle(telegramUsername) || chat.title || "telegram-listing"
   const shortInvite = await generateUniqueShortInviteFromBase(shortInviteBase)
+
+  await onStage("slug_selected", {
+    short_invite: shortInvite,
+    public_path: `/channel/${shortInvite}`,
+  })
 
   const insertPayload = {
     user_id: adminUser.id,
@@ -6015,6 +6062,16 @@ async function importSingleTelegramListing(link, options, adminUser) {
 
   if (insertError) throw insertError
 
+  await onStage("supabase_created", {
+    listing_id: inserted.id,
+    channel_name: insertPayload.channel_name,
+    telegram_username: telegramUsername,
+    short_invite: inserted.short_invite,
+    status: "approved",
+    categories: aiContent.categories,
+    description: aiContent.description,
+  })
+
   let iconUrl = null
   let iconError = null
 
@@ -6028,6 +6085,11 @@ async function importSingleTelegramListing(link, options, adminUser) {
   }
 
   if (iconUrl) {
+    await onStage("avatar_downloaded", {
+      icon_url: iconUrl,
+      background_applied: Boolean(options.useIconAsBackground),
+    })
+
     const { error: imageUpdateError } = await supabaseAdmin
       .from("channel_listings")
       .update({
@@ -6044,13 +6106,33 @@ async function importSingleTelegramListing(link, options, adminUser) {
   let framerError = null
 
   if (options.syncToFramer) {
+    await onStage("framer_sync_started", {
+      listing_id: inserted.id,
+      short_invite: inserted.short_invite,
+    })
+
     try {
       framerResult = await queueFramerSync(() =>
         syncListingToFramerCMS(inserted.id, { publish: false, skipTelegramSync: true })
       )
+      await onStage("framer_synced", {
+        listing_id: inserted.id,
+        short_invite: inserted.short_invite,
+        framer_synced: Boolean(framerResult?.ok),
+        public_url: `https://telehub.to/channel/${inserted.short_invite}`,
+        icon_applied: Boolean(iconUrl),
+        background_applied:
+          Boolean(iconUrl) && Boolean(options.useIconAsBackground),
+      })
     } catch (err) {
       framerError = err.message
       console.error("Auto import Framer sync failed:", err.message)
+
+      await onStage("framer_sync_failed", {
+        listing_id: inserted.id,
+        short_invite: inserted.short_invite,
+        error: framerError,
+      })
     }
   }
 
@@ -6065,6 +6147,12 @@ async function importSingleTelegramListing(link, options, adminUser) {
     listing_type: listingType,
     member_count: memberCount,
     categories: aiContent.categories,
+    description: aiContent.description,
+    long_description_length: String(aiContent.long_description || "").length,
+    is_nsfw: aiContent.is_nsfw,
+    telegram_username: telegramUsername,
+    telegram_title: chat.title || null,
+    avatar_available: Boolean(chat.photo?.big_file_id),
     ai_used: aiContent.ai_used,
     ai_error: aiContent.ai_error,
     icon_url: iconUrl,
@@ -6432,6 +6520,8 @@ app.post("/api/admin/scraper/start", async (req, res) => {
         sync_to_framer: syncToFramer,
         use_icon_as_background: useIconAsBackground,
         created_by: user.id,
+        discovery_stop_requested: false,
+        stop_all_requested: false,
         created_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
       })
@@ -6481,49 +6571,176 @@ app.post("/api/admin/scraper/control", async (req, res) => {
     const runId = String(req.body?.run_id || "").trim()
     const action = String(req.body?.action || "").trim().toLowerCase()
 
-    if (!runId || !["pause", "resume", "stop"].includes(action)) {
+    const allowedActions = [
+      "pause",
+      "resume",
+      "stop_discovery",
+      "stop_all",
+      "clear_queue",
+    ]
+
+    if (!runId || !allowedActions.includes(action)) {
       return res.status(400).json({
-        error: "Provide run_id and action: pause, resume, or stop.",
+        error:
+          "Provide run_id and action: pause, resume, stop_discovery, stop_all, or clear_queue.",
       })
     }
 
-    const nextStatus =
-      action === "pause"
-        ? "paused"
-        : action === "resume"
-          ? "scraping"
-          : "stopping"
+    if (action === "clear_queue") {
+      const { count: clearableCount, error: countError } =
+        await supabaseAdmin
+          .from("scraper_queue")
+          .select("id", { count: "exact", head: true })
+          .eq("run_id", runId)
+          .in("status", [
+            "queued",
+            "processing",
+            "failed",
+            "duplicate",
+            "stopped",
+          ])
 
-    const { error: runError } = await supabaseAdmin
-      .from("scraper_runs")
-      .update({
-        status: nextStatus,
-        updated_at: new Date().toISOString(),
+      if (countError) throw countError
+
+      const { error: resetProcessingError } = await supabaseAdmin
+        .from("scraper_queue")
+        .update({
+          status: "queued",
+          stage: "queued",
+          started_at: null,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("run_id", runId)
+        .eq("status", "processing")
+
+      if (resetProcessingError) throw resetProcessingError
+
+      const { error: deleteError } = await supabaseAdmin
+        .from("scraper_queue")
+        .delete()
+        .eq("run_id", runId)
+        .in("status", [
+          "queued",
+          "failed",
+          "duplicate",
+          "stopped",
+        ])
+
+      if (deleteError) throw deleteError
+
+      const counters = await refreshScraperRunCounters(runId)
+
+      const { error: runUpdateError } = await supabaseAdmin
+        .from("scraper_runs")
+        .update({
+          status: "cleared",
+          current_stage: "queue_cleared",
+          current_link: null,
+          discovery_stop_requested: true,
+          stop_all_requested: true,
+          retry_after_seconds: 0,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", runId)
+
+      if (runUpdateError) throw runUpdateError
+
+      await logScraperEvent({
+        runId,
+        level: "warning",
+        stage: "queue_cleared",
+        message: `Cleared ${Number(
+          clearableCount || 0
+        )} remaining queue item(s). Created listings were preserved.`,
+        metadata: {
+          cleared_count: Number(clearableCount || 0),
+          requested_by: user.id,
+        },
       })
+
+      return res.json({
+        ok: true,
+        action,
+        cleared_count: Number(clearableCount || 0),
+        counters,
+      })
+    }
+
+    let updatePayload = {
+      updated_at: new Date().toISOString(),
+    }
+
+    if (action === "pause") {
+      updatePayload = {
+        ...updatePayload,
+        status: "paused",
+        current_stage: "paused",
+      }
+    }
+
+    if (action === "resume") {
+      updatePayload = {
+        ...updatePayload,
+        status: "importing",
+        current_stage: "resuming_queue",
+        stop_all_requested: false,
+        retry_after_seconds: 0,
+      }
+    }
+
+    if (action === "stop_discovery") {
+      updatePayload = {
+        ...updatePayload,
+        discovery_stop_requested: true,
+        current_stage: "discovery_stopping",
+      }
+    }
+
+    if (action === "stop_all") {
+      updatePayload = {
+        ...updatePayload,
+        status: "stopped",
+        current_stage: "stopped",
+        current_link: null,
+        discovery_stop_requested: true,
+        stop_all_requested: true,
+      }
+    }
+
+    const { data: updatedRun, error: runError } = await supabaseAdmin
+      .from("scraper_runs")
+      .update(updatePayload)
       .eq("id", runId)
+      .select("*")
+      .single()
 
     if (runError) throw runError
 
-    const { error: commandError } = await supabaseAdmin
-      .from("scraper_commands")
-      .insert({
-        run_id: runId,
-        command: action,
-        payload: {},
-        status: "pending",
-      })
-
-    if (commandError) throw commandError
-
     await logScraperEvent({
       runId,
-      level: action === "stop" ? "warning" : "info",
+      level:
+        action === "stop_all" || action === "stop_discovery"
+          ? "warning"
+          : "info",
       stage: `run_${action}`,
-      message: `Admin requested ${action}.`,
-      metadata: { requested_by: user.id },
+      message:
+        action === "pause"
+          ? "Queue paused after the current listing."
+          : action === "resume"
+            ? "Existing queue resumed without scraping TGStat again."
+            : action === "stop_discovery"
+              ? "TGStat discovery stop requested. Existing queue will continue importing."
+              : "All work stopped. Remaining queue was preserved.",
+      metadata: {
+        requested_by: user.id,
+      },
     })
 
-    return res.json({ ok: true, run_id: runId, action })
+    return res.json({
+      ok: true,
+      action,
+      run: updatedRun,
+    })
   } catch (err) {
     console.error("Scraper control failed:", err)
     return res.status(500).json({ error: err.message })
@@ -6579,11 +6796,11 @@ app.get("/api/admin/scraper/status", async (req, res) => {
         supabaseAdmin
           .from("scraper_queue")
           .select(
-            "id, telegram_link, title, subscribers, category, status, stage, error, listing_id, framer_synced, created_at, updated_at"
+            "id, telegram_link, username, title, subscribers, category, avatar_url, status, stage, error, listing_id, framer_synced, result, created_at, updated_at"
           )
           .eq("run_id", run.id)
           .order("updated_at", { ascending: false })
-          .limit(40),
+          .limit(100),
       ])
 
     if (eventsError) throw eventsError
@@ -6692,11 +6909,19 @@ app.post("/api/scraper/agent/heartbeat", async (req, res) => {
         updated_at: new Date().toISOString(),
       })
       .eq("id", runId)
-      .select("id, status")
+      .select(
+        "id, status, discovery_stop_requested, stop_all_requested"
+      )
       .single()
 
     if (error) throw error
-    return res.json({ ok: true, status: run.status })
+    return res.json({
+      ok: true,
+      status: run.status,
+      discovery_stop_requested:
+        run.discovery_stop_requested === true,
+      stop_all_requested: run.stop_all_requested === true,
+    })
   } catch (err) {
     return res.status(500).json({ error: err.message })
   }
@@ -6790,8 +7015,17 @@ app.post("/api/scraper/agent/process-next", async (req, res) => {
       return res.json({ ok: true, paused: true })
     }
 
-    if (["stopping", "stopped", "completed", "failed"].includes(run.status)) {
-      return res.json({ ok: true, stopped: true, status: run.status })
+    if (
+      run.stop_all_requested === true ||
+      ["stopping", "stopped", "completed", "failed", "cleared"].includes(
+        run.status
+      )
+    ) {
+      return res.json({
+        ok: true,
+        stopped: true,
+        status: run.status,
+      })
     }
 
     const { data: candidate, error: candidateError } = await supabaseAdmin
@@ -6845,25 +7079,48 @@ app.post("/api/scraper/agent/process-next", async (req, res) => {
       stage: "telegram_verification",
       message: `Checking ${queueItem.telegram_link}`,
       telegramLink: queueItem.telegram_link,
+      metadata: {
+        source_title: queueItem.title || null,
+        source_category: queueItem.category || null,
+        source_subscribers: Number(queueItem.subscribers || 0),
+        source_avatar_url: queueItem.avatar_url || null,
+      },
     })
 
     const adminUser = { id: run.created_by }
 
-    await supabaseAdmin
-      .from("scraper_queue")
-      .update({
-        stage: "ai_generation",
-        updated_at: new Date().toISOString(),
-      })
-      .eq("id", queueItem.id)
-
-    await logScraperEvent({
-      runId,
-      level: "info",
-      stage: "ai_generation",
-      message: "Generating listing description and categories.",
-      telegramLink: queueItem.telegram_link,
-    })
+    const stageMessages = {
+      telegram_verified: (data) =>
+        `Telegram found: ${
+          data.telegram_title ||
+          data.telegram_username ||
+          queueItem.telegram_link
+        }`,
+      telegram_metadata: (data) =>
+        `${Number(data.member_count || 0).toLocaleString()} members · ${
+          data.listing_type || "unknown type"
+        } · avatar ${data.avatar_available ? "available" : "not found"}`,
+      ai_generation_started: () =>
+        "Generating display content, categories, safety label, and SEO fields.",
+      ai_generated: (data) =>
+        `Applied name "${data.generated_name}" · ${(data.categories || []).join(
+          ", "
+        ) || "General"} · NSFW ${data.is_nsfw ? "Yes" : "No"}`,
+      slug_selected: (data) =>
+        `Selected public path ${data.public_path}`,
+      supabase_created: (data) =>
+        `Supabase listing created: ${data.channel_name}`,
+      avatar_downloaded: (data) =>
+        `Avatar downloaded${
+          data.background_applied ? " and applied as background" : ""
+        }.`,
+      framer_sync_started: () =>
+        "Creating Framer CMS item.",
+      framer_synced: (data) =>
+        `Framer CMS ready: ${data.public_url}`,
+      framer_sync_failed: (data) =>
+        `Framer sync failed: ${data.error}`,
+    }
 
     const result = await importSingleTelegramListing(
       queueItem.telegram_link,
@@ -6871,7 +7128,65 @@ app.post("/api/scraper/agent/process-next", async (req, res) => {
         syncToFramer: run.sync_to_framer !== false,
         useIconAsBackground: run.use_icon_as_background !== false,
       },
-      adminUser
+      adminUser,
+      async (stage, metadata) => {
+        const queueStageMap = {
+          telegram_verified: "telegram_verified",
+          telegram_metadata: "telegram_verified",
+          ai_generation_started: "ai_generation",
+          ai_generated: "ai_generated",
+          slug_selected: "slug_selected",
+          supabase_created: "supabase_created",
+          avatar_downloaded: "avatar_downloaded",
+          framer_sync_started: "framer_sync",
+          framer_synced: "framer_synced",
+          framer_sync_failed: "framer_failed",
+        }
+
+        const nextStage = queueStageMap[stage] || stage
+
+        await supabaseAdmin
+          .from("scraper_queue")
+          .update({
+            stage: nextStage,
+            updated_at: new Date().toISOString(),
+          })
+          .eq("id", queueItem.id)
+
+        await supabaseAdmin
+          .from("scraper_runs")
+          .update({
+            current_stage: nextStage,
+            current_link: queueItem.telegram_link,
+            updated_at: new Date().toISOString(),
+          })
+          .eq("id", runId)
+
+        const messageBuilder = stageMessages[stage]
+        const message = messageBuilder
+          ? messageBuilder(metadata || {})
+          : stage
+
+        await logScraperEvent({
+          runId,
+          level:
+            stage === "framer_sync_failed"
+              ? "error"
+              : stage === "ai_generated" ||
+                  stage === "supabase_created" ||
+                  stage === "framer_synced"
+                ? "success"
+                : "info",
+          stage,
+          message,
+          telegramLink: queueItem.telegram_link,
+          listingId: metadata?.listing_id || null,
+          metadata: {
+            queue_item_id: queueItem.id,
+            ...metadata,
+          },
+        })
+      }
     )
 
     const finalStatus = result.skipped ? "duplicate" : "created"
@@ -6898,7 +7213,7 @@ app.post("/api/scraper/agent/process-next", async (req, res) => {
       stage: result.skipped ? "duplicate" : "listing_created",
       message: result.skipped
         ? `Duplicate skipped: ${result.existing_name || queueItem.telegram_link}`
-        : `Published listing data: ${result.channel_name || queueItem.telegram_link}`,
+        : `Listing created: ${result.channel_name || queueItem.telegram_link}`,
       telegramLink: queueItem.telegram_link,
       listingId: result.listing_id || result.existing_listing_id || null,
       metadata: result,
