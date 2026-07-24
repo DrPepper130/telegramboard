@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 })
 
 const BACKEND_BUILD_ID =
-  "telehub-ranked-header-overflow-fix-2026-07-24"
+  "telehub-manual-import-queue-fix-2026-07-24"
 
 app.get("/", (req, res) => {
   res.status(200).json({
@@ -6605,6 +6605,63 @@ async function importSingleTelegramListing(
   }
 }
 
+
+async function markManualImportQueueItemComplete(originalLink, result) {
+  const cleanedOriginal = cleanImportTelegramLink(originalLink)
+  const cleanedResult = cleanImportTelegramLink(result?.link || "")
+  const telegramLink = cleanedResult || cleanedOriginal
+
+  if (!telegramLink) return
+
+  const finalStatus = result?.created
+    ? "created"
+    : result?.skipped
+      ? "duplicate"
+      : result?.ok === false
+        ? "failed"
+        : "completed"
+
+  const finalStage = result?.created
+    ? "completed"
+    : result?.filtered
+      ? "filtered"
+      : result?.skipped
+        ? "duplicate"
+        : result?.ok === false
+          ? "failed"
+          : "completed"
+
+  const updatePayload = {
+    status: finalStatus,
+    stage: finalStage,
+    listing_id:
+      result?.listing_id || result?.existing_listing_id || null,
+    result: result || null,
+    framer_synced: Boolean(result?.framer_synced),
+    error: result?.ok === false ? result?.error || "Import failed." : null,
+    completed_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  }
+
+  const candidateLinks = Array.from(
+    new Set([cleanedOriginal, cleanedResult, telegramLink].filter(Boolean))
+  )
+
+  const { error } = await supabaseAdmin
+    .from("scraper_queue")
+    .update(updatePayload)
+    .in("telegram_link", candidateLinks)
+    .eq("status", "ready_for_ai")
+
+  if (error) {
+    console.error(
+      "Could not mark manually imported scraper queue item complete:",
+      telegramLink,
+      error.message
+    )
+  }
+}
+
 app.post("/api/admin/import-telegram-listings", async (req, res) => {
   try {
     const authHeader = req.headers.authorization || ""
@@ -6647,6 +6704,7 @@ app.post("/api/admin/import-telegram-listings", async (req, res) => {
       try {
         const result = await importSingleTelegramListing(link, options, user)
         results.push(result)
+        await markManualImportQueueItemComplete(link, result)
       } catch (err) {
         console.error("Auto import listing failed:", link, err)
 
@@ -6661,12 +6719,15 @@ app.post("/api/admin/import-telegram-listings", async (req, res) => {
           break
         }
 
-        results.push({
+        const failedResult = {
           ok: false,
           link,
           error: err.message || "Import failed.",
           code: err?.code || null,
-        })
+        }
+
+        results.push(failedResult)
+        await markManualImportQueueItemComplete(link, failedResult)
       }
 
       if (index < linksToImport.length - 1) {
