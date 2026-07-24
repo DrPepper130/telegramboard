@@ -6893,6 +6893,43 @@ app.post("/api/scraper/agent/command-complete", async (req, res) => {
   }
 })
 
+
+app.post("/api/scraper/agent/event", async (req, res) => {
+  try {
+    if (!requireScraperAgent(req, res)) return
+
+    const runId = String(req.body?.run_id || "").trim()
+    const level = String(req.body?.level || "info").trim()
+    const stage = String(req.body?.stage || "agent_event").trim()
+    const message = String(req.body?.message || "").trim()
+    const metadata =
+      req.body?.metadata && typeof req.body.metadata === "object"
+        ? req.body.metadata
+        : {}
+
+    if (!runId || !message) {
+      return res.status(400).json({
+        error: "Missing run_id or message.",
+      })
+    }
+
+    await logScraperEvent({
+      runId,
+      level,
+      stage,
+      message,
+      telegramLink: req.body?.telegram_link || null,
+      listingId: req.body?.listing_id || null,
+      metadata,
+    })
+
+    return res.json({ ok: true })
+  } catch (err) {
+    console.error("Scraper agent event failed:", err)
+    return res.status(500).json({ error: err.message })
+  }
+})
+
 app.post("/api/scraper/agent/heartbeat", async (req, res) => {
   try {
     if (!requireScraperAgent(req, res)) return
