@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 })
 
 const BACKEND_BUILD_ID =
-  "telehub-conservative-english-filter-cleantext-fix-2026-07-24"
+  "telehub-20-link-diverse-descriptions-2026-07-24"
 
 app.get("/", (req, res) => {
   res.status(200).json({
@@ -5643,8 +5643,8 @@ app.get("/api/telegram/sync-hourly", async (req, res) => {
 // ADMIN AI TELEGRAM LISTING IMPORT
 // ========================================
 
-const DEFAULT_ADMIN_IMPORT_LIMIT = 5
-const MAX_ADMIN_IMPORT_LIMIT = 25
+const DEFAULT_ADMIN_IMPORT_LIMIT = 20
+const MAX_ADMIN_IMPORT_LIMIT = 20
 const ADMIN_IMPORT_DELAY_MS = Math.max(
   500,
   Number(process.env.ADMIN_IMPORT_DELAY_MS || 1500)
@@ -5776,6 +5776,17 @@ function makeImportFallbackCategories(text, listingType) {
   return matches.slice(0, 5)
 }
 
+function capWords(value, maxWords) {
+  const words = String(value || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .split(" ")
+    .filter(Boolean)
+
+  if (words.length <= maxWords) return words.join(" ")
+  return words.slice(0, maxWords).join(" ")
+}
+
 function sanitizeAiImportContent(raw, fallback) {
   const source = raw && typeof raw === "object" ? raw : {}
 
@@ -5824,10 +5835,7 @@ function sanitizeAiImportContent(raw, fallback) {
     .trim()
     .slice(0, 95)
 
-  description = description
-    .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, 260)
+  description = capWords(description, 250)
 
   longDescription = longDescription
     .replace(/\n{3,}/g, "\n\n")
@@ -5881,7 +5889,7 @@ function fallbackImportContent({
 
   return {
     display_name: displayName,
-    description: description.slice(0, 260),
+    description: capWords(description, 250),
     long_description: longDescription.slice(0, 2000),
     categories,
     is_nsfw: false,
@@ -5893,87 +5901,124 @@ async function generateAiImportContent(input) {
 
   const creativeProfiles = [
     {
-      name: "clean_directory",
+      name: "clean_minimal",
       title_style:
-        "Use a clean descriptive title with no unnecessary separator or emoji.",
-      tone: "clear, useful, neutral",
-      description_shape: "one concise factual sentence",
+        "Use a clean name plus one useful descriptor. No emoji and no keyword ribbon.",
+      tone: "simple, confident, human",
+      description_shape:
+        "one compact sentence with no sales language",
       emoji_budget: "none",
+      formatting_style: "plain sentence",
     },
     {
-      name: "keyword_ribbon",
+      name: "discadia_ribbon",
       title_style:
-        "Keep the recognizable name, then add 3 to 6 short supported topic phrases using a pipe and bullets.",
+        "Use the recognizable name followed by 3 to 7 supported topics separated by a pipe and bullets.",
       tone: "energetic directory listing",
-      description_shape: "two short punchy sentences",
-      emoji_budget: "minimal",
-    },
-    {
-      name: "casual_community",
-      title_style:
-        "Create a friendly community title with one short descriptive phrase.",
-      tone: "casual and conversational",
       description_shape:
-        "audience-first invitation without sounding salesy",
+        "a lively keyword-rich paragraph with short fragments",
       emoji_budget: "moderate",
+      formatting_style: "pipe and bullet rhythm",
     },
     {
-      name: "minimal_brand",
+      name: "emoji_burst",
       title_style:
-        "Preserve the recognizable original name and add no more than one useful descriptor.",
-      tone: "minimal and confident",
-      description_shape: "one compact sentence",
-      emoji_budget: "none",
-    },
-    {
-      name: "emoji_header",
-      title_style:
-        "Use one relevant emoji in the title, followed by the name and a concise supported descriptor.",
-      tone: "bright but not childish",
+        "Use one relevant emoji in the title and a compact supported descriptor.",
+      tone: "playful and energetic",
       description_shape:
-        "topic-first sentence followed by a short benefit",
-      emoji_budget: "moderate",
-    },
-    {
-      name: "niche_hook",
-      title_style:
-        "Lead with the specific niche, then work the recognizable original name into the title naturally.",
-      tone: "specific and knowledgeable",
-      description_shape: "begin with a niche-specific hook",
-      emoji_budget: "minimal",
-    },
-    {
-      name: "social_listing",
-      title_style:
-        "Use a lively community-oriented title built from supported social topics or activities.",
-      tone: "friendly and lively",
-      description_shape: "question followed by a natural answer",
+        "two or three punchy fragments with varied emoji placement",
       emoji_budget: "expressive",
+      formatting_style: "emoji-led fragments",
     },
     {
-      name: "news_update",
+      name: "friendly_invite",
       title_style:
-        "Use a straightforward topic-and-updates title without keyword stuffing.",
-      tone: "informational and current",
+        "Use a friendly community-focused title without keyword stuffing.",
+      tone: "warm, casual, welcoming",
       description_shape:
-        "direct summary without promotional language",
-      emoji_budget: "none",
-    },
-    {
-      name: "short_punchy",
-      title_style:
-        "Create a short memorable title with no more than one separator.",
-      tone: "punchy and modern",
-      description_shape: "two compact fragments or short sentences",
+        "a natural invitation that sounds written by a community owner",
       emoji_budget: "minimal",
+      formatting_style: "conversational paragraph",
     },
     {
-      name: "resource_hub",
+      name: "feature_stack",
       title_style:
-        "Use the recognizable name plus supported resources, guides, discussion, or updates.",
-      tone: "helpful and organized",
-      description_shape: "benefit-first informational sentence",
+        "Keep the recognizable name and add a short supported feature phrase.",
+      tone: "fast, useful, direct",
+      description_shape:
+        "stack 3 to 6 supported benefits or topics using bullets, dashes, or separators",
       emoji_budget: "moderate",
+      formatting_style: "feature stack",
+    },
+    {
+      name: "question_hook",
+      title_style:
+        "Use a short modern title with at most one separator.",
+      tone: "curious and conversational",
+      description_shape:
+        "open with a question, then answer it naturally",
+      emoji_budget: "minimal",
+      formatting_style: "question and answer",
+    },
+    {
+      name: "niche_expert",
+      title_style:
+        "Lead with the exact niche and work the original name into the title naturally.",
+      tone: "specific, informed, restrained",
+      description_shape:
+        "topic-first explanation with concrete supported details",
+      emoji_budget: "none",
+      formatting_style: "informational",
+    },
+    {
+      name: "social_hangout",
+      title_style:
+        "Create a lively social title using only supported activities or interests.",
+      tone: "friendly, social, casual",
+      description_shape:
+        "short invitation plus a list-like second sentence",
+      emoji_budget: "expressive",
+      formatting_style: "social promo",
+    },
+    {
+      name: "news_flash",
+      title_style:
+        "Use a direct topic-and-updates title with no decorative filler.",
+      tone: "current, concise, informative",
+      description_shape:
+        "a headline-like opening followed by a clear summary",
+      emoji_budget: "minimal",
+      formatting_style: "headline summary",
+    },
+    {
+      name: "brand_only",
+      title_style:
+        "Keep the original recognizable brand name nearly unchanged.",
+      tone: "minimal, polished, understated",
+      description_shape:
+        "one short sentence or two tiny sentences",
+      emoji_budget: "none",
+      formatting_style: "brand card",
+    },
+    {
+      name: "chaotic_fun",
+      title_style:
+        "Use a playful title with one supported phrase and optional emoji.",
+      tone: "internet-native, fun, informal",
+      description_shape:
+        "use energetic fragments, varied punctuation, and a casual voice",
+      emoji_budget: "expressive",
+      formatting_style: "chaotic but readable",
+    },
+    {
+      name: "resource_board",
+      title_style:
+        "Use the name plus supported resources, guides, discussion, updates, or media.",
+      tone: "organized and helpful",
+      description_shape:
+        "benefit-first paragraph with a compact supported topic list",
+      emoji_budget: "moderate",
+      formatting_style: "resource summary",
     },
   ]
 
@@ -6003,11 +6048,13 @@ async function generateAiImportContent(input) {
     }
 
     const systemPrompt = `
-You create distinct, natural directory listings for TeleHub, a Telegram group and channel discovery website.
+You create highly varied, natural directory listings for TeleHub, a Telegram channel and group discovery website.
 
-The listings are generated independently, but each result must feel individually written. Follow the creative_profile in the user JSON closely. Do not default to the same title structure, opening phrase, sentence rhythm, emoji placement, or promotional wording.
+The visual energy may resemble modern community-directory cards such as Discadia, but every result must be original, grounded in the Telegram source, and not copied from any example.
 
-Return ONLY one valid JSON object with exactly these fields:
+Follow the supplied creative_profile exactly. Each listing must feel as though a different person wrote it.
+
+Return ONLY one valid JSON object:
 {
   "display_name": string,
   "description": string,
@@ -6016,155 +6063,172 @@ Return ONLY one valid JSON object with exactly these fields:
   "is_nsfw": boolean
 }
 
-GROUNDING RULES
+SOURCE GROUNDING
 
-Use only the Telegram title, username, Telegram description or bio, member count, listing type, and creative_profile supplied by the user.
+Use only:
+- Telegram title
+- Telegram username
+- Telegram description or bio
+- member count
+- listing type
+- creative_profile
 
-You may infer the broad topic from the title and bio, but never invent unsupported details.
+Do not invent unsupported:
+- active voice chat
+- giveaways
+- contests
+- events
+- staff activity
+- moderation quality
+- official status
+- safety or trust
+- discounts or pricing
+- delivery speed
+- bonuses
+- rankings
+- specific games, topics, resources, or features absent from the source
 
-Do not invent or imply:
-- official status unless the source clearly says it is official
-- guaranteed activity or an active community
-- voice chats, calls, events, giveaways, contests, or support
-- moderation quality, verification, safety, trust, or legitimacy
-- discounts, prices, earnings, performance, or guarantees
-- resources, guides, signals, news, memes, anime, networking, or other features unless the source supports them
-
-When the source is vague, write a restrained but appealing listing based on the broadest clearly supported topic. Never compensate for missing information by fabricating features.
+Broadly rephrasing an obvious topic is allowed. Fabricating a feature is not.
 
 DISPLAY NAME
 
-Create an appealing directory title that helps users understand the topic or purpose. Do not simply copy the Telegram title unless it is already clear, useful, and distinctive.
+Create an appealing card title, not merely a raw Telegram title.
 
-The display_name must:
-- be readable rather than a pile of keywords
-- remain grounded in the source
-- preserve a recognizable part of the original title when possible
-- contain 2 to 8 descriptive words or short phrases
-- stay at or below 95 characters
-- follow the assigned creative_profile title_style
+Rules:
+- preserve a recognizable part of the original name when possible
+- 2 to 10 words or short phrases
+- maximum 95 characters
+- use only supported topics
+- follow creative_profile.title_style
+- vary separators between listings
+- some titles should be plain
+- some may use |
+- some may use —
+- some may use •
+- some may use :
+- some may use no separator
+- never use more than two separator types in one title
+- never force a keyword ribbon when the profile does not call for it
 
-Possible structures include:
-- Original Name | Topic • Feature • Community
-- Emoji Original Name — Short Topic Phrase
-- Topic Hub • Community • Updates
-- Original Name | News, Discussion & Resources
-- Original Name — Topic Community
-- Original Name only when the clean name is strongest
-- Topic • Audience • Purpose
-- Emoji + Name + one short descriptor
+Possible structural inspiration:
+- Name | Topic • Chat • Updates
+- 🎮 Name — Gaming Community
+- Name: News, Media & Discussion
+- Topic Hub • Guides • Community
+- Name only
 
-These are structural examples only. Do not copy them:
-- Socialize | Hangout • Voice Chat • Memes • Anime
-- 🎮 Mobile Gaming Hub — Squads, Tips & Updates
-- Crypto Signals & Market Discussion
-- Tokyo Travel | Food • Hotels • Local Tips
-- 📚 Study Circle — Notes, Motivation & Support
-- Daily Football News
-- Creators Lounge | Networking • Feedback • Growth
+Do not copy these examples word-for-word.
 
-Do not force every title into the pipe-and-bullet style. Across listings, use a varied mix of:
-- |
-- —
-- •
-- :
-- /
-- no separator
-
-Never use more than two separator types in one title. Do not repeat the same word in the title. Do not add a descriptor that merely restates the original name.
-
-EMOJIS
+EMOJI VARIETY
 
 Follow creative_profile.emoji_budget:
-- none: zero emojis anywhere
-- minimal: zero or one emoji across the entire result
-- moderate: one or two emojis across the entire result
-- expressive: two or three emojis across the entire result
+- none: 0 emojis
+- minimal: 0 or 1 emoji across title and description
+- moderate: 1 to 4 emojis across title and description
+- expressive: 2 to 7 emojis across title and description
 
-Emoji placement must vary. Some results may use one in the title, some only in a description, and many should use none. Never automatically begin every title or description with an emoji. Use only relevant emojis.
+Vary placement:
+- title only
+- description only
+- middle of a phrase
+- end of a phrase
+- no emoji
+
+Do not always begin with an emoji. Do not use the same emoji repeatedly.
 
 SHORT DESCRIPTION
 
-description must be 110 to 260 characters and specific to this listing.
+description may contain 0 to 250 words, but it should usually be 12 to 70 words so it fits naturally on a directory card.
 
-Follow creative_profile.description_shape. Vary the structure using options such as:
-- one direct sentence
+The description may be:
+- one compact sentence
 - two short sentences
-- a question followed by an answer
-- a compact list-like sentence
-- an audience-first line
-- a factual directory summary
-- a casual recommendation
-- a niche-specific hook
-- a benefit-first opening
-- a topic-first opening
+- a short paragraph
+- a question and answer
+- a feature stack
+- a keyword-rich community pitch
+- punchy fragments separated by bullets, pipes, dashes, or emojis
+- a clean factual summary
+- an informal owner-style invitation
 
-Do not routinely begin with:
-- Join
-- Discover
-- Stay updated
-- Welcome to
-- Looking for
-- This is
-- A Telegram
-- Connect with
-- Get the latest
-- Your go-to
-- Whether you're
-- Dive into
-- Explore
+Make the rhythm visibly different across listings.
 
-Do not routinely end with:
-- Join today
-- Check it out
-- Don't miss out
-- Become part of the community
-- Everything in one place
+Allowed stylistic variety includes:
+- sentence fragments
+- selective capitalization
+- tasteful emoji clusters
+- short lists
+- topic ribbons
+- casual questions
+- direct audience calls
+- headline-like phrasing
+
+Do not repeatedly begin with:
+Join
+Discover
+Welcome to
+Stay updated
+Looking for
+This is
+A Telegram
+Your go-to
+Whether you're
+Explore
+Dive into
+
+Do not repeatedly end with:
+Join today
+Check it out
+Don't miss out
+Everything in one place
+Become part of the community
+
+Do not use generic AI phrases:
+vibrant community
+like-minded individuals
+valuable insights
+engaging content
+dynamic platform
+perfect place
+one-stop destination
+something for everyone
+thriving community
+curated content
+
+Do not force the description to use all available words. Empty descriptions are technically allowed only when the source contains almost no useful information, but a concise grounded line is strongly preferred.
 
 LONG DESCRIPTION
 
-long_description must be 450 to 1050 characters in 1 to 3 short paragraphs.
+long_description should usually be 80 to 220 words in 1 to 4 short paragraphs.
 
-Explain only what can reasonably be supported:
-- the primary subject or purpose
-- the type of audience that may find it useful or entertaining
-- the general material or conversation users may expect
+It should explain:
+- the main topic
+- what users may reasonably expect
+- the likely audience
+- why the listing may be useful or entertaining
 
-Vary the structure. Some descriptions should begin with the audience, some with the subject, some with a concise observation, and some with the original community name. Use a mix of casual, informational, punchy, and restrained voices according to the profile.
-
-Avoid generic AI phrases such as:
-- vibrant community
-- like-minded individuals
-- valuable insights
-- engaging content
-- dynamic platform
-- perfect place
-- something for everyone
-- one-stop destination
-- thriving community
-- curated content
-- endless possibilities
-
-Do not repeat the short description verbatim in the long description.
+Vary paragraph count and opening structure. Do not repeat the short description verbatim.
 
 CATEGORIES
 
-Return 2 to 5 short Title Case categories. Put the most specific category first, then broader categories. Avoid redundant near-duplicates. Do not include "Telegram" as a category unless the source is specifically about Telegram itself.
+Return 2 to 5 short Title Case categories.
+Put the most specific category first.
+Avoid duplicates and near-duplicates.
+Do not use Telegram as a category unless the channel is specifically about Telegram.
 
 NSFW
 
-Set is_nsfw to true only for clearly adult, sexually explicit, pornographic, drug-focused, gambling-focused, or strongly mature content. Ordinary profanity, memes, dating, finance, cryptocurrency, and general discussion are not automatically NSFW.
+Set is_nsfw to true only when clearly adult, sexually explicit, pornographic, drug-focused, gambling-focused, or strongly mature.
 
-SILENT FINAL CHECK
+FINAL SILENT CHECK
 
-Before returning JSON, silently verify:
-- the title is grounded and not merely copied without improvement
-- the title style follows the assigned profile
-- emoji usage stays within the assigned budget
-- the short description avoids a generic repeated opening
-- the short and long descriptions do not repeat each other
-- every claim is supported by the supplied source
-- the output is valid JSON with all five required fields
+Before returning:
+- confirm all claims are source-supported
+- confirm the title follows its assigned profile
+- confirm emoji count fits the budget
+- confirm the description structure is not generic
+- confirm the short and long descriptions are different
+- confirm valid JSON with all five fields
 
 Return only the JSON object.
 `.trim()
@@ -6183,7 +6247,7 @@ Return only the JSON object.
           temperature: 1.05,
           presence_penalty: 0.85,
           frequency_penalty: 0.65,
-          max_tokens: 1000,
+          max_tokens: 1400,
           messages: [
             {
               role: "system",
