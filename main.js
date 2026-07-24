@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 })
 
 const BACKEND_BUILD_ID =
-  "telehub-tlgrm-payload-size-fix-2026-07-24"
+  "telehub-ranked-header-overflow-fix-2026-07-24"
 
 app.get("/", (req, res) => {
   res.status(200).json({
@@ -5290,6 +5290,29 @@ app.post("/api/admin/approve-listing/:id", async (req, res) => {
 })
 
 
+
+async function fetchMemberSnapshotsInBatches(listingIds, since) {
+  const ids = Array.from(new Set((listingIds || []).filter(Boolean)))
+  const batchSize = 100
+  const allSnapshots = []
+
+  for (let index = 0; index < ids.length; index += batchSize) {
+    const batch = ids.slice(index, index + batchSize)
+
+    const { data, error } = await supabaseAdmin
+      .from("channel_member_snapshots")
+      .select("listing_id, member_count, created_at")
+      .in("listing_id", batch)
+      .gte("created_at", since)
+      .order("created_at", { ascending: true })
+
+    if (error) throw error
+    allSnapshots.push(...(data || []))
+  }
+
+  return allSnapshots
+}
+
 app.get("/api/listings/ranked", async (req, res) => {
   try {
     const { data: listings, error: listingsError } = await supabaseAdmin
@@ -5307,16 +5330,7 @@ app.get("/api/listings/ranked", async (req, res) => {
     if (listingIds.length > 0) {
       const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString()
 
-      const { data: snapshotData, error: snapshotError } = await supabaseAdmin
-        .from("channel_member_snapshots")
-        .select("listing_id, member_count, created_at")
-        .in("listing_id", listingIds)
-        .gte("created_at", since)
-        .order("created_at", { ascending: true })
-
-      if (snapshotError) throw snapshotError
-
-      snapshots = snapshotData || []
+      snapshots = await fetchMemberSnapshotsInBatches(listingIds, since)
     }
 
     const snapshotsByListing = {}
@@ -5467,19 +5481,7 @@ app.get("/api/listings/homepage", async (req, res) => {
         Date.now() - 24 * 60 * 60 * 1000
       ).toISOString()
 
-      const {
-        data: snapshotData,
-        error: snapshotError,
-      } = await supabaseAdmin
-        .from("channel_member_snapshots")
-        .select("listing_id, member_count, created_at")
-        .in("listing_id", listingIds)
-        .gte("created_at", since)
-        .order("created_at", { ascending: true })
-
-      if (snapshotError) throw snapshotError
-
-      snapshots = snapshotData || []
+      snapshots = await fetchMemberSnapshotsInBatches(listingIds, since)
     }
 
     const snapshotsByListing = {}
