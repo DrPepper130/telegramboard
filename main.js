@@ -8316,6 +8316,128 @@ app.get("/api/admin/scraper/status", async (req, res) => {
 
 
 
+// ========================================
+// GROWTH CHALLENGE FEEDBACK
+// ========================================
+
+const growthFeedbackRateLimit = new Map()
+
+function cleanFeedbackText(value, maxLength) {
+  return String(value || "")
+    .replace(/\u0000/g, "")
+    .trim()
+    .slice(0, maxLength)
+}
+
+function feedbackClientIp(req) {
+  return String(
+    req.headers["cf-connecting-ip"] ||
+      req.headers["x-forwarded-for"] ||
+      req.socket?.remoteAddress ||
+      ""
+  )
+    .split(",")[0]
+    .trim()
+}
+
+app.post("/api/feedback/growth-challenge", async (req, res) => {
+  try {
+    const responseText = cleanFeedbackText(req.body?.response, 2000)
+    const prompt = cleanFeedbackText(req.body?.prompt, 500)
+    const source = cleanFeedbackText(
+      req.body?.source || "growth-challenge-popup",
+      100
+    )
+    const pageUrl = cleanFeedbackText(req.body?.page_url, 1000)
+    const referrer = cleanFeedbackText(req.body?.referrer, 1000)
+    const visitorId = cleanFeedbackText(req.body?.visitor_id, 200)
+    const ipAddress = feedbackClientIp(req)
+    const userAgent = cleanFeedbackText(req.headers["user-agent"], 500)
+
+    if (responseText.length < 2) {
+      return res.status(400).json({
+        error: "Please enter a little more detail before submitting.",
+      })
+    }
+
+    const rateKey = visitorId || ipAddress || "unknown"
+    const now = Date.now()
+    const lastSubmission = growthFeedbackRateLimit.get(rateKey) || 0
+
+    if (now - lastSubmission < 60 * 1000) {
+      return res.status(429).json({
+        error: "Please wait a minute before submitting another response.",
+      })
+    }
+
+    const { data, error } = await supabaseAdmin
+      .from("growth_challenge_responses")
+      .insert({
+        response: responseText,
+        prompt: prompt || null,
+        source,
+        page_url: pageUrl || null,
+        referrer: referrer || null,
+        visitor_id: visitorId || null,
+        ip_address: ipAddress || null,
+        user_agent: userAgent || null,
+      })
+      .select("id, created_at")
+      .single()
+
+    if (error) throw error
+
+    growthFeedbackRateLimit.set(rateKey, now)
+
+    return res.status(201).json({
+      ok: true,
+      response_id: data.id,
+      created_at: data.created_at,
+    })
+  } catch (err) {
+    console.error("Growth challenge feedback submission failed:", err)
+    return res.status(500).json({
+      error: "Your response could not be saved. Please try again.",
+    })
+  }
+})
+
+app.get("/api/admin/feedback/growth-challenges", async (req, res) => {
+  try {
+    const user = await getAdminUserFromRequest(req)
+
+    if (!user) {
+      return res.status(403).json({ error: "Admin access required." })
+    }
+
+    const requestedLimit = Number(req.query.limit || 250)
+    const limit = Math.max(1, Math.min(requestedLimit, 500))
+
+    const { data, error } = await supabaseAdmin
+      .from("growth_challenge_responses")
+      .select(
+        "id, response, prompt, source, page_url, referrer, visitor_id, created_at"
+      )
+      .order("created_at", { ascending: false })
+      .limit(limit)
+
+    if (error) throw error
+
+    return res.json({
+      ok: true,
+      responses: data || [],
+      count: (data || []).length,
+    })
+  } catch (err) {
+    console.error("Loading growth challenge feedback failed:", err)
+    return res.status(500).json({
+      error: err.message || "Could not load feedback responses.",
+    })
+  }
+})
+
+
+
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`)
 })
