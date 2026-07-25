@@ -6310,6 +6310,89 @@ async function findDuplicateImportListing({ telegramChatId, telegramUsername, te
   return null
 }
 
+
+// ========================================
+// IMPORT LANGUAGE FILTER HELPERS
+// ========================================
+
+function cleanText(value) {
+  return String(value || "")
+    .replace(/\s+/g, " ")
+    .trim()
+}
+
+function countScriptLetters(value) {
+  const counts = {
+    latin: 0,
+    cyrillic: 0,
+    arabic: 0,
+    hebrew: 0,
+    greek: 0,
+    other: 0,
+  }
+
+  for (const char of String(value || "")) {
+    if (!/\p{L}/u.test(char)) continue
+
+    if (/\p{Script=Latin}/u.test(char)) counts.latin += 1
+    else if (/\p{Script=Cyrillic}/u.test(char)) counts.cyrillic += 1
+    else if (/\p{Script=Arabic}/u.test(char)) counts.arabic += 1
+    else if (/\p{Script=Hebrew}/u.test(char)) counts.hebrew += 1
+    else if (/\p{Script=Greek}/u.test(char)) counts.greek += 1
+    else counts.other += 1
+  }
+
+  counts.total =
+    counts.latin +
+    counts.cyrillic +
+    counts.arabic +
+    counts.hebrew +
+    counts.greek +
+    counts.other
+
+  counts.non_latin = counts.total - counts.latin
+  return counts
+}
+
+function analyzeLikelyEnglishListingContent({ title, description }) {
+  const cleanTitle = cleanText(title)
+  const cleanDescription = cleanText(description)
+  const titleScripts = countScriptLetters(cleanTitle)
+  const combinedScripts = countScriptLetters(
+    `${cleanTitle} ${cleanDescription}`
+  )
+
+  if (titleScripts.total > 0 && titleScripts.latin === 0) {
+    return {
+      isEnglish: false,
+      reason: "telegram_title_is_fully_non_latin",
+      title_scripts: titleScripts,
+      combined_scripts: combinedScripts,
+    }
+  }
+
+  if (
+    combinedScripts.total >= 20 &&
+    combinedScripts.non_latin >= 15 &&
+    combinedScripts.non_latin / combinedScripts.total >= 0.8
+  ) {
+    return {
+      isEnglish: false,
+      reason: "telegram_content_is_overwhelmingly_non_latin",
+      title_scripts: titleScripts,
+      combined_scripts: combinedScripts,
+    }
+  }
+
+  return {
+    isEnglish: true,
+    ambiguous: true,
+    reason: "latin_or_mixed_listing_allowed",
+    title_scripts: titleScripts,
+    combined_scripts: combinedScripts,
+  }
+}
+
 async function importSingleTelegramListing(
   link,
   options,
