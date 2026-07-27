@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 })
 
 const BACKEND_BUILD_ID =
-  "telehub-first-click-midnight-framer-fix-2026-07-24"
+  "telehub-daily-member-sync-owner-metadata-refresh-2026-07-27"
 
 app.get("/", (req, res) => {
   res.status(200).json({
@@ -451,6 +451,7 @@ async function syncListingTelegramData(listing) {
       icon_url: iconUrl,
       listing_type: listingType,
       last_synced_at: now,
+      telegram_metadata_synced_at: now,
       updated_at: now,
     })
     .eq("id", listing.id)
@@ -519,13 +520,13 @@ async function runWithConcurrency(items, limit, worker) {
   return results
 }
 
-// Lightweight hourly path:
+// Lightweight scheduled member-count path:
 // - Uses the saved Telegram chat ID whenever available.
 // - Falls back directly to the public username when no chat ID is saved.
 // - Calls getChatMemberCount only; it never calls getChat.
 // - Does not fetch metadata or avatars.
 // - Does not connect to Framer.
-// - Inserts the hourly member snapshot.
+// - Inserts one member snapshot per scheduled run.
 async function syncListingMemberCountFast(listing) {
   const possibleTargets = [
     listing.telegram_chat_id
@@ -578,7 +579,7 @@ async function syncListingMemberCountFast(listing) {
     last_synced_at: now,
   }
 
-  // The hourly sync never calls getChat.
+  // The scheduled member-count sync never calls getChat.
   // New listings receive their Telegram chat ID and metadata during import.
   // Older listings without a saved chat ID keep using their public username
   // directly with getChatMemberCount.
@@ -659,10 +660,8 @@ async function refreshListingMemberCountOnDemand(listing) {
 }
 
 
-// Called when a visitor opens a listing.
-// Returns cached data immediately when it is still fresh.
-// When stale, this same request waits for one Telegram member-count refresh,
-// updates Supabase, and returns the fresh count to the first visitor.
+// Legacy compatibility endpoint.
+// It now returns cached Supabase data only and never calls Telegram.
 app.post("/api/listings/refresh-member-count", async (req, res) => {
   try {
     const listingId = String(req.body?.listing_id || "").trim()
@@ -673,62 +672,31 @@ app.post("/api/listings/refresh-member-count", async (req, res) => {
 
     const { data: listing, error } = await supabaseAdmin
       .from("channel_listings")
-      .select(
-        "id, telegram_chat_id, telegram_username, telegram_link, telegram_title, telegram_description, listing_type, member_count, last_synced_at, status, is_banned"
-      )
+      .select("id, member_count, last_synced_at, status, is_banned")
       .eq("id", listingId)
       .single()
 
-    if (error || !listing) {
-      return res.status(404).json({ error: "Listing not found." })
-    }
-
-    if (listing.status !== "approved" || listing.is_banned) {
+    if (
+      error ||
+      !listing ||
+      listing.status !== "approved" ||
+      listing.is_banned
+    ) {
       return res.status(404).json({ error: "Listing is unavailable." })
     }
 
-    // The first visit may initialize an older listing that has never been
-    // synced. This updates Supabase only and never publishes Framer.
-    if (!listing.last_synced_at) {
-      const result = await refreshListingMemberCountOnDemand(listing)
-
-      return res.json({
-        ok: true,
-        ...result,
-        first_sync: true,
-        framer_cms_sync_queued: false,
-      })
-    }
-
-    // Every later visit uses the cached value. The midnight daily full-sync
-    // refreshes Telegram data, updates Framer CMS, and publishes only once.
     return res.json({
       ok: true,
       listing_id: listing.id,
       member_count: Number(listing.member_count || 0),
       last_synced_at: listing.last_synced_at,
       refreshed: false,
-      first_sync: false,
-      stale: false,
-      framer_cms_sync_queued: false,
+      cached: true,
     })
   } catch (err) {
-    console.error("First-visit member count initialization failed:", {
-      error: err.message,
-      code: err.code,
-      retry_after_seconds: err.retry_after_seconds,
-    })
-
-    if (err?.code === "TELEGRAM_RATE_LIMITED") {
-      return res.status(429).json({
-        error: err.message,
-        code: err.code,
-        retry_after_seconds: Number(err.retry_after_seconds || 0),
-      })
-    }
-
+    console.error("Cached member count route failed:", err)
     return res.status(500).json({
-      error: err.message || "Could not initialize member count.",
+      error: err.message || "Could not load cached member count.",
     })
   }
 })
@@ -788,7 +756,7 @@ async function removeBrokenListingFromPublic(listing, errorMessage) {
   }
 }
 
-async function runHourlyTelegramSync() {
+async function runHourlyTelegramSync(options = {}) {
   const startedAt = Date.now()
 
   const { data: listings, error } = await supabaseAdmin
@@ -871,6 +839,7 @@ async function runHourlyTelegramSync() {
   // Publish and deploy once after every broken CMS item has been removed.
   if (
     anyCmsItemRemoved &&
+    options.publish !== false &&
     process.env.FRAMER_AUTO_DEPLOY !== "false"
   ) {
     const { connect } = await import("framer-api")
@@ -1596,6 +1565,126 @@ async function getFramerCollection(framer) {
   }
 
   return collection
+}
+
+
+async function syncMemberCountsToFramerCMS(listings, options = {}) {
+  if (!process.env.FRAMER_API_KEY || !process.env.FRAMER_PROJECT_URL) {
+    throw new Error(
+      "Missing FRAMER_API_KEY or FRAMER_PROJECT_URL in Render environment variables."
+    )
+  }
+
+  const approvedListings = (listings || []).filter(
+    (listing) =>
+      listing &&
+      listing.status === "approved" &&
+      !listing.is_banned &&
+      (listing.framer_cms_item_id || listing.short_invite)
+  )
+
+  if (!approvedListings.length) {
+    return {
+      ok: true,
+      updated: 0,
+      skipped: 0,
+      deployed: false,
+      results: [],
+    }
+  }
+
+  const { connect } = await import("framer-api")
+  const framer = await connect(
+    process.env.FRAMER_PROJECT_URL,
+    process.env.FRAMER_API_KEY
+  )
+
+  try {
+    const collection = await getFramerCollection(framer)
+    const fields = await collection.getFields()
+    const existingItems = await collection.getItems()
+    const existingById = new Map(existingItems.map((item) => [item.id, item]))
+    const existingBySlug = new Map(existingItems.map((item) => [item.slug, item]))
+
+    const results = []
+    const payloads = []
+
+    for (const listing of approvedListings) {
+      const existingItem =
+        (listing.framer_cms_item_id
+          ? existingById.get(listing.framer_cms_item_id)
+          : null) ||
+        (listing.short_invite
+          ? existingBySlug.get(cleanCmsSlug(listing.short_invite))
+          : null)
+
+      if (!existingItem?.id) {
+        results.push({
+          id: listing.id,
+          ok: false,
+          skipped: true,
+          error: "Framer CMS item not found.",
+        })
+        continue
+      }
+
+      const fieldData = {}
+      addCmsField(
+        fieldData,
+        fields,
+        "Member Count",
+        Number(listing.member_count || 0)
+      )
+      addCmsField(
+        fieldData,
+        fields,
+        "Last Synced At",
+        listing.last_synced_at || new Date().toISOString()
+      )
+
+      payloads.push({
+        id: existingItem.id,
+        slug: existingItem.slug,
+        fieldData,
+      })
+      results.push({
+        id: listing.id,
+        ok: true,
+        cms_item_id: existingItem.id,
+      })
+    }
+
+    const chunkSize = Math.max(
+      1,
+      Math.min(Number(process.env.FRAMER_MEMBER_SYNC_BATCH_SIZE || 100), 250)
+    )
+
+    for (let index = 0; index < payloads.length; index += chunkSize) {
+      await collection.addItems(payloads.slice(index, index + chunkSize))
+    }
+
+    let deployed = false
+
+    if (
+      payloads.length &&
+      options.publish !== false &&
+      process.env.FRAMER_AUTO_DEPLOY !== "false"
+    ) {
+      const publication = await framer.publish()
+      await framer.deploy(publication.deployment.id)
+      deployed = true
+    }
+
+    return {
+      ok: true,
+      updated: payloads.length,
+      skipped: results.filter((item) => item.skipped).length,
+      deployed,
+      results,
+    }
+  } finally {
+    await framer.disconnect()
+  }
 }
 
 async function syncListingToFramerCMS(listingId, options = {}) {
@@ -2400,80 +2489,50 @@ app.post("/api/framer/sync-all-listings", async (req, res) => {
 
 // Schedule this endpoint once per day at 12:00 AM America/Phoenix.
 // Render cron uses UTC, so Phoenix midnight is 07:00 UTC year-round.
-// It performs the full Telegram metadata + Framer CMS refresh and publishes once.
+// It requests only member counts from Telegram, stores daily snapshots,
+// updates only Member Count + Last Synced At in Framer, then publishes once.
 app.get("/api/cron/daily-full-sync", async (req, res) => {
   try {
     if (req.query.secret !== process.env.CRON_SECRET) {
       return res.status(401).json({ error: "Unauthorized" })
     }
 
-    const { data: listings, error } = await supabaseAdmin
+    const startedAt = Date.now()
+
+    // Defer any Framer deployment until the final member-field update.
+    const telegramResult = await runHourlyTelegramSync({ publish: false })
+
+    const { data: freshListings, error: listingsError } = await supabaseAdmin
       .from("channel_listings")
-      .select("id")
+      .select(
+        "id, status, is_banned, member_count, last_synced_at, short_invite, framer_cms_item_id"
+      )
       .eq("status", "approved")
       .or("is_banned.is.null,is_banned.eq.false")
 
-    if (error) throw error
+    if (listingsError) throw listingsError
 
-    const startedAt = Date.now()
-    const results = []
-
-    // Keep Framer work serialized for safety. This job runs only once per day.
-    for (const listing of listings || []) {
-      try {
-        const result = await queueFramerSync(() =>
-          syncListingToFramerCMS(listing.id, { publish: false, skipTelegramSync: false })
-        )
-
-        results.push({
-          id: listing.id,
-          ok: true,
-          slug: result.slug,
-        })
-      } catch (err) {
-        results.push({
-          id: listing.id,
-          ok: false,
-          error: err.message,
-        })
-      }
-    }
-
-    let deployed = false
-
-    if (process.env.FRAMER_AUTO_DEPLOY !== "false") {
-      const { connect } = await import("framer-api")
-      const framer = await connect(
-        process.env.FRAMER_PROJECT_URL,
-        process.env.FRAMER_API_KEY
-      )
-
-      try {
-        const publication = await framer.publish()
-        await framer.deploy(publication.deployment.id)
-        deployed = true
-      } finally {
-        await framer.disconnect()
-      }
-    }
+    const framerResult = await queueFramerSync(() =>
+      syncMemberCountsToFramerCMS(freshListings || [], { publish: true })
+    )
 
     let homepageCache = null
 
     try {
       homepageCache = await updateHomepageListingCache()
     } catch (cacheErr) {
-      console.error("Homepage cache refresh after daily full sync failed:", cacheErr)
+      console.error(
+        "Homepage cache refresh after daily member sync failed:",
+        cacheErr
+      )
     }
 
     return res.json({
       ok: true,
-      full_sync: true,
-      deployed,
-      count: results.length,
-      succeeded: results.filter((item) => item.ok).length,
-      failed: results.filter((item) => !item.ok).length,
+      member_count_only: true,
+      telegram: telegramResult,
+      framer: framerResult,
       duration_ms: Date.now() - startedAt,
-      results,
       homepage_cache: homepageCache
         ? {
             updated_at: homepageCache.updated_at,
@@ -2482,7 +2541,7 @@ app.get("/api/cron/daily-full-sync", async (req, res) => {
         : null,
     })
   } catch (err) {
-    console.error("Daily full sync error:", err)
+    console.error("Daily member sync error:", err)
     return res.status(500).json({ error: err.message })
   }
 })
@@ -5234,6 +5293,123 @@ app.post("/api/telegram/sync-listing/:id", async (req, res) => {
 
 
 
+
+
+const TELEGRAM_METADATA_REFRESH_COOLDOWN_MS = Math.max(
+  60 * 60 * 1000,
+  Number(
+    process.env.TELEGRAM_METADATA_REFRESH_COOLDOWN_MS ||
+      24 * 60 * 60 * 1000
+  )
+)
+
+app.post("/api/listings/refresh-telegram-info", async (req, res) => {
+  try {
+    const authHeader = String(req.headers.authorization || "")
+    const token = authHeader.replace(/^Bearer\s+/i, "").trim()
+    const listingId = String(req.body?.listing_id || "").trim()
+
+    if (!token) {
+      return res.status(401).json({ error: "You must be logged in." })
+    }
+
+    if (!listingId) {
+      return res.status(400).json({ error: "Missing listing_id." })
+    }
+
+    const {
+      data: { user },
+      error: userError,
+    } = await supabaseAdmin.auth.getUser(token)
+
+    if (userError || !user) {
+      return res.status(401).json({ error: "Invalid login session." })
+    }
+
+    const { data: listing, error: listingError } = await supabaseAdmin
+      .from("channel_listings")
+      .select("*")
+      .eq("id", listingId)
+      .single()
+
+    if (listingError || !listing) {
+      return res.status(404).json({ error: "Listing not found." })
+    }
+
+    const email = String(user.email || "").toLowerCase()
+    const isAdmin = ADMIN_EMAILS.includes(email)
+
+    if (listing.user_id !== user.id && !isAdmin) {
+      return res.status(403).json({ error: "You do not own this listing." })
+    }
+
+    const lastMetadataSync = listing.telegram_metadata_synced_at
+      ? new Date(listing.telegram_metadata_synced_at).getTime()
+      : 0
+    const nextAllowedAt =
+      lastMetadataSync + TELEGRAM_METADATA_REFRESH_COOLDOWN_MS
+
+    if (
+      !isAdmin &&
+      Number.isFinite(lastMetadataSync) &&
+      lastMetadataSync > 0 &&
+      Date.now() < nextAllowedAt
+    ) {
+      return res.status(429).json({
+        error: "Telegram info can be refreshed once every 24 hours.",
+        code: "TELEGRAM_METADATA_REFRESH_COOLDOWN",
+        next_allowed_at: new Date(nextAllowedAt).toISOString(),
+      })
+    }
+
+    await syncListingTelegramData(listing)
+
+    const framerResult = await queueFramerSync(() =>
+      syncListingToFramerCMS(listing.id, {
+        publish: true,
+        skipTelegramSync: true,
+      })
+    )
+
+    const { data: refreshedListing, error: refreshedError } =
+      await supabaseAdmin
+        .from("channel_listings")
+        .select(
+          "id, telegram_title, telegram_username, telegram_description, telegram_chat_id, icon_url, member_count, listing_type, last_synced_at, telegram_metadata_synced_at"
+        )
+        .eq("id", listing.id)
+        .single()
+
+    if (refreshedError) throw refreshedError
+
+    updateHomepageListingCache().catch((cacheErr) => {
+      console.error(
+        "Homepage cache refresh after Telegram info refresh failed:",
+        cacheErr
+      )
+    })
+
+    return res.json({
+      ok: true,
+      listing: refreshedListing,
+      framer: framerResult,
+    })
+  } catch (err) {
+    console.error("Owner Telegram info refresh failed:", err)
+
+    if (err?.code === "TELEGRAM_RATE_LIMITED") {
+      return res.status(429).json({
+        error: err.message,
+        code: err.code,
+        retry_after_seconds: Number(err.retry_after_seconds || 0),
+      })
+    }
+
+    return res.status(500).json({
+      error: err.message || "Could not refresh Telegram info.",
+    })
+  }
+})
 
 app.post("/api/telegram/sync-hourly", async (req, res) => {
   try {
