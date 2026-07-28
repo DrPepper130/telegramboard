@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 })
 
 const BACKEND_BUILD_ID =
-  "telehub-tme-scrape-logging-homepage-batch-fix-2026-07-27"
+  "telehub-tiered-telegram-refresh-2026-07-27"
 
 app.get("/", (req, res) => {
   res.status(200).json({
@@ -579,7 +579,80 @@ async function uploadTelegramPhoto(fileId, listingId) {
   return data.publicUrl
 }
 
-async function syncListingTelegramData(listing) {
+
+const TELEGRAM_METADATA_REFRESH_MS = Math.max(
+  24 * 60 * 60 * 1000,
+  Number(
+    process.env.TELEGRAM_METADATA_REFRESH_MS ||
+      7 * 24 * 60 * 60 * 1000
+  )
+)
+
+const TELEGRAM_ICON_REFRESH_MS = Math.max(
+  24 * 60 * 60 * 1000,
+  Number(
+    process.env.TELEGRAM_ICON_REFRESH_MS ||
+      30 * 24 * 60 * 60 * 1000
+  )
+)
+
+function isTelegramRefreshDue(lastRefreshAt, intervalMs) {
+  if (!lastRefreshAt) return true
+
+  const value = new Date(lastRefreshAt).getTime()
+  if (!Number.isFinite(value)) return true
+
+  return Date.now() - value >= intervalMs
+}
+
+function scheduledTelegramRefreshPlan(listing) {
+  const metadataTimestamp =
+    listing.last_metadata_scraped_at ||
+    listing.telegram_metadata_synced_at ||
+    null
+
+  const iconTimestamp =
+    listing.last_icon_scraped_at ||
+    listing.telegram_metadata_synced_at ||
+    null
+
+  return {
+    refreshMetadata: isTelegramRefreshDue(
+      metadataTimestamp,
+      TELEGRAM_METADATA_REFRESH_MS
+    ),
+    refreshIcon: isTelegramRefreshDue(
+      iconTimestamp,
+      TELEGRAM_ICON_REFRESH_MS
+    ),
+  }
+}
+
+async function recordTelegramScrapeFailure(listing, error) {
+  const nextFailureCount =
+    Number(listing?.scrape_failure_count || 0) + 1
+
+  const { error: updateError } = await supabaseAdmin
+    .from("channel_listings")
+    .update({
+      scrape_failure_count: nextFailureCount,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", listing.id)
+
+  if (updateError) {
+    console.warn("Could not record Telegram scrape failure:", {
+      listing_id: listing.id,
+      original_error: error?.message,
+      update_error: updateError.message,
+    })
+  }
+}
+
+async function syncListingTelegramData(listing, options = {}) {
+  const refreshIcon = options.refreshIcon !== false
+  const insertSnapshot = options.insertSnapshot !== false
+
   let scraped = null
   let scrapeError = null
 
@@ -609,7 +682,7 @@ async function syncListingTelegramData(listing) {
 
     let iconUrl = listing.icon_url || null
 
-    if (scraped.iconUrl) {
+    if (refreshIcon && scraped.iconUrl) {
       try {
         iconUrl = await uploadRemoteTelegramPhoto(
           scraped.iconUrl,
@@ -640,25 +713,32 @@ async function syncListingTelegramData(listing) {
         listing_type: scraped.listingType,
         last_synced_at: now,
         telegram_metadata_synced_at: now,
+        last_member_scraped_at: now,
+        last_metadata_scraped_at: now,
+        ...(refreshIcon ? { last_icon_scraped_at: now } : {}),
+        scrape_source: scraped.source,
+        scrape_failure_count: 0,
         updated_at: now,
       })
       .eq("id", listing.id)
 
     if (updateError) throw updateError
 
-    const { error: snapshotError } = await supabaseAdmin
-      .from("channel_member_snapshots")
-      .insert({
-        listing_id: listing.id,
-        member_count: scraped.memberCount,
-        created_at: now,
-      })
+    if (insertSnapshot) {
+      const { error: snapshotError } = await supabaseAdmin
+        .from("channel_member_snapshots")
+        .insert({
+          listing_id: listing.id,
+          member_count: scraped.memberCount,
+          created_at: now,
+        })
 
-    if (snapshotError) {
-      console.warn("Member snapshot insert failed:", {
-        listing_id: listing.id,
-        error: snapshotError.message,
-      })
+      if (snapshotError) {
+        console.warn("Member snapshot insert failed:", {
+          listing_id: listing.id,
+          error: snapshotError.message,
+        })
+      }
     }
 
     return {
@@ -736,7 +816,7 @@ async function syncListingTelegramData(listing) {
 
   let iconUrl = listing.icon_url || null
 
-  if (chat.photo?.big_file_id) {
+  if (refreshIcon && chat.photo?.big_file_id) {
     try {
       iconUrl = await uploadTelegramPhoto(
         chat.photo.big_file_id,
@@ -769,25 +849,32 @@ async function syncListingTelegramData(listing) {
       listing_type: listingType,
       last_synced_at: now,
       telegram_metadata_synced_at: now,
+      last_member_scraped_at: now,
+      last_metadata_scraped_at: now,
+      ...(refreshIcon ? { last_icon_scraped_at: now } : {}),
+      scrape_source: "telegram_bot_api_fallback",
+      scrape_failure_count: 0,
       updated_at: now,
     })
     .eq("id", listing.id)
 
   if (updateError) throw updateError
 
-  const { error: snapshotError } = await supabaseAdmin
-    .from("channel_member_snapshots")
-    .insert({
-      listing_id: listing.id,
-      member_count: memberCount,
-      created_at: now,
-    })
+  if (insertSnapshot) {
+    const { error: snapshotError } = await supabaseAdmin
+      .from("channel_member_snapshots")
+      .insert({
+        listing_id: listing.id,
+        member_count: memberCount,
+        created_at: now,
+      })
 
-  if (snapshotError) {
-    console.warn("Member snapshot insert failed:", {
-      listing_id: listing.id,
-      error: snapshotError.message,
-    })
+    if (snapshotError) {
+      console.warn("Member snapshot insert failed:", {
+        listing_id: listing.id,
+        error: snapshotError.message,
+      })
+    }
   }
 
   console.log("Telegram Bot API fallback succeeded:", {
@@ -852,20 +939,29 @@ async function runWithConcurrency(items, limit, worker) {
 // - Does not refresh metadata or avatars.
 // - Does not connect to Framer.
 // - Inserts one member snapshot per scheduled run.
-async function syncListingMemberCountFast(listing) {
+async function syncListingMemberCountFast(listing, options = {}) {
+  const plan = {
+    ...scheduledTelegramRefreshPlan(listing),
+    ...options,
+  }
+
   let memberCount = null
   let successfulTarget = null
   let source = null
+  let scraped = null
+  let botChat = null
   let scrapeError = null
 
   try {
-    const scraped = await fetchPublicTelegramPage(listing)
+    scraped = await fetchPublicTelegramPage(listing)
 
     console.log("Daily Telegram public-page scrape succeeded:", {
       listing_id: listing.id,
       username: scraped.telegramUsername,
       member_count: scraped.memberCount,
       listing_type: scraped.listingType,
+      refresh_metadata: plan.refreshMetadata,
+      refresh_icon: plan.refreshIcon,
       source: scraped.source,
       raw_display: scraped.rawDisplay,
     })
@@ -897,6 +993,7 @@ async function syncListingMemberCountFast(listing) {
     const uniqueTargets = [...new Set(possibleTargets)]
 
     if (!uniqueTargets.length) {
+      await recordTelegramScrapeFailure(listing, scrapeError)
       throw scrapeError || new Error(
         "No Telegram chat ID, username, or public link found"
       )
@@ -906,9 +1003,17 @@ async function syncListingMemberCountFast(listing) {
 
     for (const target of uniqueTargets) {
       try {
-        memberCount = await tg("getChatMemberCount", {
-          chat_id: target,
-        })
+        if (plan.refreshMetadata || plan.refreshIcon) {
+          botChat = await tg("getChat", { chat_id: target })
+          memberCount = await tg("getChatMemberCount", {
+            chat_id: botChat.id,
+          })
+        } else {
+          memberCount = await tg("getChatMemberCount", {
+            chat_id: target,
+          })
+        }
+
         successfulTarget = target
         source = "telegram_bot_api_fallback"
         break
@@ -916,12 +1021,14 @@ async function syncListingMemberCountFast(listing) {
         lastError = err
 
         if (err?.code === "TELEGRAM_RATE_LIMITED") {
+          await recordTelegramScrapeFailure(listing, err)
           throw err
         }
       }
     }
 
     if (memberCount === null) {
+      await recordTelegramScrapeFailure(listing, lastError)
       if (lastError) throw lastError
       throw new Error(
         "Telegram member count could not be loaded from t.me or the Bot API."
@@ -930,13 +1037,74 @@ async function syncListingMemberCountFast(listing) {
   }
 
   const now = new Date().toISOString()
+  const updatePayload = {
+    member_count: memberCount,
+    last_synced_at: now,
+    last_member_scraped_at: now,
+    scrape_source: source,
+    scrape_failure_count: 0,
+  }
+
+  let iconUrl = listing.icon_url || null
+
+  if (plan.refreshMetadata) {
+    if (scraped) {
+      updatePayload.telegram_username = scraped.telegramUsername
+      updatePayload.telegram_title =
+        scraped.title || listing.telegram_title || listing.channel_name
+      updatePayload.telegram_description =
+        scraped.description ||
+        listing.telegram_description ||
+        null
+      updatePayload.listing_type =
+        scraped.listingType || listing.listing_type || null
+    } else if (botChat) {
+      updatePayload.telegram_chat_id = String(botChat.id)
+      updatePayload.telegram_username = cleanUsername(botChat.username)
+      updatePayload.telegram_title =
+        botChat.title || listing.telegram_title || listing.channel_name
+      updatePayload.telegram_description =
+        botChat.description ||
+        botChat.bio ||
+        listing.telegram_description ||
+        null
+      updatePayload.listing_type =
+        normalizeTelegramType(botChat.type) ||
+        listing.listing_type ||
+        null
+    }
+
+    updatePayload.telegram_metadata_synced_at = now
+    updatePayload.last_metadata_scraped_at = now
+  }
+
+  if (plan.refreshIcon) {
+    try {
+      if (scraped?.iconUrl) {
+        iconUrl = await uploadRemoteTelegramPhoto(
+          scraped.iconUrl,
+          listing.id
+        )
+      } else if (botChat?.photo?.big_file_id) {
+        iconUrl = await uploadTelegramPhoto(
+          botChat.photo.big_file_id,
+          listing.id
+        )
+      }
+
+      if (iconUrl) updatePayload.icon_url = iconUrl
+      updatePayload.last_icon_scraped_at = now
+    } catch (photoErr) {
+      console.warn("Scheduled Telegram icon refresh failed:", {
+        listing_id: listing.id,
+        error: photoErr.message,
+      })
+    }
+  }
 
   const { error: updateError } = await supabaseAdmin
     .from("channel_listings")
-    .update({
-      member_count: memberCount,
-      last_synced_at: now,
-    })
+    .update(updatePayload)
     .eq("id", listing.id)
 
   if (updateError) throw updateError
@@ -961,6 +1129,8 @@ async function syncListingMemberCountFast(listing) {
       listing_id: listing.id,
       target: successfulTarget,
       member_count: memberCount,
+      refresh_metadata: plan.refreshMetadata,
+      refresh_icon: plan.refreshIcon,
       source,
     })
   }
@@ -970,9 +1140,10 @@ async function syncListingMemberCountFast(listing) {
     memberCount,
     successfulTarget,
     source,
+    metadataRefreshed: Boolean(plan.refreshMetadata),
+    iconRefreshed: Boolean(plan.refreshIcon),
   }
 }
-
 
 const MEMBER_COUNT_STALE_MS = Math.max(
   60 * 1000,
@@ -1122,7 +1293,7 @@ async function runHourlyTelegramSync(options = {}) {
   const { data: listings, error } = await supabaseAdmin
     .from("channel_listings")
     .select(
-      "id, telegram_chat_id, telegram_username, telegram_link, telegram_title, telegram_description, listing_type, member_count, short_invite, slug, framer_cms_item_id"
+      "id, telegram_chat_id, telegram_username, telegram_link, telegram_title, telegram_description, listing_type, member_count, icon_url, short_invite, slug, framer_cms_item_id, telegram_metadata_synced_at, last_member_scraped_at, last_metadata_scraped_at, last_icon_scraped_at, scrape_source, scrape_failure_count"
     )
     .eq("status", "approved")
     .or("is_banned.is.null,is_banned.eq.false")
@@ -1143,6 +1314,9 @@ async function runHourlyTelegramSync(options = {}) {
         id: listing.id,
         ok: true,
         member_count: result.value.memberCount,
+        source: result.value.source,
+        metadata_refreshed: result.value.metadataRefreshed,
+        icon_refreshed: result.value.iconRefreshed,
       }
     }
 
@@ -1237,6 +1411,12 @@ async function runHourlyTelegramSync(options = {}) {
     removal_failed: removalFailures.length,
     framer_deployed: framerDeployed,
     concurrency: TELEGRAM_SYNC_CONCURRENCY,
+    metadata_refreshed: results.filter(
+      (item) => item.ok && item.metadata_refreshed
+    ).length,
+    icons_refreshed: results.filter(
+      (item) => item.ok && item.icon_refreshed
+    ).length,
     duration_ms: Date.now() - startedAt,
     results,
     removed_listings: removedListings,
@@ -2849,8 +3029,10 @@ app.post("/api/framer/sync-all-listings", async (req, res) => {
 
 // Schedule this endpoint once per day at 12:00 AM America/Phoenix.
 // Render cron uses UTC, so Phoenix midnight is 07:00 UTC year-round.
-// It requests only member counts from Telegram, stores daily snapshots,
-// updates only Member Count + Last Synced At in Framer, then publishes once.
+// It refreshes member counts daily, metadata weekly, and icons monthly.
+// Telegram public pages are scraped first, with Bot API fallback.
+// Framer receives daily member fields plus full CMS refreshes for listings
+// whose weekly metadata or monthly icon changed, then publishes once.
 app.get("/api/cron/daily-full-sync", async (req, res) => {
   try {
     if (req.query.secret !== process.env.CRON_SECRET) {
@@ -2872,6 +3054,42 @@ app.get("/api/cron/daily-full-sync", async (req, res) => {
 
     if (listingsError) throw listingsError
 
+    const metadataListingIds = telegramResult.results
+      .filter(
+        (item) =>
+          item.ok &&
+          (item.metadata_refreshed || item.icon_refreshed)
+      )
+      .map((item) => item.id)
+
+    const metadataFramerResults = []
+
+    // Weekly/monthly metadata changes are uncommon at the current scale.
+    // Sync those listings fully without publishing, then let the final
+    // member-count batch perform the single daily publish/deploy.
+    for (const listingId of metadataListingIds) {
+      try {
+        const result = await queueFramerSync(() =>
+          syncListingToFramerCMS(listingId, {
+            publish: false,
+            skipTelegramSync: true,
+          })
+        )
+
+        metadataFramerResults.push({
+          id: listingId,
+          ok: true,
+          slug: result.slug,
+        })
+      } catch (metadataFramerError) {
+        metadataFramerResults.push({
+          id: listingId,
+          ok: false,
+          error: metadataFramerError.message,
+        })
+      }
+    }
+
     const framerResult = await queueFramerSync(() =>
       syncMemberCountsToFramerCMS(freshListings || [], { publish: true })
     )
@@ -2889,8 +3107,19 @@ app.get("/api/cron/daily-full-sync", async (req, res) => {
 
     return res.json({
       ok: true,
-      member_count_only: true,
+      member_count_only: false,
+      schedule: {
+        member_counts: "daily",
+        metadata: "weekly",
+        icons: "monthly",
+      },
       telegram: telegramResult,
+      metadata_framer: {
+        attempted: metadataFramerResults.length,
+        succeeded: metadataFramerResults.filter((item) => item.ok).length,
+        failed: metadataFramerResults.filter((item) => !item.ok).length,
+        results: metadataFramerResults,
+      },
       framer: framerResult,
       duration_ms: Date.now() - startedAt,
       homepage_cache: homepageCache
@@ -5839,7 +6068,7 @@ app.post("/api/listings/refresh-telegram-info", async (req, res) => {
       await supabaseAdmin
         .from("channel_listings")
         .select(
-          "id, telegram_title, telegram_username, telegram_description, telegram_chat_id, icon_url, member_count, listing_type, last_synced_at, telegram_metadata_synced_at"
+          "id, telegram_title, telegram_username, telegram_description, telegram_chat_id, icon_url, member_count, listing_type, last_synced_at, telegram_metadata_synced_at, last_member_scraped_at, last_metadata_scraped_at, last_icon_scraped_at, scrape_source, scrape_failure_count"
         )
         .eq("id", listing.id)
         .single()
