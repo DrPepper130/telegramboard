@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 })
 
 const BACKEND_BUILD_ID =
-  "telehub-tme-scrape-primary-bot-fallback-2026-07-27"
+  "telehub-tme-scrape-logging-homepage-batch-fix-2026-07-27"
 
 app.get("/", (req, res) => {
   res.status(200).json({
@@ -596,6 +596,17 @@ async function syncListingTelegramData(listing) {
   }
 
   if (scraped) {
+    console.log("Telegram public-page scrape succeeded:", {
+      listing_id: listing.id,
+      username: scraped.telegramUsername,
+      member_count: scraped.memberCount,
+      listing_type: scraped.listingType,
+      title: scraped.title,
+      icon_found: Boolean(scraped.iconUrl),
+      source: scraped.source,
+      raw_display: scraped.rawDisplay,
+    })
+
     let iconUrl = listing.icon_url || null
 
     if (scraped.iconUrl) {
@@ -779,6 +790,14 @@ async function syncListingTelegramData(listing) {
     })
   }
 
+  console.log("Telegram Bot API fallback succeeded:", {
+    listing_id: listing.id,
+    target: successfulTarget,
+    member_count: memberCount,
+    listing_type: listingType,
+    source: "telegram_bot_api_fallback",
+  })
+
   return {
     chat,
     memberCount,
@@ -841,6 +860,16 @@ async function syncListingMemberCountFast(listing) {
 
   try {
     const scraped = await fetchPublicTelegramPage(listing)
+
+    console.log("Daily Telegram public-page scrape succeeded:", {
+      listing_id: listing.id,
+      username: scraped.telegramUsername,
+      member_count: scraped.memberCount,
+      listing_type: scraped.listingType,
+      source: scraped.source,
+      raw_display: scraped.rawDisplay,
+    })
+
     memberCount = scraped.memberCount
     successfulTarget = scraped.telegramUsername
     source = scraped.source
@@ -924,6 +953,15 @@ async function syncListingMemberCountFast(listing) {
     console.warn("Member snapshot insert failed:", {
       listing_id: listing.id,
       error: snapshotError.message,
+    })
+  }
+
+  if (source === "telegram_bot_api_fallback") {
+    console.log("Daily Telegram Bot API fallback succeeded:", {
+      listing_id: listing.id,
+      target: successfulTarget,
+      member_count: memberCount,
+      source,
     })
   }
 
@@ -3192,17 +3230,33 @@ async function buildHomepageListings(limit = 18) {
 
   if (listingIds.length > 0) {
     const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString()
+    const snapshotIdBatchSize = Math.max(
+      10,
+      Math.min(
+        Number(process.env.HOMEPAGE_SNAPSHOT_ID_BATCH_SIZE || 75),
+        150
+      )
+    )
 
-    const { data: snapshotData, error: snapshotError } = await supabaseAdmin
-      .from("channel_member_snapshots")
-      .select("listing_id, member_count, created_at")
-      .in("listing_id", listingIds)
-      .gte("created_at", since)
-      .order("created_at", { ascending: true })
+    for (
+      let index = 0;
+      index < listingIds.length;
+      index += snapshotIdBatchSize
+    ) {
+      const idBatch = listingIds.slice(index, index + snapshotIdBatchSize)
 
-    if (snapshotError) throw snapshotError
+      const { data: snapshotData, error: snapshotError } =
+        await supabaseAdmin
+          .from("channel_member_snapshots")
+          .select("listing_id, member_count, created_at")
+          .in("listing_id", idBatch)
+          .gte("created_at", since)
+          .order("created_at", { ascending: true })
 
-    snapshots = snapshotData || []
+      if (snapshotError) throw snapshotError
+
+      snapshots.push(...(snapshotData || []))
+    }
   }
 
   const snapshotsByListing = {}
@@ -5616,6 +5670,94 @@ app.post("/api/telegram/sync-listing/:id", async (req, res) => {
 
 
 
+
+
+app.post("/api/admin/test-telegram-scrape", async (req, res) => {
+  try {
+    const authHeader = String(req.headers.authorization || "")
+    const bearerToken = authHeader.replace(/^Bearer\s+/i, "").trim()
+    const cronSecret = String(req.body?.secret || req.query?.secret || "")
+    const listingId = String(req.body?.listing_id || "").trim()
+    const telegramLink = String(req.body?.telegram_link || "").trim()
+
+    let authorized = false
+
+    if (cronSecret && cronSecret === process.env.CRON_SECRET) {
+      authorized = true
+    }
+
+    if (!authorized && bearerToken) {
+      const {
+        data: { user },
+      } = await supabaseAdmin.auth.getUser(bearerToken)
+
+      const email = String(user?.email || "").toLowerCase()
+      authorized = Boolean(user && ADMIN_EMAILS.includes(email))
+    }
+
+    if (!authorized) {
+      return res.status(401).json({ error: "Unauthorized" })
+    }
+
+    let listing = null
+
+    if (listingId) {
+      const { data, error } = await supabaseAdmin
+        .from("channel_listings")
+        .select(
+          "id, channel_name, telegram_username, telegram_link, telegram_chat_id"
+        )
+        .eq("id", listingId)
+        .single()
+
+      if (error || !data) {
+        return res.status(404).json({ error: "Listing not found." })
+      }
+
+      listing = data
+    } else if (telegramLink) {
+      listing = {
+        id: "scrape-test",
+        channel_name: "Scrape test",
+        telegram_link: telegramLink,
+        telegram_username: extractUsernameFromLink(telegramLink),
+        telegram_chat_id: null,
+      }
+    } else {
+      return res.status(400).json({
+        error: "Provide listing_id or telegram_link.",
+      })
+    }
+
+    const scraped = await fetchPublicTelegramPage(listing)
+
+    console.log("Manual Telegram scrape test succeeded:", {
+      listing_id: listing.id,
+      username: scraped.telegramUsername,
+      member_count: scraped.memberCount,
+      source: scraped.source,
+      raw_display: scraped.rawDisplay,
+    })
+
+    return res.json({
+      ok: true,
+      used_bot_api: false,
+      scraped,
+    })
+  } catch (err) {
+    console.error("Manual Telegram scrape test failed:", {
+      code: err.code,
+      error: err.message,
+      status: err.status,
+    })
+
+    return res.status(err.status || 500).json({
+      ok: false,
+      error: err.message,
+      code: err.code || "TME_SCRAPE_TEST_FAILED",
+    })
+  }
+})
 
 const TELEGRAM_METADATA_REFRESH_COOLDOWN_MS = Math.max(
   60 * 60 * 1000,
