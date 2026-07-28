@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 })
 
 const BACKEND_BUILD_ID =
-  "telehub-bulk-framer-image-isolation-2026-07-27"
+  "telehub-sharp-icon-normalization-2026-07-27"
 
 app.get("/", (req, res) => {
   res.status(200).json({
@@ -500,7 +500,6 @@ async function fetchPublicTelegramPage(listing) {
 function detectImageFormat(buffer) {
   if (!Buffer.isBuffer(buffer) || buffer.length < 12) return null
 
-  // JPEG
   if (
     buffer[0] === 0xff &&
     buffer[1] === 0xd8 &&
@@ -509,7 +508,6 @@ function detectImageFormat(buffer) {
     return { extension: "jpg", contentType: "image/jpeg" }
   }
 
-  // PNG
   if (
     buffer[0] === 0x89 &&
     buffer[1] === 0x50 &&
@@ -523,13 +521,11 @@ function detectImageFormat(buffer) {
     return { extension: "png", contentType: "image/png" }
   }
 
-  // GIF
   const gifHeader = buffer.subarray(0, 6).toString("ascii")
   if (gifHeader === "GIF87a" || gifHeader === "GIF89a") {
     return { extension: "gif", contentType: "image/gif" }
   }
 
-  // WebP: RIFF....WEBP
   if (
     buffer.subarray(0, 4).toString("ascii") === "RIFF" &&
     buffer.subarray(8, 12).toString("ascii") === "WEBP"
@@ -540,6 +536,76 @@ function detectImageFormat(buffer) {
   return null
 }
 
+async function normalizeTelegramIconBuffer(
+  inputBuffer,
+  reportedContentType = ""
+) {
+  if (!Buffer.isBuffer(inputBuffer) || inputBuffer.length === 0) {
+    throw new Error("Telegram icon response was empty.")
+  }
+
+  const cleanReportedType = String(reportedContentType || "")
+    .split(";")[0]
+    .trim()
+    .toLowerCase()
+
+  const detected = detectImageFormat(inputBuffer)
+
+  // Keep already-safe raster formats without recompressing them.
+  if (detected) {
+    return {
+      buffer: inputBuffer,
+      extension: detected.extension,
+      contentType: detected.contentType,
+      converted: false,
+      sourceFormat: detected.extension,
+    }
+  }
+
+  // Sharp handles valid SVG, AVIF, TIFF and other supported formats.
+  // Everything non-standard is normalized to PNG for reliable Framer import.
+  try {
+    const metadata = await sharp(inputBuffer, {
+      failOn: "error",
+      density: 192,
+    }).metadata()
+
+    const outputBuffer = await sharp(inputBuffer, {
+      failOn: "error",
+      density: 192,
+    })
+      .rotate()
+      .resize({
+        width: 1024,
+        height: 1024,
+        fit: "inside",
+        withoutEnlargement: true,
+      })
+      .png({
+        compressionLevel: 9,
+        adaptiveFiltering: true,
+      })
+      .toBuffer()
+
+    return {
+      buffer: outputBuffer,
+      extension: "png",
+      contentType: "image/png",
+      converted: true,
+      sourceFormat:
+        metadata.format ||
+        cleanReportedType ||
+        "unknown",
+    }
+  } catch (err) {
+    throw new Error(
+      `Telegram icon could not be decoded or converted. ` +
+      `Reported content type: ${cleanReportedType || "unknown"}. ` +
+      `Sharp error: ${err.message}`
+    )
+  }
+}
+
 async function uploadRemoteTelegramPhoto(remoteUrl, listingId) {
   if (!remoteUrl) return null
 
@@ -548,7 +614,8 @@ async function uploadRemoteTelegramPhoto(remoteUrl, listingId) {
       "User-Agent":
         process.env.TME_SCRAPE_USER_AGENT ||
         "Mozilla/5.0 (compatible; TeleHubBot/1.0; +https://telehub.to)",
-      Accept: "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+      Accept:
+        "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
     },
   })
 
@@ -558,26 +625,23 @@ async function uploadRemoteTelegramPhoto(remoteUrl, listingId) {
     )
   }
 
+  const reportedContentType =
+    imageRes.headers.get("content-type") || ""
+
   const arrayBuffer = await imageRes.arrayBuffer()
-  const buffer = Buffer.from(arrayBuffer)
-  const detected = detectImageFormat(buffer)
-
-  if (!detected) {
-    const reportedContentType =
-      imageRes.headers.get("content-type") || "unknown"
-
-    throw new Error(
-      `Telegram icon bytes are not a supported JPEG, PNG, GIF, or WebP image. Reported content type: ${reportedContentType}.`
-    )
-  }
+  const inputBuffer = Buffer.from(arrayBuffer)
+  const normalized = await normalizeTelegramIconBuffer(
+    inputBuffer,
+    reportedContentType
+  )
 
   const path =
-    `telegram-icons/${listingId}-${Date.now()}.${detected.extension}`
+    `telegram-icons/${listingId}-${Date.now()}.${normalized.extension}`
 
   const { error } = await supabaseAdmin.storage
     .from("listing-images")
-    .upload(path, buffer, {
-      contentType: detected.contentType,
+    .upload(path, normalized.buffer, {
+      contentType: normalized.contentType,
       upsert: true,
     })
 
@@ -586,6 +650,15 @@ async function uploadRemoteTelegramPhoto(remoteUrl, listingId) {
   const { data } = supabaseAdmin.storage
     .from("listing-images")
     .getPublicUrl(path)
+
+  console.log("Telegram icon normalized:", {
+    listing_id: listingId,
+    source_format: normalized.sourceFormat,
+    output_format: normalized.extension,
+    converted: normalized.converted,
+    bytes_in: inputBuffer.length,
+    bytes_out: normalized.buffer.length,
+  })
 
   return data.publicUrl
 }
@@ -593,18 +666,34 @@ async function uploadRemoteTelegramPhoto(remoteUrl, listingId) {
 async function uploadTelegramPhoto(fileId, listingId) {
   const file = await tg("getFile", { file_id: fileId })
 
-  const fileUrl = `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${file.file_path}`
-  const imageRes = await fetch(fileUrl)
-  const arrayBuffer = await imageRes.arrayBuffer()
-  const buffer = Buffer.from(arrayBuffer)
+  const fileUrl =
+    `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${file.file_path}`
 
-  const ext = file.file_path.split(".").pop() || "jpg"
-  const path = `telegram-icons/${listingId}-${Date.now()}.${ext}`
+  const imageRes = await fetch(fileUrl)
+
+  if (!imageRes.ok) {
+    throw new Error(
+      `Telegram Bot API icon returned HTTP ${imageRes.status}.`
+    )
+  }
+
+  const reportedContentType =
+    imageRes.headers.get("content-type") || ""
+
+  const arrayBuffer = await imageRes.arrayBuffer()
+  const inputBuffer = Buffer.from(arrayBuffer)
+  const normalized = await normalizeTelegramIconBuffer(
+    inputBuffer,
+    reportedContentType
+  )
+
+  const path =
+    `telegram-icons/${listingId}-${Date.now()}.${normalized.extension}`
 
   const { error } = await supabaseAdmin.storage
     .from("listing-images")
-    .upload(path, buffer, {
-      contentType: imageRes.headers.get("content-type") || "image/jpeg",
+    .upload(path, normalized.buffer, {
+      contentType: normalized.contentType,
       upsert: true,
     })
 
@@ -614,56 +703,16 @@ async function uploadTelegramPhoto(fileId, listingId) {
     .from("listing-images")
     .getPublicUrl(path)
 
+  console.log("Telegram Bot API icon normalized:", {
+    listing_id: listingId,
+    source_format: normalized.sourceFormat,
+    output_format: normalized.extension,
+    converted: normalized.converted,
+    bytes_in: inputBuffer.length,
+    bytes_out: normalized.buffer.length,
+  })
+
   return data.publicUrl
-}
-
-
-const TELEGRAM_METADATA_REFRESH_MS = Math.max(
-  24 * 60 * 60 * 1000,
-  Number(
-    process.env.TELEGRAM_METADATA_REFRESH_MS ||
-      7 * 24 * 60 * 60 * 1000
-  )
-)
-
-const TELEGRAM_ICON_REFRESH_MS = Math.max(
-  24 * 60 * 60 * 1000,
-  Number(
-    process.env.TELEGRAM_ICON_REFRESH_MS ||
-      30 * 24 * 60 * 60 * 1000
-  )
-)
-
-function isTelegramRefreshDue(lastRefreshAt, intervalMs) {
-  if (!lastRefreshAt) return true
-
-  const value = new Date(lastRefreshAt).getTime()
-  if (!Number.isFinite(value)) return true
-
-  return Date.now() - value >= intervalMs
-}
-
-function scheduledTelegramRefreshPlan(listing) {
-  const metadataTimestamp =
-    listing.last_metadata_scraped_at ||
-    listing.telegram_metadata_synced_at ||
-    null
-
-  const iconTimestamp =
-    listing.last_icon_scraped_at ||
-    listing.telegram_metadata_synced_at ||
-    null
-
-  return {
-    refreshMetadata: isTelegramRefreshDue(
-      metadataTimestamp,
-      TELEGRAM_METADATA_REFRESH_MS
-    ),
-    refreshIcon: isTelegramRefreshDue(
-      iconTimestamp,
-      TELEGRAM_ICON_REFRESH_MS
-    ),
-  }
 }
 
 async function recordTelegramScrapeFailure(listing, error) {
@@ -1848,6 +1897,7 @@ app.post("/api/discord/vote-feed", async (req, res) => {
 })
 
 const crypto = require("crypto")
+const sharp = require("sharp")
 
 const REFERRAL_DAILY_CAP = 50
 const REFERRAL_WINDOW_HOURS = 24
