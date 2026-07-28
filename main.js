@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 })
 
 const BACKEND_BUILD_ID =
-  "telehub-sharp-icon-normalization-2026-07-27"
+  "telehub-sharp-icon-normalization-plan-fix-2026-07-27"
 
 app.get("/", (req, res) => {
   res.status(200).json({
@@ -30,7 +30,6 @@ const supabaseAdmin = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
 )
-
 
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`
@@ -1019,6 +1018,55 @@ async function runWithConcurrency(items, limit, worker) {
   )
 
   return results
+}
+
+
+const TELEGRAM_METADATA_REFRESH_MS = Math.max(
+  24 * 60 * 60 * 1000,
+  Number(
+    process.env.TELEGRAM_METADATA_REFRESH_MS ||
+      7 * 24 * 60 * 60 * 1000
+  )
+)
+
+const TELEGRAM_ICON_REFRESH_MS = Math.max(
+  24 * 60 * 60 * 1000,
+  Number(
+    process.env.TELEGRAM_ICON_REFRESH_MS ||
+      30 * 24 * 60 * 60 * 1000
+  )
+)
+
+function isTelegramRefreshDue(lastRefreshAt, intervalMs) {
+  if (!lastRefreshAt) return true
+
+  const value = new Date(lastRefreshAt).getTime()
+  if (!Number.isFinite(value)) return true
+
+  return Date.now() - value >= intervalMs
+}
+
+function scheduledTelegramRefreshPlan(listing) {
+  const metadataTimestamp =
+    listing.last_metadata_scraped_at ||
+    listing.telegram_metadata_synced_at ||
+    null
+
+  const iconTimestamp =
+    listing.last_icon_scraped_at ||
+    listing.telegram_metadata_synced_at ||
+    null
+
+  return {
+    refreshMetadata: isTelegramRefreshDue(
+      metadataTimestamp,
+      TELEGRAM_METADATA_REFRESH_MS
+    ),
+    refreshIcon: isTelegramRefreshDue(
+      iconTimestamp,
+      TELEGRAM_ICON_REFRESH_MS
+    ),
+  }
 }
 
 // Lightweight scheduled member-count path:
