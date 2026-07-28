@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 })
 
 const BACKEND_BUILD_ID =
-  "telehub-daily-member-sync-owner-metadata-refresh-2026-07-27"
+  "telehub-tme-scrape-primary-bot-fallback-2026-07-27"
 
 app.get("/", (req, res) => {
   res.status(200).json({
@@ -327,6 +327,231 @@ function extractUsernameFromLink(link) {
   return `@${cleaned}`
 }
 
+
+function decodeHtmlEntities(value) {
+  return String(value || "")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&#160;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&#(\d+);/g, (_, code) =>
+      String.fromCharCode(Number(code))
+    )
+    .replace(/&#x([0-9a-f]+);/gi, (_, code) =>
+      String.fromCharCode(parseInt(code, 16))
+    )
+}
+
+function stripHtml(value) {
+  return decodeHtmlEntities(
+    String(value || "")
+      .replace(/<br\s*\/?>/gi, "\n")
+      .replace(/<[^>]+>/g, "")
+  ).trim()
+}
+
+function publicTelegramUsername(listing) {
+  const username =
+    listing.telegram_username ||
+    extractUsernameFromLink(listing.telegram_link)
+
+  if (!username) return null
+
+  const clean = String(username)
+    .replace(/^@/, "")
+    .trim()
+
+  if (!/^[a-zA-Z0-9_]{3,}$/.test(clean)) return null
+  return clean
+}
+
+function parseDisplayedTelegramCount(rawText) {
+  const normalized = decodeHtmlEntities(rawText)
+    .replace(/\u00a0/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+
+  const match = normalized.match(
+    /([\d\s.,]+)\s+(members?|subscribers?|participants?)/i
+  )
+
+  if (!match) return null
+
+  const countText = match[1].trim()
+  const digitsOnly = countText.replace(/[^\d]/g, "")
+
+  if (!digitsOnly) return null
+
+  return {
+    memberCount: Number(digitsOnly),
+    listingType: /subscribers?/i.test(match[2]) ? "channel" : "group",
+    rawDisplay: match[0],
+  }
+}
+
+async function fetchPublicTelegramPage(listing) {
+  const username = publicTelegramUsername(listing)
+
+  if (!username) {
+    const error = new Error(
+      "No public Telegram username is available for webpage scraping."
+    )
+    error.code = "TME_SCRAPE_UNAVAILABLE"
+    throw error
+  }
+
+  const controller = new AbortController()
+  const timeout = setTimeout(
+    () => controller.abort(),
+    Math.max(3000, Number(process.env.TME_SCRAPE_TIMEOUT_MS || 12000))
+  )
+
+  try {
+    const pageUrl = `https://t.me/${encodeURIComponent(username)}`
+    const response = await fetch(pageUrl, {
+      method: "GET",
+      redirect: "follow",
+      signal: controller.signal,
+      headers: {
+        "User-Agent":
+          process.env.TME_SCRAPE_USER_AGENT ||
+          "Mozilla/5.0 (compatible; TeleHubBot/1.0; +https://telehub.to)",
+        Accept:
+          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.8",
+        "Cache-Control": "no-cache",
+      },
+    })
+
+    if (!response.ok) {
+      const error = new Error(
+        `Telegram public page returned HTTP ${response.status}.`
+      )
+      error.code =
+        response.status === 429
+          ? "TME_SCRAPE_RATE_LIMITED"
+          : "TME_SCRAPE_HTTP_ERROR"
+      error.status = response.status
+      throw error
+    }
+
+    const html = await response.text()
+
+    const titleMatch =
+      html.match(
+        /<div[^>]+class="[^"]*tgme_page_title[^"]*"[^>]*>([\s\S]*?)<\/div>/i
+      ) ||
+      html.match(
+        /<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']*)["']/i
+      )
+
+    const descriptionMatch =
+      html.match(
+        /<div[^>]+class="[^"]*tgme_page_description[^"]*"[^>]*>([\s\S]*?)<\/div>/i
+      ) ||
+      html.match(
+        /<meta[^>]+property=["']og:description["'][^>]+content=["']([^"']*)["']/i
+      )
+
+    const extraMatch = html.match(
+      /<div[^>]+class="[^"]*tgme_page_extra[^"]*"[^>]*>([\s\S]*?)<\/div>/i
+    )
+
+    const imageMatch =
+      html.match(
+        /<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i
+      ) ||
+      html.match(
+        /<img[^>]+class="[^"]*tgme_page_photo_image[^"]*"[^>]+src=["']([^"']+)["']/i
+      )
+
+    const extraText = stripHtml(extraMatch?.[1] || "")
+    const parsedCount = parseDisplayedTelegramCount(extraText)
+
+    if (!parsedCount) {
+      const error = new Error(
+        "Telegram public page did not expose a readable member count."
+      )
+      error.code = "TME_SCRAPE_COUNT_MISSING"
+      throw error
+    }
+
+    return {
+      username,
+      telegramUsername: `@${username}`,
+      telegramLink: `https://t.me/${username}`,
+      title: stripHtml(titleMatch?.[1] || ""),
+      description: stripHtml(descriptionMatch?.[1] || ""),
+      iconUrl: decodeHtmlEntities(imageMatch?.[1] || "") || null,
+      memberCount: parsedCount.memberCount,
+      listingType: parsedCount.listingType,
+      rawDisplay: parsedCount.rawDisplay,
+      source: "tme_public_page",
+    }
+  } finally {
+    clearTimeout(timeout)
+  }
+}
+
+async function uploadRemoteTelegramPhoto(remoteUrl, listingId) {
+  if (!remoteUrl) return null
+
+  const imageRes = await fetch(remoteUrl, {
+    headers: {
+      "User-Agent":
+        process.env.TME_SCRAPE_USER_AGENT ||
+        "Mozilla/5.0 (compatible; TeleHubBot/1.0; +https://telehub.to)",
+      Accept: "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+    },
+  })
+
+  if (!imageRes.ok) {
+    throw new Error(
+      `Telegram public icon returned HTTP ${imageRes.status}.`
+    )
+  }
+
+  const arrayBuffer = await imageRes.arrayBuffer()
+  const buffer = Buffer.from(arrayBuffer)
+  const contentType =
+    imageRes.headers.get("content-type") || "image/jpeg"
+
+  const typeExtension = {
+    "image/png": "png",
+    "image/webp": "webp",
+    "image/gif": "gif",
+    "image/jpeg": "jpg",
+  }[contentType.split(";")[0].trim()]
+
+  const urlExtension =
+    new URL(remoteUrl).pathname.split(".").pop()?.toLowerCase() || ""
+  const ext =
+    typeExtension ||
+    (/^(png|jpe?g|webp|gif)$/.test(urlExtension)
+      ? urlExtension.replace("jpeg", "jpg")
+      : "jpg")
+
+  const path = `telegram-icons/${listingId}-${Date.now()}.${ext}`
+
+  const { error } = await supabaseAdmin.storage
+    .from("listing-images")
+    .upload(path, buffer, {
+      contentType,
+      upsert: true,
+    })
+
+  if (error) throw error
+
+  const { data } = supabaseAdmin.storage
+    .from("listing-images")
+    .getPublicUrl(path)
+
+  return data.publicUrl
+}
+
 async function uploadTelegramPhoto(fileId, listingId) {
   const file = await tg("getFile", { file_id: fileId })
 
@@ -355,45 +580,128 @@ async function uploadTelegramPhoto(fileId, listingId) {
 }
 
 async function syncListingTelegramData(listing) {
+  let scraped = null
+  let scrapeError = null
+
+  try {
+    scraped = await fetchPublicTelegramPage(listing)
+  } catch (err) {
+    scrapeError = err
+    console.warn("Telegram public-page scrape failed; using Bot API fallback:", {
+      listing_id: listing.id,
+      channel_name: listing.channel_name,
+      code: err.code,
+      error: err.message,
+    })
+  }
+
+  if (scraped) {
+    let iconUrl = listing.icon_url || null
+
+    if (scraped.iconUrl) {
+      try {
+        iconUrl = await uploadRemoteTelegramPhoto(
+          scraped.iconUrl,
+          listing.id
+        )
+      } catch (photoErr) {
+        console.warn("Telegram scraped photo upload failed:", {
+          listing_id: listing.id,
+          error: photoErr.message,
+        })
+      }
+    }
+
+    const now = new Date().toISOString()
+
+    const { error: updateError } = await supabaseAdmin
+      .from("channel_listings")
+      .update({
+        telegram_username: scraped.telegramUsername,
+        telegram_title:
+          scraped.title || listing.telegram_title || listing.channel_name,
+        telegram_description:
+          scraped.description ||
+          listing.telegram_description ||
+          null,
+        member_count: scraped.memberCount,
+        icon_url: iconUrl,
+        listing_type: scraped.listingType,
+        last_synced_at: now,
+        telegram_metadata_synced_at: now,
+        updated_at: now,
+      })
+      .eq("id", listing.id)
+
+    if (updateError) throw updateError
+
+    const { error: snapshotError } = await supabaseAdmin
+      .from("channel_member_snapshots")
+      .insert({
+        listing_id: listing.id,
+        member_count: scraped.memberCount,
+        created_at: now,
+      })
+
+    if (snapshotError) {
+      console.warn("Member snapshot insert failed:", {
+        listing_id: listing.id,
+        error: snapshotError.message,
+      })
+    }
+
+    return {
+      chat: null,
+      memberCount: scraped.memberCount,
+      iconUrl,
+      listingType: scraped.listingType,
+      successfulTarget: scraped.telegramUsername,
+      source: scraped.source,
+      rawDisplay: scraped.rawDisplay,
+    }
+  }
+
   const possibleTargets = [
     listing.telegram_chat_id
       ? String(listing.telegram_chat_id).trim()
       : null,
-
     listing.telegram_username
       ? cleanUsername(listing.telegram_username)
       : null,
-
     extractUsernameFromLink(listing.telegram_link),
   ].filter(Boolean)
 
   const uniqueTargets = [...new Set(possibleTargets)]
 
   if (uniqueTargets.length === 0) {
-    throw new Error("No Telegram username, chat ID, or public link found")
+    throw scrapeError || new Error(
+      "No Telegram username, chat ID, or public link found"
+    )
   }
 
   let chat = null
   let successfulTarget = null
-  let lastError = null
+  let lastError = scrapeError
 
   for (const target of uniqueTargets) {
     try {
       chat = await tg("getChat", {
         chat_id: target,
       })
-
       successfulTarget = target
       break
     } catch (err) {
       lastError = err
-
-      console.warn("Telegram getChat failed, trying fallback:", {
+      console.warn("Telegram getChat fallback failed:", {
         listing_id: listing.id,
         channel_name: listing.channel_name,
         target,
         error: err.message,
       })
+
+      if (err?.code === "TELEGRAM_RATE_LIMITED") {
+        throw err
+      }
     }
   }
 
@@ -407,7 +715,6 @@ async function syncListingTelegramData(listing) {
   const memberCount = await tg("getChatMemberCount", {
     chat_id: chat.id,
   })
-
   const listingType = normalizeTelegramType(chat.type)
 
   if (!listingType) {
@@ -425,7 +732,7 @@ async function syncListingTelegramData(listing) {
         listing.id
       )
     } catch (photoErr) {
-      console.warn("Telegram photo upload failed:", {
+      console.warn("Telegram Bot API photo upload failed:", {
         listing_id: listing.id,
         error: photoErr.message,
       })
@@ -433,7 +740,6 @@ async function syncListingTelegramData(listing) {
   }
 
   const now = new Date().toISOString()
-
   const normalizedUsername = cleanUsername(chat.username)
 
   const { error: updateError } = await supabaseAdmin
@@ -479,12 +785,13 @@ async function syncListingTelegramData(listing) {
     iconUrl,
     listingType,
     successfulTarget,
+    source: "telegram_bot_api_fallback",
   }
 }
 
 const TELEGRAM_SYNC_CONCURRENCY = Math.max(
   1,
-  Math.min(Number(process.env.TELEGRAM_SYNC_CONCURRENCY || 6), 12)
+  Math.min(Number(process.env.TELEGRAM_SYNC_CONCURRENCY || 3), 12)
 )
 
 async function runWithConcurrency(items, limit, worker) {
@@ -521,72 +828,86 @@ async function runWithConcurrency(items, limit, worker) {
 }
 
 // Lightweight scheduled member-count path:
-// - Uses the saved Telegram chat ID whenever available.
-// - Falls back directly to the public username when no chat ID is saved.
-// - Calls getChatMemberCount only; it never calls getChat.
-// - Does not fetch metadata or avatars.
+// - Scrapes the public t.me page first.
+// - Uses getChatMemberCount only as a fallback.
+// - Does not refresh metadata or avatars.
 // - Does not connect to Framer.
 // - Inserts one member snapshot per scheduled run.
 async function syncListingMemberCountFast(listing) {
-  const possibleTargets = [
-    listing.telegram_chat_id
-      ? String(listing.telegram_chat_id).trim()
-      : null,
-    listing.telegram_username
-      ? cleanUsername(listing.telegram_username)
-      : null,
-    extractUsernameFromLink(listing.telegram_link),
-  ].filter(Boolean)
-
-  const uniqueTargets = [...new Set(possibleTargets)]
-
-  if (!uniqueTargets.length) {
-    throw new Error("No Telegram chat ID, username, or public link found")
-  }
-
   let memberCount = null
   let successfulTarget = null
-  let lastError = null
+  let source = null
+  let scrapeError = null
 
-  for (const target of uniqueTargets) {
-    try {
-      memberCount = await tg("getChatMemberCount", {
-        chat_id: target,
-      })
-      successfulTarget = target
-      break
-    } catch (err) {
-      lastError = err
-
-      // A Telegram flood wait applies to the bot, not just this identifier.
-      // Do not keep trying fallback identifiers after a 429.
-      if (err?.code === "TELEGRAM_RATE_LIMITED") {
-        throw err
-      }
-    }
+  try {
+    const scraped = await fetchPublicTelegramPage(listing)
+    memberCount = scraped.memberCount
+    successfulTarget = scraped.telegramUsername
+    source = scraped.source
+  } catch (err) {
+    scrapeError = err
+    console.warn("Daily t.me scrape failed; trying Bot API fallback:", {
+      listing_id: listing.id,
+      channel_name: listing.channel_name,
+      code: err.code,
+      error: err.message,
+    })
   }
 
   if (memberCount === null) {
-    if (lastError) throw lastError
-    throw new Error(
-      "Telegram member count could not be loaded using any stored identifier."
-    )
+    const possibleTargets = [
+      listing.telegram_chat_id
+        ? String(listing.telegram_chat_id).trim()
+        : null,
+      listing.telegram_username
+        ? cleanUsername(listing.telegram_username)
+        : null,
+      extractUsernameFromLink(listing.telegram_link),
+    ].filter(Boolean)
+
+    const uniqueTargets = [...new Set(possibleTargets)]
+
+    if (!uniqueTargets.length) {
+      throw scrapeError || new Error(
+        "No Telegram chat ID, username, or public link found"
+      )
+    }
+
+    let lastError = scrapeError
+
+    for (const target of uniqueTargets) {
+      try {
+        memberCount = await tg("getChatMemberCount", {
+          chat_id: target,
+        })
+        successfulTarget = target
+        source = "telegram_bot_api_fallback"
+        break
+      } catch (err) {
+        lastError = err
+
+        if (err?.code === "TELEGRAM_RATE_LIMITED") {
+          throw err
+        }
+      }
+    }
+
+    if (memberCount === null) {
+      if (lastError) throw lastError
+      throw new Error(
+        "Telegram member count could not be loaded from t.me or the Bot API."
+      )
+    }
   }
 
   const now = new Date().toISOString()
-  const updatePayload = {
-    member_count: memberCount,
-    last_synced_at: now,
-  }
-
-  // The scheduled member-count sync never calls getChat.
-  // New listings receive their Telegram chat ID and metadata during import.
-  // Older listings without a saved chat ID keep using their public username
-  // directly with getChatMemberCount.
 
   const { error: updateError } = await supabaseAdmin
     .from("channel_listings")
-    .update(updatePayload)
+    .update({
+      member_count: memberCount,
+      last_synced_at: now,
+    })
     .eq("id", listing.id)
 
   if (updateError) throw updateError
@@ -610,6 +931,7 @@ async function syncListingMemberCountFast(listing) {
     listingId: listing.id,
     memberCount,
     successfulTarget,
+    source,
   }
 }
 
