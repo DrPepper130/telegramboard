@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 })
 
 const BACKEND_BUILD_ID =
-  "telehub-bulk-framer-monthly-sync-2026-07-27"
+  "telehub-bulk-framer-image-isolation-2026-07-27"
 
 app.get("/", (req, res) => {
   res.status(200).json({
@@ -496,6 +496,50 @@ async function fetchPublicTelegramPage(listing) {
   }
 }
 
+
+function detectImageFormat(buffer) {
+  if (!Buffer.isBuffer(buffer) || buffer.length < 12) return null
+
+  // JPEG
+  if (
+    buffer[0] === 0xff &&
+    buffer[1] === 0xd8 &&
+    buffer[2] === 0xff
+  ) {
+    return { extension: "jpg", contentType: "image/jpeg" }
+  }
+
+  // PNG
+  if (
+    buffer[0] === 0x89 &&
+    buffer[1] === 0x50 &&
+    buffer[2] === 0x4e &&
+    buffer[3] === 0x47 &&
+    buffer[4] === 0x0d &&
+    buffer[5] === 0x0a &&
+    buffer[6] === 0x1a &&
+    buffer[7] === 0x0a
+  ) {
+    return { extension: "png", contentType: "image/png" }
+  }
+
+  // GIF
+  const gifHeader = buffer.subarray(0, 6).toString("ascii")
+  if (gifHeader === "GIF87a" || gifHeader === "GIF89a") {
+    return { extension: "gif", contentType: "image/gif" }
+  }
+
+  // WebP: RIFF....WEBP
+  if (
+    buffer.subarray(0, 4).toString("ascii") === "RIFF" &&
+    buffer.subarray(8, 12).toString("ascii") === "WEBP"
+  ) {
+    return { extension: "webp", contentType: "image/webp" }
+  }
+
+  return null
+}
+
 async function uploadRemoteTelegramPhoto(remoteUrl, listingId) {
   if (!remoteUrl) return null
 
@@ -516,30 +560,24 @@ async function uploadRemoteTelegramPhoto(remoteUrl, listingId) {
 
   const arrayBuffer = await imageRes.arrayBuffer()
   const buffer = Buffer.from(arrayBuffer)
-  const contentType =
-    imageRes.headers.get("content-type") || "image/jpeg"
+  const detected = detectImageFormat(buffer)
 
-  const typeExtension = {
-    "image/png": "png",
-    "image/webp": "webp",
-    "image/gif": "gif",
-    "image/jpeg": "jpg",
-  }[contentType.split(";")[0].trim()]
+  if (!detected) {
+    const reportedContentType =
+      imageRes.headers.get("content-type") || "unknown"
 
-  const urlExtension =
-    new URL(remoteUrl).pathname.split(".").pop()?.toLowerCase() || ""
-  const ext =
-    typeExtension ||
-    (/^(png|jpe?g|webp|gif)$/.test(urlExtension)
-      ? urlExtension.replace("jpeg", "jpg")
-      : "jpg")
+    throw new Error(
+      `Telegram icon bytes are not a supported JPEG, PNG, GIF, or WebP image. Reported content type: ${reportedContentType}.`
+    )
+  }
 
-  const path = `telegram-icons/${listingId}-${Date.now()}.${ext}`
+  const path =
+    `telegram-icons/${listingId}-${Date.now()}.${detected.extension}`
 
   const { error } = await supabaseAdmin.storage
     .from("listing-images")
     .upload(path, buffer, {
-      contentType,
+      contentType: detected.contentType,
       upsert: true,
     })
 
@@ -2253,6 +2291,7 @@ async function syncScheduledListingsToFramerCMS(
       updated: 0,
       full_updated: 0,
       member_only_updated: 0,
+      image_skipped: 0,
       skipped: 0,
       failed: 0,
       deployed: false,
@@ -2279,6 +2318,11 @@ async function syncScheduledListingsToFramerCMS(
     const existingBySlug = new Map(
       existingItems.map((item) => [item.slug, item])
     )
+    const imageFieldIds = new Set(
+      fields
+        .filter((field) => field.type === "image")
+        .map((field) => field.id)
+    )
 
     console.log("Bulk scheduled Framer sync started:", {
       listings: approvedListings.length,
@@ -2286,10 +2330,8 @@ async function syncScheduledListingsToFramerCMS(
       cms_items: existingItems.length,
     })
 
-    const payloads = []
+    const entries = []
     const results = []
-    const successfulFullSyncs = []
-    const failedFullSyncs = []
 
     for (const listing of approvedListings) {
       const isFullSync = fullIdSet.has(String(listing.id))
@@ -2302,16 +2344,13 @@ async function syncScheduledListingsToFramerCMS(
           : null)
 
       if (!existingItem?.id) {
-        const result = {
+        results.push({
           id: listing.id,
           ok: false,
           skipped: true,
           full_sync: isFullSync,
           error: "Framer CMS item not found.",
-        }
-
-        results.push(result)
-        if (isFullSync) failedFullSyncs.push(result)
+        })
         continue
       }
 
@@ -2345,32 +2384,32 @@ async function syncScheduledListingsToFramerCMS(
           )
         }
 
-        payloads.push({
-          id: existingItem.id,
-          slug: cmsSlug,
-          fieldData,
-        })
-
         const result = {
           id: listing.id,
-          ok: true,
+          ok: null,
           full_sync: isFullSync,
           cms_item_id: existingItem.id,
           warnings,
+          image_skipped: false,
         }
 
         results.push(result)
-        if (isFullSync) successfulFullSyncs.push(result)
+        entries.push({
+          listing,
+          result,
+          payload: {
+            id: existingItem.id,
+            slug: cmsSlug,
+            fieldData,
+          },
+        })
       } catch (err) {
-        const result = {
+        results.push({
           id: listing.id,
           ok: false,
           full_sync: isFullSync,
           error: err.message,
-        }
-
-        results.push(result)
-        if (isFullSync) failedFullSyncs.push(result)
+        })
       }
     }
 
@@ -2383,24 +2422,119 @@ async function syncScheduledListingsToFramerCMS(
     )
 
     let batches = 0
+    let uploadedCount = 0
 
-    for (let index = 0; index < payloads.length; index += chunkSize) {
-      const batch = payloads.slice(index, index + chunkSize)
-      await collection.addItems(batch)
+    async function uploadEntriesResilient(batchEntries, depth = 0) {
+      if (!batchEntries.length) return
+
       batches += 1
 
-      console.log("Bulk scheduled Framer batch uploaded:", {
-        batch: batches,
-        batch_size: batch.length,
-        uploaded_so_far: Math.min(index + batch.length, payloads.length),
-        total: payloads.length,
-      })
+      try {
+        await collection.addItems(
+          batchEntries.map((entry) => entry.payload)
+        )
+
+        for (const entry of batchEntries) {
+          entry.result.ok = true
+          uploadedCount += 1
+        }
+
+        console.log("Bulk scheduled Framer batch uploaded:", {
+          batch: batches,
+          batch_size: batchEntries.length,
+          uploaded_so_far: uploadedCount,
+          total: entries.length,
+          split_depth: depth,
+        })
+
+        return
+      } catch (err) {
+        console.warn("Bulk Framer batch failed; isolating item:", {
+          batch_size: batchEntries.length,
+          split_depth: depth,
+          error: err.message,
+        })
+
+        if (batchEntries.length > 1) {
+          const midpoint = Math.ceil(batchEntries.length / 2)
+
+          await uploadEntriesResilient(
+            batchEntries.slice(0, midpoint),
+            depth + 1
+          )
+          await uploadEntriesResilient(
+            batchEntries.slice(midpoint),
+            depth + 1
+          )
+          return
+        }
+
+        const entry = batchEntries[0]
+        const originalFieldData = entry.payload.fieldData || {}
+        const fieldDataWithoutImages = {}
+
+        for (const [fieldId, value] of Object.entries(originalFieldData)) {
+          if (!imageFieldIds.has(fieldId)) {
+            fieldDataWithoutImages[fieldId] = value
+          }
+        }
+
+        const removedImageFieldCount =
+          Object.keys(originalFieldData).length -
+          Object.keys(fieldDataWithoutImages).length
+
+        if (removedImageFieldCount > 0) {
+          try {
+            batches += 1
+
+            await collection.addItems([
+              {
+                ...entry.payload,
+                fieldData: fieldDataWithoutImages,
+              },
+            ])
+
+            entry.result.ok = true
+            entry.result.image_skipped = true
+            entry.result.warnings = [
+              ...(entry.result.warnings || []),
+              `Framer could not decode one of this listing's images, so existing CMS images were preserved. Original error: ${err.message}`,
+            ]
+            uploadedCount += 1
+
+            console.warn(
+              "Framer listing uploaded without image fields:",
+              {
+                listing_id: entry.listing.id,
+                cms_item_id: entry.payload.id,
+                removed_image_fields: removedImageFieldCount,
+              }
+            )
+            return
+          } catch (retryErr) {
+            entry.result.ok = false
+            entry.result.error =
+              `Full payload failed: ${err.message}. ` +
+              `Retry without images also failed: ${retryErr.message}`
+            return
+          }
+        }
+
+        entry.result.ok = false
+        entry.result.error = err.message
+      }
+    }
+
+    for (let index = 0; index < entries.length; index += chunkSize) {
+      await uploadEntriesResilient(
+        entries.slice(index, index + chunkSize)
+      )
     }
 
     let deployed = false
 
     if (
-      payloads.length &&
+      uploadedCount > 0 &&
       options.publish !== false &&
       process.env.FRAMER_AUTO_DEPLOY !== "false"
     ) {
@@ -2410,8 +2544,13 @@ async function syncScheduledListingsToFramerCMS(
     }
 
     const now = new Date().toISOString()
+    const successfulFullSyncs = results.filter(
+      (item) => item.full_sync && item.ok === true
+    )
+    const failedFullSyncs = results.filter(
+      (item) => item.full_sync && item.ok === false
+    )
 
-    // Only full metadata syncs need the detailed Framer status columns.
     for (const result of successfulFullSyncs) {
       const warningText =
         Array.isArray(result.warnings) && result.warnings.length
@@ -2455,13 +2594,19 @@ async function syncScheduledListingsToFramerCMS(
     }
 
     return {
-      ok: true,
-      updated: payloads.length,
+      ok: results.every(
+        (item) => item.ok === true || item.skipped === true
+      ),
+      updated: results.filter((item) => item.ok === true).length,
       full_updated: successfulFullSyncs.length,
-      member_only_updated:
-        payloads.length - successfulFullSyncs.length,
+      member_only_updated: results.filter(
+        (item) => !item.full_sync && item.ok === true
+      ).length,
+      image_skipped: results.filter(
+        (item) => item.image_skipped === true
+      ).length,
       skipped: results.filter((item) => item.skipped).length,
-      failed: results.filter((item) => !item.ok).length,
+      failed: results.filter((item) => item.ok === false).length,
       deployed,
       batches,
       batch_size: chunkSize,
