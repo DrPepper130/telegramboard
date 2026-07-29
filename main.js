@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 })
 
 const BACKEND_BUILD_ID =
-  "telehub-telemetr-persistent-rotation-2026-07-29"
+  "telehub-telemetr-persistent-rotation-auth-fix-2026-07-29"
 
 app.get("/", (req, res) => {
   res.status(200).json({
@@ -8577,6 +8577,21 @@ const PORT = process.env.PORT || 3000
 
 const SCRAPER_EVENT_LIMIT = 250
 const activeTelemetrRuns = new Set()
+
+async function getAdminUserFromRequest(req) {
+  const authHeader = String(req.headers.authorization || "")
+  const token = authHeader.replace(/^Bearer\s+/i, "").trim()
+
+  if (!token) return null
+
+  const {
+    data: { user },
+    error,
+  } = await supabaseAdmin.auth.getUser(token)
+
+  if (error || !user || !isBackendAdminUser(user)) return null
+  return user
+}
 
 const TELEMETR_ROTATION_COUNTRIES = [
   "usa","afghanistan","algeria","argentina","armenia","australia","austria",
