@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 })
 
 const BACKEND_BUILD_ID =
-  "telehub-telemetr-discovery-only-2026-07-29"
+  "telehub-telemetr-persistent-rotation-2026-07-29"
 
 app.get("/", (req, res) => {
   res.status(200).json({
@@ -8570,33 +8570,205 @@ app.post("/api/admin/import-telegram-listings", async (req, res) => {
 const PORT = process.env.PORT || 3000
 
 
+
 // ========================================
-// TELEMETR API IMPORT COMMAND CENTER
+// TELEMETR DISCOVERY + PERSISTENT ROTATION
 // ========================================
 
-const TELEMETR_API_BASE = "https://api.telemetr.io"
-const TELEMETR_API_KEY = String(process.env.TELEMETR_API_KEY || "").trim()
-
-const SCRAPER_EVENT_LIMIT = Math.max(
-  50,
-  Math.min(Number(process.env.SCRAPER_EVENT_LIMIT || 300), 1000)
-)
-
+const SCRAPER_EVENT_LIMIT = 250
 const activeTelemetrRuns = new Set()
 
-async function getAdminUserFromRequest(req) {
-  const authHeader = String(req.headers.authorization || "")
-  const token = authHeader.replace(/^Bearer\s+/i, "").trim()
+const TELEMETR_ROTATION_COUNTRIES = [
+  "usa","afghanistan","algeria","argentina","armenia","australia","austria",
+  "azerbaijan","bahrain","bangladesh","belarus","bolivia",
+  "bosnia_and_herzegovina","brazil","bulgaria","cambodia","cameroon","canada",
+  "chile","china","colombia","costa_rica","croatia","czech_republic",
+  "dominican_republic","ecuador","egypt","salvador","estonia","ethiopia",
+  "finland","france","georgia","germany","greece","guatemala","haiti",
+  "honduras","india","indonesia","international","iran","iraq","israel",
+  "italy","ivory_coast","japan","jordan","kazakhstan","kenya","korea",
+  "kyrgyzstan","latvia","lebanon","libya","lithuania","malaysia","mexico",
+  "moldova","mongolia","morocco","myanmar","netherlands","nigeria","norway",
+  "oman","pakistan","palestine","panama","paraguay","peru","philippines",
+  "poland","portugal","puerto_rico","qatar","romania","russia",
+  "saudi_arabia","senegal","serbia","singapore","slovakia","slovenia",
+  "somalia","spain","sri_lanka","sudan","sweden","syria","taiwan",
+  "tajikistan","thailand","tunisia","turkey","turkmenistan","uae",
+  "ukraine","united_kingdom","uruguay","uzbekistan","venezuela","vietnam",
+  "yemen"
+]
+const TELEMETR_ROTATION_CATEGORIES = [
+  "art-and-design",
+  "beauty",
+  "betting-and-casino",
+  "blogs",
+  "books",
+  "business",
+  "career",
+  "cryptocurrencies",
+  "economy-and-finance",
+  "education",
+  "erotic",
+  "facts",
+  "family-and-children",
+  "food-and-drinks",
+  "games",
+  "healthy-lifestyle",
+  "home-and-architecture",
+  "humor-and-entertainment",
+  "law",
+  "linguistics",
+  "marketing-and-pr",
+  "medicine",
+  "motivation-and-quotes",
+  "movies",
+  "music",
+  "nature-and-animals",
+  "news-and-media"
+]
+const TELEMETR_ROTATION_SUBSCRIBER_RANGES = [
+  {
+    "id": "all",
+    "min": null,
+    "max": null
+  },
+  {
+    "id": "100-2000",
+    "min": 100,
+    "max": 2000
+  },
+  {
+    "id": "2000-10000",
+    "min": 2000,
+    "max": 10000
+  },
+  {
+    "id": "10000-100000",
+    "min": 10000,
+    "max": 100000
+  },
+  {
+    "id": "100000-500000",
+    "min": 100000,
+    "max": 500000
+  },
+  {
+    "id": "500000-1000000",
+    "min": 500000,
+    "max": 1000000
+  },
+  {
+    "id": "1000000-plus",
+    "min": 1000000,
+    "max": null
+  }
+]
 
-  if (!token) return null
+function cleanTelemetrUsername(value) {
+  const clean = String(value || "")
+    .trim()
+    .replace(/^@/, "")
+    .replace(/^https?:\/\/(?:www\.)?t\.me\//i, "")
+    .split(/[/?#]/)[0]
 
-  const {
-    data: { user },
-    error,
-  } = await supabaseAdmin.auth.getUser(token)
+  if (!/^[a-zA-Z0-9_]{3,}$/.test(clean)) return null
 
-  if (error || !user || !isBackendAdminUser(user)) return null
-  return user
+  const blocked = new Set([
+    "peer_type_channel",
+    "peer_type_group",
+    "channel",
+    "group",
+    "supergroup",
+    "telegram",
+    "telemetr",
+  ])
+
+  if (blocked.has(clean.toLowerCase())) return null
+  return clean
+}
+
+function telemetrCatalogUrl({
+  country,
+  category,
+  subscriberMin,
+  subscriberMax,
+  page,
+  term,
+}) {
+  const safeCountry = String(country || "usa").trim().toLowerCase()
+  const params = new URLSearchParams()
+
+  if (Number(page || 1) > 1) params.set("page", String(Number(page)))
+  if (category && category !== "all") params.set("categories", category)
+
+  if (subscriberMin || subscriberMax) {
+    params.set(
+      "subscribers",
+      `${subscriberMin || 0},${subscriberMax || ""}`
+    )
+  }
+
+  if (term) params.set("term", String(term).trim())
+
+  const query = params.toString()
+  return `https://telemetr.io/en/catalog/${encodeURIComponent(safeCountry)}${
+    query ? `?${query}` : ""
+  }`
+}
+
+async function fetchTelemetrCatalogPage(filters) {
+  const url = telemetrCatalogUrl(filters)
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), 20000)
+
+  try {
+    const response = await fetch(url, {
+      redirect: "follow",
+      signal: controller.signal,
+      headers: {
+        "User-Agent":
+          process.env.TELEMETR_WEB_USER_AGENT ||
+          "Mozilla/5.0 (compatible; TeleHubDiscovery/1.0; +https://telehub.to)",
+        Accept: "text/html,application/xhtml+xml",
+        "Accept-Language": "en-US,en;q=0.8",
+        "Cache-Control": "no-cache",
+      },
+    })
+
+    if (!response.ok) {
+      const error = new Error(
+        `Telemetr catalog returned HTTP ${response.status}.`
+      )
+      error.status = response.status
+      error.code = "TELEMETR_CATALOG_HTTP_ERROR"
+      throw error
+    }
+
+    const html = await response.text()
+    const usernames = new Set()
+
+    const jsonUsernameRegex = /"username"\s*:\s*"([a-zA-Z0-9_]{3,})"/g
+    const visibleUsernameRegex = />\s*@([a-zA-Z0-9_]{3,})\s*</g
+
+    let match
+    while ((match = jsonUsernameRegex.exec(html))) {
+      const clean = cleanTelemetrUsername(match[1])
+      if (clean) usernames.add(clean)
+    }
+
+    while ((match = visibleUsernameRegex.exec(html))) {
+      const clean = cleanTelemetrUsername(match[1])
+      if (clean) usernames.add(clean)
+    }
+
+    return {
+      url,
+      usernames: [...usernames],
+      html_length: html.length,
+    }
+  } finally {
+    clearTimeout(timeout)
+  }
 }
 
 async function logScraperEvent({
@@ -8606,7 +8778,7 @@ async function logScraperEvent({
   message,
   telegramLink = null,
   listingId = null,
-  metadata = {},
+  metadata = null,
 }) {
   const { error } = await supabaseAdmin.from("scraper_events").insert({
     run_id: runId,
@@ -8616,523 +8788,72 @@ async function logScraperEvent({
     telegram_link: telegramLink,
     listing_id: listingId,
     metadata,
+    created_at: new Date().toISOString(),
   })
 
-  if (error) {
-    console.error("Telemetr event insert failed:", error.message)
-  }
+  if (error) console.error("Could not save scraper event:", error)
 }
 
 async function refreshScraperRunCounters(runId) {
-  const statuses = [
-    "queued",
-    "ready_for_ai",
-    "processing",
-    "created",
-    "duplicate",
-    "failed",
-    "stopped",
-  ]
-
-  const counts = {}
-
-  for (const status of statuses) {
-    const { count, error } = await supabaseAdmin
-      .from("scraper_queue")
-      .select("id", { count: "exact", head: true })
-      .eq("run_id", runId)
-      .eq("status", status)
-
-    if (error) throw error
-    counts[status] = Number(count || 0)
-  }
-
-  const { count: total, error: totalError } = await supabaseAdmin
+  const { data, error } = await supabaseAdmin
     .from("scraper_queue")
-    .select("id", { count: "exact", head: true })
+    .select("status")
     .eq("run_id", runId)
 
-  if (totalError) throw totalError
+  if (error) throw error
 
-  const processed =
-    counts.created + counts.duplicate + counts.failed + counts.stopped
+  const counts = {
+    ready_for_ai: 0,
+    duplicate: 0,
+    failed: 0,
+  }
 
-  const { error: updateError } = await supabaseAdmin
+  for (const row of data || []) {
+    if (Object.prototype.hasOwnProperty.call(counts, row.status)) {
+      counts[row.status] += 1
+    }
+  }
+
+  await supabaseAdmin
     .from("scraper_runs")
     .update({
-      discovered_count: Number(total || 0),
-      queued_count: counts.queued + counts.ready_for_ai,
-      processing_count: counts.processing,
-      processed_count: processed,
-      created_count: counts.created,
+      discovered_count: counts.ready_for_ai,
+      queued_count: counts.ready_for_ai,
+      processing_count: 0,
+      processed_count: 0,
+      created_count: 0,
       duplicate_count: counts.duplicate,
       failed_count: counts.failed,
       updated_at: new Date().toISOString(),
     })
     .eq("id", runId)
 
-  if (updateError) throw updateError
-
-  return {
-    total: Number(total || 0),
-    ...counts,
-    processed,
-  }
+  return counts
 }
 
-async function publishScraperRunFramerBatch(runId) {
-  const { count, error } = await supabaseAdmin
-    .from("scraper_queue")
-    .select("id", { count: "exact", head: true })
-    .eq("run_id", runId)
-    .eq("status", "created")
-    .eq("framer_synced", true)
+async function telemetrListingAlreadyExists(telegramLink) {
+  const username = extractUsernameFromLink(telegramLink)
+  const clean = String(username || "").replace(/^@/, "").toLowerCase()
 
-  if (error) throw error
-
-  if (
-    Number(count || 0) === 0 ||
-    process.env.FRAMER_AUTO_DEPLOY === "false"
-  ) {
-    return false
-  }
-
-  const { connect } = await import("framer-api")
-  const framer = await connect(
-    process.env.FRAMER_PROJECT_URL,
-    process.env.FRAMER_API_KEY
-  )
-
-  try {
-    const publication = await framer.publish()
-    await framer.deploy(publication.deployment.id)
-    return true
-  } finally {
-    await framer.disconnect()
-  }
-}
-
-async function telemetrRequest(path, params = {}) {
-  if (!TELEMETR_API_KEY) {
-    const error = new Error(
-      "Missing TELEMETR_API_KEY in the Render environment."
-    )
-    error.code = "TELEMETR_KEY_MISSING"
-    throw error
-  }
-
-  const url = new URL(path, TELEMETR_API_BASE)
-
-  for (const [key, rawValue] of Object.entries(params)) {
-    if (rawValue === undefined || rawValue === null || rawValue === "") continue
-    url.searchParams.set(key, String(rawValue))
-  }
-
-  const response = await fetch(url, {
-    headers: {
-      Accept: "application/json",
-      "x-api-key": TELEMETR_API_KEY,
-    },
-  })
-
-  const rawBody = await response.text()
-  let body = {}
-
-  try {
-    body = rawBody ? JSON.parse(rawBody) : {}
-  } catch {
-    body = rawBody ? { raw: rawBody.slice(0, 2000) } : {}
-  }
-
-  if (!response.ok) {
-    const message =
-      body?.message ||
-      body?.error ||
-      body?.detail ||
-      body?.raw ||
-      `Telemetr API request failed with status ${response.status}.`
-
-    const error = new Error(
-      typeof message === "string" ? message : JSON.stringify(message)
-    )
-    error.status = response.status
-    error.code =
-      response.status === 401
-        ? "TELEMETR_UNAUTHORIZED"
-        : response.status === 403
-          ? "TELEMETR_FORBIDDEN"
-          : response.status === 412
-            ? "TELEMETR_SUBSCRIPTION_INACTIVE"
-            : response.status === 426
-              ? "TELEMETR_QUOTA_REACHED"
-              : "TELEMETR_API_ERROR"
-    error.response = body
-    throw error
-  }
-
-  return body
-}
-
-function telemetrResultRows(payload) {
-  if (Array.isArray(payload)) return payload
-  if (!payload || typeof payload !== "object") return []
-
-  const preferredKeys = [
-    "channels",
-    "items",
-    "results",
-    "data",
-    "list",
-    "rows",
-  ]
-
-  for (const key of preferredKeys) {
-    const value = payload[key]
-
-    if (Array.isArray(value)) return value
-
-    if (value && typeof value === "object") {
-      const nested = telemetrResultRows(value)
-      if (nested.length) return nested
-    }
-  }
-
-  for (const value of Object.values(payload)) {
-    if (
-      Array.isArray(value) &&
-      value.some(
-        (item) =>
-          item &&
-          typeof item === "object" &&
-          (
-            item.username ||
-            item.telegram_username ||
-            item.peer ||
-            item.internal_id ||
-            item.title
-          )
-      )
-    ) {
-      return value
-    }
-  }
-
-  return []
-}
-
-function firstNonEmpty(...values) {
-  for (const value of values) {
-    if (value !== undefined && value !== null && String(value).trim()) {
-      return value
-    }
-  }
-  return null
-}
-
-function normalizeTelemetrLink(item) {
-  const rawLink = firstNonEmpty(
-    item?.telegram_link,
-    item?.telegram_url,
-    item?.link,
-    item?.url,
-    item?.invite_link,
-    item?.public_link
-  )
-
-  const rawUsername = firstNonEmpty(
-    item?.username,
-    item?.telegram_username,
-    item?.screen_name,
-    item?.name_username,
-    item?.peer
-  )
-
-  if (rawLink) {
-    const cleaned = cleanImportTelegramLink(String(rawLink))
-    if (cleaned && extractUsernameFromLink(cleaned)) return cleaned
-  }
-
-  if (!rawUsername) return ""
-
-  const username = String(rawUsername)
-    .trim()
-    .replace(/^@/, "")
-    .replace(/^https?:\/\/(?:www\.)?t\.me\//i, "")
-    .replace(/^t\.me\//i, "")
-    .split(/[/?#]/)[0]
-
-  if (!/^[a-zA-Z0-9_]{3,}$/.test(username)) return ""
-
-  return `https://t.me/${username}`
-}
-
-function telemetrItemMetadata(item) {
-  const title = firstNonEmpty(
-    item?.title,
-    item?.name,
-    item?.channel_name,
-    item?.telegram_title
-  )
-
-  const subscribers = Number(
-    firstNonEmpty(
-      item?.membersCount,
-      item?.members,
-      item?.subscribers,
-      item?.member_count,
-      item?.participants_count,
-      item?.audience
-    ) || 0
-  )
-
-  const categoryValue = firstNonEmpty(
-    item?.category?.name,
-    item?.category_name,
-    item?.category,
-    item?.categories?.[0]?.name,
-    item?.categories?.[0]
-  )
-
-  const avatarUrl = firstNonEmpty(
-    item?.avatar_url,
-    item?.photoUrl,
-    item?.photo_url,
-    item?.image_url,
-    item?.avatar,
-    item?.photo
-  )
-
-  return {
-    telemetr_internal_id: firstNonEmpty(
-      item?.internal_id,
-      item?.id?.internalId,
-      item?.id,
-      item?.channel_id
-    ),
-    title: title ? String(title) : null,
-    subscribers: Number.isFinite(subscribers) ? subscribers : 0,
-    category: categoryValue ? String(categoryValue) : null,
-    avatar_url:
-      avatarUrl && /^https?:\/\//i.test(String(avatarUrl))
-        ? String(avatarUrl)
-        : null,
-    raw: item,
-  }
-}
-
-async function getTelemetrUsage() {
-  return await telemetrRequest("/v1/usage/info")
-}
-
-async function telemetrCatalogGatewayRequest({
-  country,
-  category,
-  peerType,
-}) {
-  const response = await fetch(
-    "https://gw-prod.telemetr.io/store.v1.Catalog/TopGrowth",
-    {
-      method: "POST",
-      headers: {
-        Accept: "application/json",
-        "Content-Type": "application/json",
-        Origin: "https://telemetr.io",
-        Referer: "https://telemetr.io/",
-        "User-Agent":
-          process.env.TELEMETR_WEB_USER_AGENT ||
-          "Mozilla/5.0 (compatible; TeleHubDiscovery/1.0; +https://telehub.to)",
-      },
-      body: JSON.stringify({
-        filter: {
-          country: country ? [{ countryId: country }] : [],
-          category: category
-            ? [{ categoryId: category }]
-            : [],
-        },
-        sortBy:
-          "TOP_GROWTH_SORT_PARTICIPANTS_GROWTH_7_DAYS",
-      }),
-    }
-  )
-
-  const rawBody = await response.text()
-  let payload = {}
-
-  try {
-    payload = rawBody ? JSON.parse(rawBody) : {}
-  } catch {
-    payload = rawBody ? { raw: rawBody.slice(0, 2000) } : {}
-  }
-
-  if (!response.ok) {
-    const error = new Error(
-      payload?.message ||
-        payload?.error ||
-        payload?.raw ||
-        `Telemetr catalog gateway returned HTTP ${response.status}.`
-    )
-    error.status = response.status
-    error.code = "TELEMETR_CATALOG_GATEWAY_ERROR"
-    error.response = payload
-    throw error
-  }
-
-  const expectedPeer =
-    peerType === "Group"
-      ? "PEER_TYPE_GROUP"
-      : peerType === "Channel"
-        ? "PEER_TYPE_CHANNEL"
-        : null
-
-  const rows = Array.isArray(payload?.items)
-    ? payload.items.filter(
-        (item) => !expectedPeer || item?.peer === expectedPeer
-      )
-    : []
-
-  return {
-    ...payload,
-    items: rows,
-  }
-}
-
-async function getTelemetrChannelInfo(internalId) {
-  if (!internalId) return null
-
-  return await telemetrRequest("/v1/channel/info", {
-    internal_id: internalId,
-  })
-}
-
-async function resolveTelemetrPublicListing(item) {
-  const directLink = normalizeTelemetrLink(item)
-
-  // Search results often expose "peer" as the peer type ("Channel") rather
-  // than the Telegram username. Only trust a direct link when it is not one
-  // of those generic peer-type values.
-  const directUsername = extractUsernameFromLink(directLink)
-  const genericPeerValues = new Set([
-    "channel",
-    "group",
-    "supergroup",
-    "chat",
-  ])
-
-  if (
-    directLink &&
-    directUsername &&
-    !genericPeerValues.has(
-      String(directUsername).replace(/^@/, "").toLowerCase()
-    )
-  ) {
-    return {
-      link: directLink,
-      item,
-      source: "telemetr_search_result",
-    }
-  }
-
-  const internalId = firstNonEmpty(
-    item?.internal_id,
-    item?.id,
-    item?.channel_id
-  )
-
-  if (!internalId) {
-    return {
-      link: "",
-      item,
-      source: "telemetr_search_result",
-    }
-  }
-
-  const infoPayload = await getTelemetrChannelInfo(internalId)
-  const infoRows = telemetrResultRows(infoPayload)
-  const infoItem =
-    infoRows[0] ||
-    infoPayload?.channel ||
-    infoPayload?.data ||
-    infoPayload?.result ||
-    infoPayload
-
-  return {
-    link: normalizeTelemetrLink(infoItem),
-    item: {
-      ...(item && typeof item === "object" ? item : {}),
-      ...(infoItem && typeof infoItem === "object" ? infoItem : {}),
-      internal_id: internalId,
-    },
-    source: "telemetr_channel_info",
-  }
-}
-
-async function getTelemetrPage({
-  peerType,
-  skip,
-  country,
-  language,
-  category,
-  membersMin,
-  sortBy,
-}) {
-  // The website gateway returns the public username directly, so no
-  // /v1/channel/info request is needed. The captured endpoint returns one
-  // ranked set of up to 30 rows per country/category combination.
-  if (skip > 0) {
-    return {
-      items: [],
-      exhausted: true,
-      source: "telemetr_web_catalog",
-    }
-  }
-
-  return await telemetrCatalogGatewayRequest({
-    peerType,
-    country,
-    category,
-  })
-}
-
-async function getTelemetrRunState(runId) {
   const { data, error } = await supabaseAdmin
-    .from("scraper_runs")
-    .select(
-      "id, status, discovery_stop_requested, stop_all_requested, requested_target, sync_to_framer, use_icon_as_background, created_by, country_id, sort"
+    .from("channel_listings")
+    .select("id, channel_name, telegram_link, telegram_username")
+    .or(
+      `telegram_link.ilike.%${clean}%,telegram_username.ilike.%${clean}%`
     )
-    .eq("id", runId)
-    .single()
+    .limit(1)
+    .maybeSingle()
 
   if (error) throw error
-  return data
+  return data || null
 }
 
-async function waitWhileTelemetrPaused(runId) {
-  while (true) {
-    const run = await getTelemetrRunState(runId)
-
-    if (
-      run.stop_all_requested === true ||
-      run.discovery_stop_requested === true ||
-      run.status === "stopped" ||
-      run.status === "cleared"
-    ) {
-      return { stopped: true, run }
-    }
-
-    if (run.status !== "paused") {
-      return { stopped: false, run }
-    }
-
-    await new Promise((resolve) => setTimeout(resolve, 1200))
-  }
-}
-
-async function telemetrQueueAlreadyContains(runId, telegramLink) {
+async function queueAlreadyContainsAnyRun(telegramLink) {
   const { data, error } = await supabaseAdmin
     .from("scraper_queue")
     .select("id")
-    .eq("run_id", runId)
     .eq("telegram_link", telegramLink)
+    .in("status", ["ready_for_ai", "duplicate", "created"])
     .limit(1)
     .maybeSingle()
 
@@ -9140,311 +8861,405 @@ async function telemetrQueueAlreadyContains(runId, telegramLink) {
   return Boolean(data)
 }
 
-async function telemetrListingAlreadyExists(telegramLink) {
-  const username = extractUsernameFromLink(telegramLink)
-  const normalizedUsername = username ? cleanUsername(username) : null
+async function loadRotationProgress(userId) {
+  const { data, error } = await supabaseAdmin
+    .from("telemetr_rotation_progress")
+    .select("*")
+    .eq("user_id", userId)
+    .maybeSingle()
 
-  let query = supabaseAdmin
-    .from("channel_listings")
-    .select("id, channel_name, short_invite")
-    .limit(1)
-
-  if (normalizedUsername) {
-    query = query.or(
-      `telegram_link.eq.${telegramLink},telegram_username.eq.${normalizedUsername}`
-    )
-  } else {
-    query = query.eq("telegram_link", telegramLink)
-  }
-
-  const { data, error } = await query.maybeSingle()
   if (error) throw error
   return data || null
 }
 
-async function updateTelemetrQueueStage(queueItemId, runId, stage, link) {
-  await Promise.all([
-    supabaseAdmin
-      .from("scraper_queue")
-      .update({
-        stage,
-        updated_at: new Date().toISOString(),
-      })
-      .eq("id", queueItemId),
-    supabaseAdmin
-      .from("scraper_runs")
-      .update({
-        status: "importing",
-        current_stage: stage,
-        current_link: link,
-        agent_last_seen_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-      })
-      .eq("id", runId),
-  ])
-}
+async function saveRotationProgress(userId, patch) {
+  const payload = {
+    user_id: userId,
+    ...patch,
+    updated_at: new Date().toISOString(),
+  }
 
-async function processTelemetrQueueItem(run, queueItem) {
-  const runId = run.id
-
-  const { data: claimed, error: claimError } = await supabaseAdmin
-    .from("scraper_queue")
-    .update({
-      status: "processing",
-      stage: "telegram_verification",
-      started_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-    })
-    .eq("id", queueItem.id)
-    .eq("status", "queued")
+  const { data, error } = await supabaseAdmin
+    .from("telemetr_rotation_progress")
+    .upsert(payload, { onConflict: "user_id" })
     .select("*")
-    .maybeSingle()
+    .single()
 
-  if (claimError) throw claimError
-  if (!claimed) return null
+  if (error) throw error
+  return data
+}
 
-  await updateTelemetrQueueStage(
-    queueItem.id,
-    runId,
-    "telegram_verification",
-    queueItem.telegram_link
-  )
+function rotationConfigFromMetadata(metadata) {
+  const countries =
+    Array.isArray(metadata.rotation_countries) &&
+    metadata.rotation_countries.length
+      ? metadata.rotation_countries
+      : TELEMETR_ROTATION_COUNTRIES
 
-  await logScraperEvent({
-    runId,
-    level: "info",
-    stage: "telegram_verification",
-    message: `Verifying ${queueItem.telegram_link} with Telegram.`,
-    telegramLink: queueItem.telegram_link,
-    metadata: {
-      source: "telemetr_api",
-      source_title: queueItem.title || null,
-      source_category: queueItem.category || null,
-      source_subscribers: Number(queueItem.subscribers || 0),
-    },
-  })
+  const categories =
+    Array.isArray(metadata.rotation_categories) &&
+    metadata.rotation_categories.length
+      ? metadata.rotation_categories
+      : TELEMETR_ROTATION_CATEGORIES
 
-  const stageMessages = {
-    telegram_verified: (data) =>
-      `Telegram verified ${data.telegram_title || data.telegram_username}.`,
-    telegram_metadata: (data) =>
-      `${Number(data.member_count || 0).toLocaleString()} members · ${
-        data.listing_type || "unknown type"
-      }.`,
-    language_filtered: (data) =>
-      `Filtered as non-English: ${data.reason || "language filter"}.`,
-    ai_generation_started: () =>
-      "Generating listing content, categories, safety label, and SEO fields.",
-    ai_generated: (data) =>
-      `AI generated "${data.generated_name}" · ${(data.categories || []).join(
-        ", "
-      ) || "General"} · NSFW ${data.is_nsfw ? "Yes" : "No"}.`,
-    slug_selected: (data) => `Selected ${data.public_path}.`,
-    supabase_created: (data) =>
-      `Supabase listing created: ${data.channel_name}.`,
-    avatar_downloaded: (data) =>
-      `Telegram avatar saved${
-        data.background_applied ? " and applied as background" : ""
-      }.`,
-    framer_sync_started: () => "Creating Framer CMS item.",
-    framer_synced: (data) => `Framer CMS ready: ${data.public_url}.`,
-    framer_sync_failed: (data) => `Framer sync failed: ${data.error}.`,
-  }
+  const ranges =
+    Array.isArray(metadata.rotation_subscriber_ranges) &&
+    metadata.rotation_subscriber_ranges.length
+      ? metadata.rotation_subscriber_ranges
+      : TELEMETR_ROTATION_SUBSCRIBER_RANGES
 
-  try {
-    const result = await importSingleTelegramListing(
-      queueItem.telegram_link,
-      {
-        syncToFramer: run.sync_to_framer !== false,
-        useIconAsBackground: run.use_icon_as_background !== false,
-      },
-      { id: run.created_by },
-      async (stage, metadata) => {
-        const stageMap = {
-          telegram_verified: "telegram_verified",
-          telegram_metadata: "telegram_verified",
-          language_filtered: "filtered",
-          ai_generation_started: "ai_generation",
-          ai_generated: "ai_generated",
-          slug_selected: "slug_selected",
-          supabase_created: "supabase_created",
-          avatar_downloaded: "avatar_downloaded",
-          framer_sync_started: "framer_sync",
-          framer_synced: "framer_synced",
-          framer_sync_failed: "framer_failed",
-        }
-
-        const nextStage = stageMap[stage] || stage
-
-        await updateTelemetrQueueStage(
-          queueItem.id,
-          runId,
-          nextStage,
-          queueItem.telegram_link
-        )
-
-        await logScraperEvent({
-          runId,
-          level:
-            stage === "framer_sync_failed"
-              ? "error"
-              : ["ai_generated", "supabase_created", "framer_synced"].includes(
-                    stage
-                  )
-                ? "success"
-                : stage === "language_filtered"
-                  ? "warning"
-                  : "info",
-          stage,
-          message: stageMessages[stage]
-            ? stageMessages[stage](metadata || {})
-            : stage,
-          telegramLink: queueItem.telegram_link,
-          listingId: metadata?.listing_id || null,
-          metadata: {
-            queue_item_id: queueItem.id,
-            ...metadata,
-          },
-        })
-      }
-    )
-
-    const finalStatus = result.filtered
-      ? "failed"
-      : result.skipped
-        ? "duplicate"
-        : result.created
-          ? "created"
-          : "failed"
-
-    const finalStage = result.filtered
-      ? "filtered"
-      : result.skipped
-        ? "duplicate"
-        : result.created
-          ? "completed"
-          : "failed"
-
-    const { error: updateError } = await supabaseAdmin
-      .from("scraper_queue")
-      .update({
-        status: finalStatus,
-        stage: finalStage,
-        listing_id: result.listing_id || result.existing_listing_id || null,
-        result,
-        framer_synced: Boolean(result.framer_synced),
-        error:
-          finalStatus === "failed"
-            ? result.error || "Listing import failed."
-            : null,
-        completed_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-      })
-      .eq("id", queueItem.id)
-
-    if (updateError) throw updateError
-
-    await logScraperEvent({
-      runId,
-      level:
-        finalStatus === "created"
-          ? "success"
-          : finalStatus === "duplicate"
-            ? "warning"
-            : "error",
-      stage:
-        finalStatus === "created"
-          ? "listing_created"
-          : finalStatus === "duplicate"
-            ? "duplicate"
-            : "import_failed",
-      message:
-        finalStatus === "created"
-          ? `Listing created: ${result.channel_name || queueItem.title || queueItem.telegram_link}.`
-          : finalStatus === "duplicate"
-            ? `Duplicate skipped: ${result.existing_name || queueItem.title || queueItem.telegram_link}.`
-            : result.error || `Import failed for ${queueItem.telegram_link}.`,
-      telegramLink: queueItem.telegram_link,
-      listingId: result.listing_id || result.existing_listing_id || null,
-      metadata: result,
-    })
-
-    await refreshScraperRunCounters(runId)
-    return result
-  } catch (error) {
-    const isTelegramRateLimit = error?.code === "TELEGRAM_RATE_LIMITED"
-
-    await supabaseAdmin
-      .from("scraper_queue")
-      .update({
-        status: isTelegramRateLimit ? "queued" : "failed",
-        stage: isTelegramRateLimit ? "rate_limited" : "failed",
-        error: error.message || "Import failed.",
-        updated_at: new Date().toISOString(),
-      })
-      .eq("id", queueItem.id)
-
-    await supabaseAdmin
-      .from("scraper_runs")
-      .update({
-        status: isTelegramRateLimit ? "rate_limited" : "importing",
-        retry_after_seconds: isTelegramRateLimit
-          ? Number(error.retry_after_seconds || 60)
-          : 0,
-        current_stage: isTelegramRateLimit
-          ? "rate_limited"
-          : "failed_item",
-        updated_at: new Date().toISOString(),
-      })
-      .eq("id", runId)
-
-    await logScraperEvent({
-      runId,
-      level: "error",
-      stage: isTelegramRateLimit ? "rate_limited" : "import_failed",
-      message: error.message || "Import failed.",
-      telegramLink: queueItem.telegram_link,
-      metadata: {
-        code: error?.code || null,
-        retry_after_seconds: Number(error?.retry_after_seconds || 0),
-      },
-    })
-
-    await refreshScraperRunCounters(runId).catch(() => {})
-
-    if (isTelegramRateLimit) throw error
-    return null
+  return {
+    countries,
+    categories,
+    ranges,
+    pagesPerCombination: Math.max(
+      1,
+      Math.min(Number(metadata.pages_per_combination || 5), 100)
+    ),
+    combinationsPerRun: Math.max(
+      1,
+      Math.min(Number(metadata.combinations_per_run || 10), 500)
+    ),
   }
 }
 
-async function finishTelemetrRun(runId) {
-  const counts = await refreshScraperRunCounters(runId)
+function currentRotationCombination(progress, config) {
+  const country = config.countries[progress.country_index || 0]
+  const category = config.categories[progress.category_index || 0]
+  const range = config.ranges[progress.range_index || 0]
 
-  const { error } = await supabaseAdmin
+  return { country, category, range }
+}
+
+function advanceRotationCursor(progress, config) {
+  let countryIndex = Number(progress.country_index || 0)
+  let categoryIndex = Number(progress.category_index || 0)
+  let rangeIndex = Number(progress.range_index || 0) + 1
+
+  if (rangeIndex >= config.ranges.length) {
+    rangeIndex = 0
+    categoryIndex += 1
+  }
+
+  if (categoryIndex >= config.categories.length) {
+    categoryIndex = 0
+    countryIndex += 1
+  }
+
+  const complete = countryIndex >= config.countries.length
+
+  return {
+    country_index: complete ? config.countries.length : countryIndex,
+    category_index: complete ? 0 : categoryIndex,
+    range_index: complete ? 0 : rangeIndex,
+    page: 1,
+    completed_combinations:
+      Number(progress.completed_combinations || 0) + 1,
+    is_complete: complete,
+  }
+}
+
+async function shouldStopRun(runId) {
+  const { data } = await supabaseAdmin
     .from("scraper_runs")
-    .update({
-      status: "completed",
-      current_stage: "ready_for_review",
-      current_link: null,
-      framer_deployed: false,
+    .select("status, discovery_stop_requested, stop_all_requested")
+    .eq("id", runId)
+    .single()
+
+  return Boolean(
+    data?.discovery_stop_requested ||
+    data?.stop_all_requested ||
+    ["stopped", "stopping"].includes(data?.status)
+  )
+}
+
+async function waitWhilePaused(runId) {
+  while (true) {
+    const { data } = await supabaseAdmin
+      .from("scraper_runs")
+      .select("status, discovery_stop_requested, stop_all_requested")
+      .eq("id", runId)
+      .single()
+
+    if (
+      data?.discovery_stop_requested ||
+      data?.stop_all_requested ||
+      ["stopped", "stopping"].includes(data?.status)
+    ) {
+      return false
+    }
+
+    if (data?.status !== "paused") return true
+    await new Promise((resolve) => setTimeout(resolve, 1500))
+  }
+}
+
+async function addDiscoveryResult(runId, username, metadata = {}) {
+  const clean = cleanTelemetrUsername(username)
+  if (!clean) return { added: false, reason: "invalid" }
+
+  const telegramLink = `https://t.me/${clean}`
+
+  if (await queueAlreadyContainsAnyRun(telegramLink)) {
+    return { added: false, reason: "already_queued" }
+  }
+
+  const existing = await telemetrListingAlreadyExists(telegramLink)
+
+  if (existing) {
+    await supabaseAdmin.from("scraper_queue").insert({
+      run_id: runId,
+      telegram_link: telegramLink,
+      username: `@${clean}`,
+      title: metadata.title || clean,
+      status: "duplicate",
+      stage: "duplicate",
+      listing_id: existing.id,
+      result: {
+        reason: "duplicate",
+        existing_listing_id: existing.id,
+      },
       completed_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
     })
-    .eq("id", runId)
+
+    return { added: false, reason: "duplicate" }
+  }
+
+  const { data, error } = await supabaseAdmin
+    .from("scraper_queue")
+    .insert({
+      run_id: runId,
+      telegram_link: telegramLink,
+      username: `@${clean}`,
+      title: metadata.title || clean,
+      subscribers: metadata.subscribers || null,
+      category: metadata.category || null,
+      status: "ready_for_ai",
+      stage: "ready_for_ai",
+      result: {
+        source: "telemetr_catalog_html",
+        filters: metadata.filters || null,
+      },
+      updated_at: new Date().toISOString(),
+    })
+    .select("*")
+    .single()
 
   if (error) throw error
 
   await logScraperEvent({
     runId,
     level: "success",
-    stage: "run_completed",
-    message: `Discovery complete: ${counts.ready_for_ai || 0} new link(s) are ready in the manual import box and ${counts.duplicate || 0} duplicate(s) were skipped.`,
+    stage: "ready_for_ai",
+    message: `Ready for review: @${clean}`,
+    telegramLink,
     metadata: {
-      counters: counts,
-      discovery_only: true,
-      framer_deployed: false,
+      queue_item_id: data.id,
+      filters: metadata.filters || null,
     },
   })
+
+  return { added: true, row: data }
+}
+
+async function runSingleFilterDiscovery(run, metadata) {
+  const pages = Math.max(
+    1,
+    Math.min(Number(metadata.pages_per_combination || 5), 100)
+  )
+  const target = Math.max(1, Number(run.requested_target || 100))
+  let accepted = 0
+
+  for (let page = 1; page <= pages && accepted < target; page += 1) {
+    if (!(await waitWhilePaused(run.id))) return accepted
+
+    const result = await fetchTelemetrCatalogPage({
+      country: metadata.country,
+      category: metadata.category,
+      subscriberMin: metadata.subscriber_min,
+      subscriberMax: metadata.subscriber_max,
+      page,
+      term: metadata.term,
+    })
+
+    await logScraperEvent({
+      runId: run.id,
+      stage: "telemetr_catalog_page",
+      message: `Page ${page} returned ${result.usernames.length} username(s).`,
+      metadata: {
+        url: result.url,
+        page,
+        returned: result.usernames.length,
+      },
+    })
+
+    if (!result.usernames.length) break
+
+    for (const username of result.usernames) {
+      if (accepted >= target) break
+      const added = await addDiscoveryResult(run.id, username, {
+        category: metadata.category,
+        filters: {
+          country: metadata.country,
+          category: metadata.category,
+          subscriber_min: metadata.subscriber_min,
+          subscriber_max: metadata.subscriber_max,
+          page,
+          term: metadata.term || "",
+        },
+      })
+      if (added.added) accepted += 1
+    }
+
+    await refreshScraperRunCounters(run.id)
+    await new Promise((resolve) => setTimeout(resolve, 900))
+  }
+
+  return accepted
+}
+
+async function runRotationDiscovery(run, metadata) {
+  const config = rotationConfigFromMetadata(metadata)
+  const totalCombinations =
+    config.countries.length *
+    config.categories.length *
+    config.ranges.length
+
+  let progress = await loadRotationProgress(run.created_by)
+
+  const configSignature = JSON.stringify({
+    countries: config.countries,
+    categories: config.categories,
+    ranges: config.ranges,
+    pages: config.pagesPerCombination,
+  })
+
+  if (!progress || progress.config_signature !== configSignature) {
+    progress = await saveRotationProgress(run.created_by, {
+      config_signature: configSignature,
+      country_index: 0,
+      category_index: 0,
+      range_index: 0,
+      page: 1,
+      completed_combinations: 0,
+      total_combinations: totalCombinations,
+      links_discovered: 0,
+      is_complete: false,
+      last_run_id: run.id,
+      current_filters: null,
+    })
+  }
+
+  let accepted = 0
+  let combinationsProcessed = 0
+  const target = Math.max(1, Number(run.requested_target || 100))
+
+  while (
+    !progress.is_complete &&
+    accepted < target &&
+    combinationsProcessed < config.combinationsPerRun
+  ) {
+    if (!(await waitWhilePaused(run.id))) return accepted
+
+    const combo = currentRotationCombination(progress, config)
+    if (!combo.country || !combo.category || !combo.range) break
+
+    const filters = {
+      country: combo.country,
+      category: combo.category,
+      subscriber_min: combo.range.min,
+      subscriber_max: combo.range.max,
+    }
+
+    progress = await saveRotationProgress(run.created_by, {
+      ...progress,
+      last_run_id: run.id,
+      current_filters: filters,
+      total_combinations: totalCombinations,
+    })
+
+    await logScraperEvent({
+      runId: run.id,
+      stage: "rotation_combination",
+      message:
+        `Rotation ${Number(progress.completed_combinations || 0) + 1}/${totalCombinations}: ` +
+        `${combo.country} · ${combo.category} · ${combo.range.id}`,
+      metadata: filters,
+    })
+
+    let exhausted = false
+
+    for (
+      let page = Math.max(1, Number(progress.page || 1));
+      page <= config.pagesPerCombination && accepted < target;
+      page += 1
+    ) {
+      if (!(await waitWhilePaused(run.id))) return accepted
+
+      const result = await fetchTelemetrCatalogPage({
+        country: combo.country,
+        category: combo.category,
+        subscriberMin: combo.range.min,
+        subscriberMax: combo.range.max,
+        page,
+      })
+
+      await logScraperEvent({
+        runId: run.id,
+        stage: "telemetr_catalog_page",
+        message:
+          `${combo.country} / ${combo.category} / ${combo.range.id} / page ${page} ` +
+          `returned ${result.usernames.length} username(s).`,
+        metadata: {
+          ...filters,
+          page,
+          url: result.url,
+          returned: result.usernames.length,
+        },
+      })
+
+      if (!result.usernames.length) {
+        exhausted = true
+        break
+      }
+
+      for (const username of result.usernames) {
+        if (accepted >= target) break
+        const added = await addDiscoveryResult(run.id, username, {
+          category: combo.category,
+          filters: { ...filters, page },
+        })
+        if (added.added) accepted += 1
+      }
+
+      progress = await saveRotationProgress(run.created_by, {
+        ...progress,
+        page: page + 1,
+        links_discovered:
+          Number(progress.links_discovered || 0) + accepted,
+        last_run_id: run.id,
+      })
+
+      await refreshScraperRunCounters(run.id)
+      await new Promise((resolve) => setTimeout(resolve, 900))
+    }
+
+    if (
+      exhausted ||
+      Number(progress.page || 1) > config.pagesPerCombination ||
+      accepted >= target
+    ) {
+      progress = await saveRotationProgress(run.created_by, {
+        ...progress,
+        ...advanceRotationCursor(progress, config),
+        last_run_id: run.id,
+      })
+      combinationsProcessed += 1
+    }
+  }
+
+  return accepted
 }
 
 async function runTelemetrImport(runId) {
@@ -9452,53 +9267,26 @@ async function runTelemetrImport(runId) {
   activeTelemetrRuns.add(runId)
 
   try {
-    let run = await getTelemetrRunState(runId)
-    const config =
-      run?.metadata && typeof run.metadata === "object" ? run.metadata : {}
-
-    // Older scraper_runs schemas may not expose metadata through the selected
-    // columns above, so fetch the complete row once.
-    const { data: fullRun, error: fullRunError } = await supabaseAdmin
+    const { data: run, error } = await supabaseAdmin
       .from("scraper_runs")
       .select("*")
       .eq("id", runId)
       .single()
 
-    if (fullRunError) throw fullRunError
-    run = fullRun
+    if (error) throw error
 
-    const target = Math.max(
-      1,
-      Math.min(Number(run.requested_target || 100), 10000)
-    )
-    const sourceParts = String(run.source || "").split(":")
-    const fallbackPeerType = ["Channel", "Group", "All"].includes(sourceParts[1])
-      ? sourceParts[1]
-      : "Channel"
-    const fallbackMembersMin = Math.max(0, Number(sourceParts[2] || 0))
-
-    const options =
+    const metadata =
       run.metadata && typeof run.metadata === "object"
         ? run.metadata
-        : {
-            peer_type: fallbackPeerType,
-            members_min: fallbackMembersMin,
-            country: run.country_id || "",
-            sort_by: run.sort || "Members",
-          }
-
-    const peerTypes =
-      options.peer_type === "Group"
-        ? ["Group"]
-        : options.peer_type === "All"
-          ? ["Channel", "Group"]
-          : ["Channel"]
+        : {}
 
     await supabaseAdmin
       .from("scraper_runs")
       .update({
         status: "scraping",
-        current_stage: "telemetr_connecting",
+        current_stage: metadata.rotation_mode
+          ? "rotation_discovery"
+          : "telemetr_catalog",
         started_at: run.started_at || new Date().toISOString(),
         agent_last_seen_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
@@ -9507,244 +9295,46 @@ async function runTelemetrImport(runId) {
 
     await logScraperEvent({
       runId,
-      level: "info",
       stage: "telemetr_connecting",
-      message: "Connected to Telemetr's public catalog data source. Discovery will stop before AI generation or publishing.",
-      metadata: {
-        peer_types: peerTypes,
-        target,
-      },
+      message: metadata.rotation_mode
+        ? "Persistent rotation resumed from the saved cursor."
+        : "Single-filter Telemetr discovery started.",
+      metadata,
     })
+
+    const accepted = metadata.rotation_mode
+      ? await runRotationDiscovery(run, metadata)
+      : await runSingleFilterDiscovery(run, metadata)
+
+    const counts = await refreshScraperRunCounters(runId)
+
+    await supabaseAdmin
+      .from("scraper_runs")
+      .update({
+        status: "completed",
+        current_stage: "ready_for_review",
+        current_link: null,
+        framer_deployed: false,
+        completed_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", runId)
 
     await logScraperEvent({
       runId,
-      level: "info",
-      stage: "telemetr_discovery_mode",
-      message: "Discovery-only mode is active. Links will be placed in the manual AI import box.",
+      level: "success",
+      stage: "run_completed",
+      message:
+        `Discovery complete: ${counts.ready_for_ai} new link(s) are ready for review. ` +
+        `${counts.duplicate} duplicate(s) were skipped.`,
+      metadata: {
+        accepted,
+        counters: counts,
+        discovery_only: true,
+      },
     })
-
-    let accepted = 0
-    let exhaustedSources = 0
-
-    for (const peerType of peerTypes) {
-      if (accepted >= target) break
-
-      let skip = 0
-      const pageLimit = 30
-      const maximumSkip = 0
-
-      while (accepted < target && skip <= maximumSkip) {
-        const pauseState = await waitWhileTelemetrPaused(runId)
-        if (pauseState.stopped) {
-          await logScraperEvent({
-            runId,
-            level: "warning",
-            stage: "run_stopped",
-            message: "Telemetr import stopped. Existing imported listings were preserved.",
-          })
-          return
-        }
-
-        await supabaseAdmin
-          .from("scraper_runs")
-          .update({
-            status: "scraping",
-            current_stage: "telemetr_catalog",
-            current_link: null,
-            agent_last_seen_at: new Date().toISOString(),
-            updated_at: new Date().toISOString(),
-          })
-          .eq("id", runId)
-
-        const payload = await getTelemetrPage({
-          peerType,
-          skip,
-          country: options.country || "",
-          language: options.language || "",
-          category: options.category || "",
-          membersMin: Number(options.members_min || 0),
-          sortBy: options.sort_by || "Members",
-        })
-
-        const rows = telemetrResultRows(payload)
-
-        await logScraperEvent({
-          runId,
-          level: "info",
-          stage: "telemetr_catalog_page",
-          message: `Telemetr returned ${rows.length} ${peerType.toLowerCase()} result(s) at offset ${skip}.`,
-          metadata: {
-            peer_type: peerType,
-            skip,
-            returned: rows.length,
-            total: payload?.total ?? payload?.count ?? null,
-            audience_count: payload?.audience_count ?? null,
-            response_keys:
-              payload && typeof payload === "object"
-                ? Object.keys(payload).slice(0, 20)
-                : [],
-            data_keys:
-              payload?.data && typeof payload.data === "object"
-                ? Object.keys(payload.data).slice(0, 20)
-                : [],
-          },
-        })
-
-        if (!rows.length) {
-          exhaustedSources += 1
-          break
-        }
-
-        for (const item of rows) {
-          if (accepted >= target) break
-
-          const pauseState = await waitWhileTelemetrPaused(runId)
-          if (pauseState.stopped) return
-
-          const telegramLink = normalizeTelemetrLink(item)
-          const resolvedItem = item
-          const resolutionSource = "telemetr_web_catalog"
-
-          if (!telegramLink) {
-            console.warn("Telemetr result had no usable public Telegram username:", {
-              keys:
-                resolvedItem && typeof resolvedItem === "object"
-                  ? Object.keys(resolvedItem).slice(0, 25)
-                  : [],
-              peer: resolvedItem?.peer || null,
-              username:
-                resolvedItem?.username ||
-                resolvedItem?.telegram_username ||
-                null,
-              internal_id:
-                resolvedItem?.internal_id ||
-                resolvedItem?.id ||
-                resolvedItem?.channel_id ||
-                null,
-              title: resolvedItem?.title || resolvedItem?.name || null,
-            })
-            continue
-          }
-
-          if (await telemetrQueueAlreadyContains(runId, telegramLink)) continue
-
-          const existingListing = await telemetrListingAlreadyExists(telegramLink)
-          const metadata = telemetrItemMetadata(resolvedItem)
-
-          if (existingListing) {
-            const { data: duplicateRow, error: duplicateInsertError } =
-              await supabaseAdmin
-                .from("scraper_queue")
-                .insert({
-                  run_id: runId,
-                  telegram_link: telegramLink,
-                  username: extractUsernameFromLink(telegramLink),
-                  title: metadata.title,
-                  subscribers: metadata.subscribers,
-                  category: metadata.category,
-                  avatar_url: metadata.avatar_url,
-                  status: "duplicate",
-                  stage: "duplicate",
-                  listing_id: existingListing.id,
-                  result: {
-                    ok: true,
-                    skipped: true,
-                    reason: "duplicate",
-                    existing_listing_id: existingListing.id,
-                    existing_name: existingListing.channel_name,
-                    source: "telemetr_web_catalog",
-                    telemetr_internal_id: metadata.telemetr_internal_id,
-                  },
-                  completed_at: new Date().toISOString(),
-                  updated_at: new Date().toISOString(),
-                })
-                .select("*")
-                .single()
-
-            if (duplicateInsertError) throw duplicateInsertError
-
-            await logScraperEvent({
-              runId,
-              level: "warning",
-              stage: "duplicate",
-              message: `Already on TeleHub: ${metadata.title || telegramLink}.`,
-              telegramLink,
-              listingId: existingListing.id,
-              metadata: {
-                queue_item_id: duplicateRow.id,
-                telemetr_internal_id: metadata.telemetr_internal_id,
-              },
-            })
-
-            await refreshScraperRunCounters(runId)
-            continue
-          }
-
-          const { data: queueItem, error: queueError } = await supabaseAdmin
-            .from("scraper_queue")
-            .insert({
-              run_id: runId,
-              telegram_link: telegramLink,
-              username: extractUsernameFromLink(telegramLink),
-              title: metadata.title,
-              subscribers: metadata.subscribers,
-              category: metadata.category,
-              avatar_url: metadata.avatar_url,
-              status: "ready_for_ai",
-              stage: "ready_for_ai",
-              result: {
-                source: "telemetr_web_catalog",
-                telemetr_internal_id: metadata.telemetr_internal_id,
-              },
-              updated_at: new Date().toISOString(),
-            })
-            .select("*")
-            .single()
-
-          if (queueError) throw queueError
-
-          accepted += 1
-
-          await logScraperEvent({
-            runId,
-            level: "success",
-            stage: "ready_for_ai",
-            message: `Ready for review: ${metadata.title || telegramLink}.`,
-            telegramLink,
-            metadata: {
-              queue_item_id: queueItem.id,
-              peer_type: peerType,
-              telemetr_internal_id: metadata.telemetr_internal_id,
-              subscribers: metadata.subscribers,
-              category: metadata.category,
-              resolution_source: resolutionSource,
-            },
-          })
-
-          await refreshScraperRunCounters(runId)
-
-          // Discovery-only mode intentionally stops here. The existing
-          // frontend polling code will copy ready_for_ai links into the
-          // manual import textarea for review.
-        }
-
-        skip += pageLimit
-      }
-    }
-
-    if (accepted < target && exhaustedSources === peerTypes.length) {
-      await logScraperEvent({
-        runId,
-        level: "warning",
-        stage: "telemetr_exhausted",
-        message: `Telemetr returned ${accepted.toLocaleString()} new public link(s) from the captured ranked catalog set. Change country or category to discover a different set.`,
-        metadata: { accepted, target },
-      })
-    }
-
-    await finishTelemetrRun(runId)
   } catch (error) {
-    console.error("Telemetr import run failed:", error)
+    console.error("Telemetr discovery failed:", error)
 
     await supabaseAdmin
       .from("scraper_runs")
@@ -9752,8 +9342,8 @@ async function runTelemetrImport(runId) {
         status: "failed",
         current_stage: "telemetr_failed",
         current_link: null,
-        updated_at: new Date().toISOString(),
         completed_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
       })
       .eq("id", runId)
 
@@ -9761,11 +9351,10 @@ async function runTelemetrImport(runId) {
       runId,
       level: "error",
       stage: "telemetr_failed",
-      message: error.message || "Telemetr import failed.",
+      message: error.message || "Telemetr discovery failed.",
       metadata: {
         code: error?.code || null,
         status: error?.status || null,
-        response: error?.response || null,
       },
     })
   } finally {
@@ -9773,93 +9362,92 @@ async function runTelemetrImport(runId) {
   }
 }
 
-app.get("/api/admin/telemetr/usage", async (req, res) => {
-  try {
-    const user = await getAdminUserFromRequest(req)
-
-    if (!user) {
-      return res.status(403).json({ error: "Admin access required." })
-    }
-
-    const usage = await getTelemetrUsage()
-    return res.json({ ok: true, usage })
-  } catch (error) {
-    return res.status(error?.status || 500).json({
-      error: error.message,
-      code: error?.code || null,
-    })
-  }
-})
-
 app.post("/api/admin/scraper/start", async (req, res) => {
   try {
     const user = await getAdminUserFromRequest(req)
-
     if (!user) {
       return res.status(403).json({ error: "Admin access required." })
-    }
-
-    const requestedTarget = Number(req.body?.target || 100)
-    const target = Math.max(1, Math.min(requestedTarget, 10000))
-    const peerType = ["Channel", "Group", "All"].includes(req.body?.peer_type)
-      ? req.body.peer_type
-      : "Channel"
-
-    const country = String(req.body?.country || "")
-      .trim()
-      .toLowerCase()
-
-    if (!/^[a-z0-9_]+$/.test(country)) {
-      return res.status(400).json({
-        error: "Choose a valid country before starting the Telemetr import.",
-        code: "TELEMETR_COUNTRY_REQUIRED",
-      })
     }
 
     const { data: activeRun } = await supabaseAdmin
       .from("scraper_runs")
       .select("id, status")
-      .in("status", [
-        "queued",
-        "scraping",
-        "importing",
-        "paused",
-        "rate_limited",
-      ])
+      .in("status", ["queued", "scraping", "paused"])
       .order("created_at", { ascending: false })
       .limit(1)
       .maybeSingle()
 
     if (activeRun) {
       return res.status(409).json({
-        error: "A Telemetr import run is already active.",
+        error: "A Telemetr discovery run is already active.",
         run_id: activeRun.id,
         status: activeRun.status,
       })
     }
 
-    const now = new Date().toISOString()
-    const metadata = {
-      peer_type: peerType,
-      country,
-      language: String(req.body?.language || "").trim(),
-      category: String(req.body?.category || "").trim(),
-      members_min: Math.max(0, Number(req.body?.members_min || 0)),
-      sort_by: String(req.body?.sort_by || "Members").trim(),
-      provider: "telemetr",
+    const country = String(req.body?.country || "usa")
+      .trim()
+      .toLowerCase()
+
+    if (!/^[a-z0-9_]+$/.test(country)) {
+      return res.status(400).json({
+        error: "Choose a valid country.",
+      })
     }
 
-    const { data: run, error: runError } = await supabaseAdmin
+    const metadata = {
+      provider: "telemetr_catalog_html",
+      rotation_mode: req.body?.rotation_mode === true,
+      country,
+      category: String(req.body?.category || "all").trim(),
+      subscriber_min:
+        req.body?.subscriber_min === null ||
+        req.body?.subscriber_min === undefined
+          ? null
+          : Math.max(0, Number(req.body.subscriber_min)),
+      subscriber_max:
+        req.body?.subscriber_max === null ||
+        req.body?.subscriber_max === undefined ||
+        req.body?.subscriber_max === ""
+          ? null
+          : Math.max(0, Number(req.body.subscriber_max)),
+      term: String(req.body?.term || "").trim(),
+      pages_per_combination: Math.max(
+        1,
+        Math.min(Number(req.body?.pages_per_combination || 5), 100)
+      ),
+      combinations_per_run: Math.max(
+        1,
+        Math.min(Number(req.body?.combinations_per_run || 10), 500)
+      ),
+      rotation_countries: Array.isArray(req.body?.rotation_countries)
+        ? req.body.rotation_countries
+        : null,
+      rotation_categories: Array.isArray(req.body?.rotation_categories)
+        ? req.body.rotation_categories
+        : null,
+      rotation_subscriber_ranges:
+        Array.isArray(req.body?.rotation_subscriber_ranges)
+          ? req.body.rotation_subscriber_ranges
+          : null,
+    }
+
+    const now = new Date().toISOString()
+    const { data: run, error } = await supabaseAdmin
       .from("scraper_runs")
       .insert({
-        source: "telemetr_api",
+        source: metadata.rotation_mode
+          ? "telemetr_rotation"
+          : "telemetr_filter",
         status: "queued",
-        requested_target: target,
-        country_id: metadata.country,
-        sort: metadata.sort_by,
-        sync_to_framer: req.body?.sync_to_framer !== false,
-        use_icon_as_background:
-          req.body?.use_icon_as_background !== false,
+        requested_target: Math.max(
+          1,
+          Math.min(Number(req.body?.target || 100), 10000)
+        ),
+        country_id: country,
+        sort: "catalog",
+        sync_to_framer: false,
+        use_icon_as_background: false,
         created_by: user.id,
         discovery_stop_requested: false,
         stop_all_requested: false,
@@ -9871,206 +9459,90 @@ app.post("/api/admin/scraper/start", async (req, res) => {
       .select("*")
       .single()
 
-    if (runError) {
-      // Compatibility for an older scraper_runs table without metadata.
-      if (
-        String(runError.message || "").toLowerCase().includes("metadata")
-      ) {
-        const fallback = await supabaseAdmin
-          .from("scraper_runs")
-          .insert({
-            source: `telemetr_api:${peerType}:${metadata.members_min}`,
-            status: "queued",
-            requested_target: target,
-            country_id: metadata.country,
-            sort: metadata.sort_by,
-            sync_to_framer: req.body?.sync_to_framer !== false,
-            use_icon_as_background:
-              req.body?.use_icon_as_background !== false,
-            created_by: user.id,
-            discovery_stop_requested: false,
-            stop_all_requested: false,
-            current_stage: "queued",
-            created_at: now,
-            updated_at: now,
-          })
-          .select("*")
-          .single()
-
-        if (fallback.error) throw fallback.error
-        fallback.data.metadata = metadata
-
-        // Persist config in the first event when no metadata column exists.
-        await logScraperEvent({
-          runId: fallback.data.id,
-          level: "info",
-          stage: "telemetr_config",
-          message: "Telemetr run configuration saved.",
-          metadata,
-        })
-
-        setImmediate(() => runTelemetrImport(fallback.data.id))
-        return res.json({ ok: true, run: fallback.data })
-      }
-
-      throw runError
-    }
+    if (error) throw error
 
     await logScraperEvent({
       runId: run.id,
-      level: "info",
-      stage: "telemetr_queued",
-      message: `Telemetr API import queued for up to ${target.toLocaleString()} new ${peerType.toLowerCase()} listing(s).`,
+      stage: "telemetr_config",
+      message: metadata.rotation_mode
+        ? "Persistent rotation configuration saved."
+        : "Single-filter discovery configuration saved.",
       metadata,
     })
 
     setImmediate(() => runTelemetrImport(run.id))
-
     return res.json({ ok: true, run })
   } catch (error) {
-    console.error("Start Telemetr run failed:", error)
-    return res.status(500).json({ error: error.message })
+    console.error("Starting Telemetr discovery failed:", error)
+    return res.status(500).json({
+      error: error.message || "Could not start discovery.",
+    })
   }
 })
 
 app.post("/api/admin/scraper/control", async (req, res) => {
   try {
     const user = await getAdminUserFromRequest(req)
-
     if (!user) {
       return res.status(403).json({ error: "Admin access required." })
     }
 
     const runId = String(req.body?.run_id || "").trim()
-    const rawAction = String(req.body?.action || "").trim().toLowerCase()
-    const action =
-      rawAction === "stop_all"
-        ? "stop_discovery"
-        : rawAction === "clear_queue"
-          ? "clear_results"
-          : rawAction
+    const action = String(req.body?.action || "").trim()
 
-    if (
-      !runId ||
-      !["pause", "resume", "stop_discovery", "clear_results"].includes(
-        action
-      )
-    ) {
-      return res.status(400).json({
-        error:
-          "Provide run_id and action: pause, resume, stop_discovery, or clear_results.",
-      })
-    }
+    if (!runId) return res.status(400).json({ error: "Missing run_id." })
 
-    if (action === "clear_results") {
-      const { count, error: countError } = await supabaseAdmin
-        .from("scraper_queue")
-        .select("id", { count: "exact", head: true })
-        .eq("run_id", runId)
+    if (action === "pause") {
+      await supabaseAdmin
+        .from("scraper_runs")
+        .update({ status: "paused", updated_at: new Date().toISOString() })
+        .eq("id", runId)
+    } else if (action === "resume") {
+      await supabaseAdmin
+        .from("scraper_runs")
+        .update({ status: "scraping", updated_at: new Date().toISOString() })
+        .eq("id", runId)
 
-      if (countError) throw countError
-
-      const { error: deleteError } = await supabaseAdmin
-        .from("scraper_queue")
-        .delete()
-        .eq("run_id", runId)
-
-      if (deleteError) throw deleteError
-
-      const { data: run, error: runError } = await supabaseAdmin
+      setImmediate(() => runTelemetrImport(runId))
+    } else if (action === "stop_discovery") {
+      await supabaseAdmin
         .from("scraper_runs")
         .update({
-          status: "cleared",
-          current_stage: "results_cleared",
-          current_link: null,
+          status: "stopped",
           discovery_stop_requested: true,
-          stop_all_requested: true,
-          discovered_count: 0,
-          queued_count: 0,
-          processing_count: 0,
-          processed_count: 0,
-          created_count: 0,
-          duplicate_count: 0,
-          failed_count: 0,
           updated_at: new Date().toISOString(),
         })
         .eq("id", runId)
-        .select("*")
-        .single()
-
-      if (runError) throw runError
-
-      await logScraperEvent({
-        runId,
-        level: "warning",
-        stage: "results_cleared",
-        message: `Cleared ${Number(count || 0)} Telemetr result(s).`,
-        metadata: {
-          cleared_count: Number(count || 0),
-          requested_by: user.id,
-        },
-      })
-
-      return res.json({
-        ok: true,
-        action,
-        cleared_count: Number(count || 0),
-        run,
-      })
+    } else if (action === "clear_results") {
+      await supabaseAdmin
+        .from("scraper_queue")
+        .delete()
+        .eq("run_id", runId)
+    } else {
+      return res.status(400).json({ error: "Unknown control action." })
     }
 
-    const update =
-      action === "pause"
-        ? {
-            status: "paused",
-            current_stage: "paused",
-          }
-        : action === "resume"
-          ? {
-              status: "scraping",
-              current_stage: "resuming_telemetr",
-              discovery_stop_requested: false,
-              stop_all_requested: false,
-            }
-          : {
-              status: "stopped",
-              current_stage: "stopped",
-              discovery_stop_requested: true,
-              stop_all_requested: true,
-            }
+    return res.json({ ok: true })
+  } catch (error) {
+    return res.status(500).json({ error: error.message })
+  }
+})
 
-    const { data: run, error } = await supabaseAdmin
-      .from("scraper_runs")
-      .update({
-        ...update,
-        updated_at: new Date().toISOString(),
-      })
-      .eq("id", runId)
-      .select("*")
-      .single()
+app.post("/api/admin/scraper/rotation/reset", async (req, res) => {
+  try {
+    const user = await getAdminUserFromRequest(req)
+    if (!user) {
+      return res.status(403).json({ error: "Admin access required." })
+    }
+
+    const { error } = await supabaseAdmin
+      .from("telemetr_rotation_progress")
+      .delete()
+      .eq("user_id", user.id)
 
     if (error) throw error
-
-    if (action === "resume" && !activeTelemetrRuns.has(runId)) {
-      setImmediate(() => runTelemetrImport(runId))
-    }
-
-    await logScraperEvent({
-      runId,
-      level: action === "stop_discovery" ? "warning" : "info",
-      stage: `telemetr_${action}`,
-      message:
-        action === "pause"
-          ? "Telemetr import paused after the current item."
-          : action === "resume"
-            ? "Telemetr import resumed."
-            : "Telemetr import stopped. Created listings were preserved.",
-      metadata: { requested_by: user.id },
-    })
-
-    return res.json({ ok: true, action, run })
+    return res.json({ ok: true })
   } catch (error) {
-    console.error("Telemetr control failed:", error)
     return res.status(500).json({ error: error.message })
   }
 })
@@ -10078,7 +9550,6 @@ app.post("/api/admin/scraper/control", async (req, res) => {
 app.get("/api/admin/scraper/status", async (req, res) => {
   try {
     const user = await getAdminUserFromRequest(req)
-
     if (!user) {
       return res.status(403).json({ error: "Admin access required." })
     }
@@ -10104,49 +9575,57 @@ app.get("/api/admin/scraper/status", async (req, res) => {
 
     const run = Array.isArray(runs) ? runs[0] || null : runs || null
 
+    const { data: rotationProgress, error: progressError } =
+      await supabaseAdmin
+        .from("telemetr_rotation_progress")
+        .select("*")
+        .eq("user_id", user.id)
+        .maybeSingle()
+
+    if (progressError) throw progressError
+
     if (!run) {
       return res.json({
         ok: true,
         run: null,
         events: [],
         queue: [],
+        rotation_progress: rotationProgress || null,
       })
     }
 
-    const [{ data: events, error: eventsError }, { data: queue, error: queueError }] =
-      await Promise.all([
-        supabaseAdmin
-          .from("scraper_events")
-          .select("*")
-          .eq("run_id", run.id)
-          .order("created_at", { ascending: false })
-          .limit(SCRAPER_EVENT_LIMIT),
-        supabaseAdmin
-          .from("scraper_queue")
-          .select(
-            "id, telegram_link, username, title, subscribers, category, avatar_url, status, stage, error, listing_id, framer_synced, result, created_at, updated_at"
-          )
-          .eq("run_id", run.id)
-          .order("updated_at", { ascending: false })
-          .limit(100),
-      ])
+    const [eventsResult, queueResult] = await Promise.all([
+      supabaseAdmin
+        .from("scraper_events")
+        .select("*")
+        .eq("run_id", run.id)
+        .order("created_at", { ascending: false })
+        .limit(SCRAPER_EVENT_LIMIT),
+      supabaseAdmin
+        .from("scraper_queue")
+        .select(
+          "id, telegram_link, username, title, subscribers, category, avatar_url, status, stage, error, listing_id, framer_synced, result, created_at, updated_at"
+        )
+        .eq("run_id", run.id)
+        .order("updated_at", { ascending: false })
+        .limit(500),
+    ])
 
-    if (eventsError) throw eventsError
-    if (queueError) throw queueError
+    if (eventsResult.error) throw eventsResult.error
+    if (queueResult.error) throw queueResult.error
 
     return res.json({
       ok: true,
       run,
-      events: (events || []).reverse(),
-      queue: queue || [],
+      events: (eventsResult.data || []).reverse(),
+      queue: queueResult.data || [],
+      rotation_progress: rotationProgress || null,
     })
   } catch (error) {
     console.error("Telemetr status failed:", error)
     return res.status(500).json({ error: error.message })
   }
 })
-
-
 
 // ========================================
 // GROWTH CHALLENGE FEEDBACK
