@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 })
 
 const BACKEND_BUILD_ID =
-  "telehub-telemetr-persistent-rotation-auth-fix-2026-07-29"
+  "telehub-telemetr-rsc-catalog-fix-2026-07-29"
 
 app.get("/", (req, res) => {
   res.status(200).json({
@@ -8731,55 +8731,128 @@ function telemetrCatalogUrl({
   }`
 }
 
+function telemetrRscStateTree(country) {
+  return encodeURIComponent(
+    JSON.stringify([
+      "",
+      {
+        children: [
+          ["lng", "en", "d"],
+          {
+            children: [
+              "(main)",
+              {
+                children: [
+                  "(service)",
+                  {
+                    children: [
+                      "catalog",
+                      {
+                        children: [
+                          ["country", country, "d"],
+                          {
+                            children: [
+                              "__PAGE__",
+                              {},
+                              null,
+                              null,
+                            ],
+                          },
+                          null,
+                          null,
+                        ],
+                      },
+                      null,
+                      null,
+                    ],
+                  },
+                  null,
+                  null,
+                ],
+              },
+              null,
+              null,
+            ],
+          },
+          null,
+          null,
+          true,
+        ],
+      },
+      null,
+      null,
+    ])
+  )
+}
+
 async function fetchTelemetrCatalogPage(filters) {
-  const url = telemetrCatalogUrl(filters)
+  const browserUrl = telemetrCatalogUrl(filters)
+  const country = String(filters.country || "usa")
+    .trim()
+    .toLowerCase()
+
+  const rscUrl = new URL(browserUrl)
+  rscUrl.searchParams.set(
+    "_rsc",
+    Math.random().toString(36).slice(2, 14)
+  )
+
   const controller = new AbortController()
-  const timeout = setTimeout(() => controller.abort(), 20000)
+  const timeout = setTimeout(() => controller.abort(), 25000)
 
   try {
-    const response = await fetch(url, {
+    const response = await fetch(rscUrl.toString(), {
       redirect: "follow",
       signal: controller.signal,
       headers: {
         "User-Agent":
           process.env.TELEMETR_WEB_USER_AGENT ||
-          "Mozilla/5.0 (compatible; TeleHubDiscovery/1.0; +https://telehub.to)",
-        Accept: "text/html,application/xhtml+xml",
-        "Accept-Language": "en-US,en;q=0.8",
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/150.0.0.0 Safari/537.36",
+        Accept: "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
         "Cache-Control": "no-cache",
+        Pragma: "no-cache",
+        RSC: "1",
+        "Next-Url": `/en/catalog/${country}`,
+        "Next-Router-State-Tree": telemetrRscStateTree(country),
+        Referer: `https://telemetr.io/en/catalog/${country}`,
       },
     })
 
     if (!response.ok) {
       const error = new Error(
-        `Telemetr catalog returned HTTP ${response.status}.`
+        `Telemetr catalog RSC request returned HTTP ${response.status}.`
       )
       error.status = response.status
-      error.code = "TELEMETR_CATALOG_HTTP_ERROR"
+      error.code = "TELEMETR_CATALOG_RSC_ERROR"
       throw error
     }
 
-    const html = await response.text()
+    const body = await response.text()
     const usernames = new Set()
 
-    const jsonUsernameRegex = /"username"\s*:\s*"([a-zA-Z0-9_]{3,})"/g
-    const visibleUsernameRegex = />\s*@([a-zA-Z0-9_]{3,})\s*</g
+    const usernameRegex =
+      /["\\]username["\\]?\s*:\s*["\\]([a-zA-Z0-9_]{3,})/g
 
     let match
-    while ((match = jsonUsernameRegex.exec(html))) {
+    while ((match = usernameRegex.exec(body))) {
       const clean = cleanTelemetrUsername(match[1])
       if (clean) usernames.add(clean)
     }
 
-    while ((match = visibleUsernameRegex.exec(html))) {
+    // Defensive fallback for rendered @username text.
+    const visibleUsernameRegex = /@([a-zA-Z0-9_]{3,})/g
+    while ((match = visibleUsernameRegex.exec(body))) {
       const clean = cleanTelemetrUsername(match[1])
       if (clean) usernames.add(clean)
     }
 
     return {
-      url,
+      url: browserUrl,
+      rsc_url: rscUrl.toString(),
       usernames: [...usernames],
-      html_length: html.length,
+      response_length: body.length,
+      source: "telemetr_next_rsc",
     }
   } finally {
     clearTimeout(timeout)
