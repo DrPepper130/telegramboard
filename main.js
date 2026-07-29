@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 })
 
 const BACKEND_BUILD_ID =
-  "telehub-telemetr-subscriber-default-fix-2026-07-29"
+  "telehub-telemetr-nonoverlapping-ranges-2026-07-29"
 
 app.get("/", (req, res) => {
   res.status(200).json({
@@ -8643,34 +8643,34 @@ const TELEMETR_ROTATION_CATEGORIES = [
 ]
 const TELEMETR_ROTATION_SUBSCRIBER_RANGES = [
   {
-    "id": "all",
-    "min": null,
-    "max": null
+    "id": "0-99",
+    "min": 0,
+    "max": 99
   },
   {
-    "id": "100-2000",
+    "id": "100-1999",
     "min": 100,
-    "max": 2000
+    "max": 1999
   },
   {
-    "id": "2000-10000",
+    "id": "2000-9999",
     "min": 2000,
-    "max": 10000
+    "max": 9999
   },
   {
-    "id": "10000-100000",
+    "id": "10000-99999",
     "min": 10000,
-    "max": 100000
+    "max": 99999
   },
   {
-    "id": "100000-500000",
+    "id": "100000-499999",
     "min": 100000,
-    "max": 500000
+    "max": 499999
   },
   {
-    "id": "500000-1000000",
+    "id": "500000-999999",
     "min": 500000,
-    "max": 1000000
+    "max": 999999
   },
   {
     "id": "1000000-plus",
