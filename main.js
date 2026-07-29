@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 })
 
 const BACKEND_BUILD_ID =
-  "telehub-ai-import-public-context-2026-07-29"
+  "telehub-telemetr-country-selector-2026-07-29"
 
 app.get("/", (req, res) => {
   res.status(200).json({
@@ -9667,6 +9667,17 @@ app.post("/api/admin/scraper/start", async (req, res) => {
       ? req.body.peer_type
       : "Channel"
 
+    const country = String(req.body?.country || "")
+      .trim()
+      .toUpperCase()
+
+    if (!/^[A-Z]{2}$/.test(country)) {
+      return res.status(400).json({
+        error: "Choose a valid country before starting the Telemetr import.",
+        code: "TELEMETR_COUNTRY_REQUIRED",
+      })
+    }
+
     const { data: activeRun } = await supabaseAdmin
       .from("scraper_runs")
       .select("id, status")
@@ -9692,7 +9703,7 @@ app.post("/api/admin/scraper/start", async (req, res) => {
     const now = new Date().toISOString()
     const metadata = {
       peer_type: peerType,
-      country: String(req.body?.country || "").trim(),
+      country,
       language: String(req.body?.language || "").trim(),
       category: String(req.body?.category || "").trim(),
       members_min: Math.max(0, Number(req.body?.members_min || 0)),
