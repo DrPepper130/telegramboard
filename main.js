@@ -9669,7 +9669,7 @@ app.post("/api/admin/scraper/start", async (req, res) => {
       .trim()
       .toUpperCase()
 
-    if (!/^[A-Z]{2}$/.test(country)) {
+    if (!/^[A-Z]{2,3}$/.test(country)) {
       return res.status(400).json({
         error: "Choose a valid country before starting the Telemetr import.",
         code: "TELEMETR_COUNTRY_REQUIRED",
