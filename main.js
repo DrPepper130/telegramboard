@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 })
 
 const BACKEND_BUILD_ID =
-  "telehub-telemetr-channel-info-resolution-2026-07-29"
+  "telehub-telemetr-discovery-only-2026-07-29"
 
 app.get("/", (req, res) => {
   res.status(200).json({
@@ -8626,6 +8626,7 @@ async function logScraperEvent({
 async function refreshScraperRunCounters(runId) {
   const statuses = [
     "queued",
+    "ready_for_ai",
     "processing",
     "created",
     "duplicate",
@@ -8660,7 +8661,7 @@ async function refreshScraperRunCounters(runId) {
     .from("scraper_runs")
     .update({
       discovered_count: Number(total || 0),
-      queued_count: counts.queued,
+      queued_count: counts.queued + counts.ready_for_ai,
       processing_count: counts.processing,
       processed_count: processed,
       created_count: counts.created,
@@ -8875,6 +8876,7 @@ function telemetrItemMetadata(item) {
 
   const subscribers = Number(
     firstNonEmpty(
+      item?.membersCount,
       item?.members,
       item?.subscribers,
       item?.member_count,
@@ -8893,6 +8895,7 @@ function telemetrItemMetadata(item) {
 
   const avatarUrl = firstNonEmpty(
     item?.avatar_url,
+    item?.photoUrl,
     item?.photo_url,
     item?.image_url,
     item?.avatar,
@@ -8902,6 +8905,7 @@ function telemetrItemMetadata(item) {
   return {
     telemetr_internal_id: firstNonEmpty(
       item?.internal_id,
+      item?.id?.internalId,
       item?.id,
       item?.channel_id
     ),
@@ -8918,6 +8922,78 @@ function telemetrItemMetadata(item) {
 
 async function getTelemetrUsage() {
   return await telemetrRequest("/v1/usage/info")
+}
+
+async function telemetrCatalogGatewayRequest({
+  country,
+  category,
+  peerType,
+}) {
+  const response = await fetch(
+    "https://gw-prod.telemetr.io/store.v1.Catalog/TopGrowth",
+    {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        Origin: "https://telemetr.io",
+        Referer: "https://telemetr.io/",
+        "User-Agent":
+          process.env.TELEMETR_WEB_USER_AGENT ||
+          "Mozilla/5.0 (compatible; TeleHubDiscovery/1.0; +https://telehub.to)",
+      },
+      body: JSON.stringify({
+        filter: {
+          country: country ? [{ countryId: country }] : [],
+          category: category
+            ? [{ categoryId: category }]
+            : [],
+        },
+        sortBy:
+          "TOP_GROWTH_SORT_PARTICIPANTS_GROWTH_7_DAYS",
+      }),
+    }
+  )
+
+  const rawBody = await response.text()
+  let payload = {}
+
+  try {
+    payload = rawBody ? JSON.parse(rawBody) : {}
+  } catch {
+    payload = rawBody ? { raw: rawBody.slice(0, 2000) } : {}
+  }
+
+  if (!response.ok) {
+    const error = new Error(
+      payload?.message ||
+        payload?.error ||
+        payload?.raw ||
+        `Telemetr catalog gateway returned HTTP ${response.status}.`
+    )
+    error.status = response.status
+    error.code = "TELEMETR_CATALOG_GATEWAY_ERROR"
+    error.response = payload
+    throw error
+  }
+
+  const expectedPeer =
+    peerType === "Group"
+      ? "PEER_TYPE_GROUP"
+      : peerType === "Channel"
+        ? "PEER_TYPE_CHANNEL"
+        : null
+
+  const rows = Array.isArray(payload?.items)
+    ? payload.items.filter(
+        (item) => !expectedPeer || item?.peer === expectedPeer
+      )
+    : []
+
+  return {
+    ...payload,
+    items: rows,
+  }
 }
 
 async function getTelemetrChannelInfo(internalId) {
@@ -8999,17 +9075,21 @@ async function getTelemetrPage({
   membersMin,
   sortBy,
 }) {
-  // Telemetr channel discovery uses /v1/channels/search.
-  // The catalog endpoint rejects this filter combination with HTTP 400.
-  // Keep the request deliberately small and apply the minimum-member filter
-  // locally after Telemetr returns the rows.
-  return await telemetrRequest("/v1/channels/search", {
-    peer_type: peerType === "Group" ? "Group" : "Channel",
+  // The website gateway returns the public username directly, so no
+  // /v1/channel/info request is needed. The captured endpoint returns one
+  // ranked set of up to 30 rows per country/category combination.
+  if (skip > 0) {
+    return {
+      items: [],
+      exhausted: true,
+      source: "telemetr_web_catalog",
+    }
+  }
+
+  return await telemetrCatalogGatewayRequest({
+    peerType,
     country,
-    language,
     category,
-    limit: 30,
-    skip: Math.min(skip, 900),
   })
 }
 
@@ -9340,35 +9420,13 @@ async function processTelemetrQueueItem(run, queueItem) {
 async function finishTelemetrRun(runId) {
   const counts = await refreshScraperRunCounters(runId)
 
-  let deployed = false
-  try {
-    deployed = await publishScraperRunFramerBatch(runId)
-  } catch (error) {
-    await logScraperEvent({
-      runId,
-      level: "error",
-      stage: "framer_deploy_failed",
-      message: error.message,
-    })
-  }
-
-  let homepageCache = null
-  try {
-    homepageCache = await updateHomepageListingCache()
-  } catch (error) {
-    console.error("Telemetr homepage cache refresh failed:", error)
-  }
-
-  const finalStatus =
-    counts.failed > 0 ? "completed_with_errors" : "completed"
-
   const { error } = await supabaseAdmin
     .from("scraper_runs")
     .update({
-      status: finalStatus,
-      current_stage: "completed",
+      status: "completed",
+      current_stage: "ready_for_review",
       current_link: null,
-      framer_deployed: deployed,
+      framer_deployed: false,
       completed_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
     })
@@ -9380,11 +9438,11 @@ async function finishTelemetrRun(runId) {
     runId,
     level: "success",
     stage: "run_completed",
-    message: `Telemetr run complete: ${counts.created} created, ${counts.duplicate} duplicates, ${counts.failed} failed.`,
+    message: `Discovery complete: ${counts.ready_for_ai || 0} new link(s) are ready in the manual import box and ${counts.duplicate || 0} duplicate(s) were skipped.`,
     metadata: {
       counters: counts,
-      framer_deployed: deployed,
-      homepage_cache_count: homepageCache?.listings?.length || null,
+      discovery_only: true,
+      framer_deployed: false,
     },
   })
 }
@@ -9451,31 +9509,19 @@ async function runTelemetrImport(runId) {
       runId,
       level: "info",
       stage: "telemetr_connecting",
-      message: "Connected directly to the Telemetr API. No VM or browser scraper is being used.",
+      message: "Connected to Telemetr's public catalog data source. Discovery will stop before AI generation or publishing.",
       metadata: {
         peer_types: peerTypes,
         target,
       },
     })
 
-    let usage = null
-    try {
-      usage = await getTelemetrUsage()
-      await logScraperEvent({
-        runId,
-        level: "info",
-        stage: "telemetr_usage",
-        message: "Telemetr account usage loaded.",
-        metadata: usage,
-      })
-    } catch (error) {
-      await logScraperEvent({
-        runId,
-        level: "warning",
-        stage: "telemetr_usage_unavailable",
-        message: `Could not load Telemetr usage: ${error.message}`,
-      })
-    }
+    await logScraperEvent({
+      runId,
+      level: "info",
+      stage: "telemetr_discovery_mode",
+      message: "Discovery-only mode is active. Links will be placed in the manual AI import box.",
+    })
 
     let accepted = 0
     let exhaustedSources = 0
@@ -9485,7 +9531,7 @@ async function runTelemetrImport(runId) {
 
       let skip = 0
       const pageLimit = 30
-      const maximumSkip = 900
+      const maximumSkip = 0
 
       while (accepted < target && skip <= maximumSkip) {
         const pauseState = await waitWhileTelemetrPaused(runId)
@@ -9555,27 +9601,9 @@ async function runTelemetrImport(runId) {
           const pauseState = await waitWhileTelemetrPaused(runId)
           if (pauseState.stopped) return
 
-          let resolved
-
-          try {
-            resolved = await resolveTelemetrPublicListing(item)
-          } catch (resolveError) {
-            await logScraperEvent({
-              runId,
-              level: "warning",
-              stage: "telemetr_info_failed",
-              message: `Could not resolve a Telemetr result into a public Telegram link: ${resolveError.message}`,
-              metadata: {
-                internal_id:
-                  item?.internal_id || item?.id || item?.channel_id || null,
-                title: item?.title || item?.name || null,
-              },
-            })
-            continue
-          }
-
-          const telegramLink = resolved.link
-          const resolvedItem = resolved.item || item
+          const telegramLink = normalizeTelemetrLink(item)
+          const resolvedItem = item
+          const resolutionSource = "telemetr_web_catalog"
 
           if (!telegramLink) {
             console.warn("Telemetr result had no usable public Telegram username:", {
@@ -9624,7 +9652,7 @@ async function runTelemetrImport(runId) {
                     reason: "duplicate",
                     existing_listing_id: existingListing.id,
                     existing_name: existingListing.channel_name,
-                    source: "telemetr_api",
+                    source: "telemetr_web_catalog",
                     telemetr_internal_id: metadata.telemetr_internal_id,
                   },
                   completed_at: new Date().toISOString(),
@@ -9662,10 +9690,10 @@ async function runTelemetrImport(runId) {
               subscribers: metadata.subscribers,
               category: metadata.category,
               avatar_url: metadata.avatar_url,
-              status: "queued",
-              stage: "telemetr_discovered",
+              status: "ready_for_ai",
+              stage: "ready_for_ai",
               result: {
-                source: "telemetr_api",
+                source: "telemetr_web_catalog",
                 telemetr_internal_id: metadata.telemetr_internal_id,
               },
               updated_at: new Date().toISOString(),
@@ -9680,8 +9708,8 @@ async function runTelemetrImport(runId) {
           await logScraperEvent({
             runId,
             level: "success",
-            stage: "telemetr_discovered",
-            message: `Discovered ${metadata.title || telegramLink} through Telemetr.`,
+            stage: "ready_for_ai",
+            message: `Ready for review: ${metadata.title || telegramLink}.`,
             telegramLink,
             metadata: {
               queue_item_id: queueItem.id,
@@ -9689,54 +9717,15 @@ async function runTelemetrImport(runId) {
               telemetr_internal_id: metadata.telemetr_internal_id,
               subscribers: metadata.subscribers,
               category: metadata.category,
-              resolution_source: resolved.source,
+              resolution_source: resolutionSource,
             },
           })
 
           await refreshScraperRunCounters(runId)
 
-          try {
-            await processTelemetrQueueItem(run, queueItem)
-          } catch (error) {
-            if (error?.code === "TELEGRAM_RATE_LIMITED") {
-              const retrySeconds = Math.max(
-                1,
-                Number(error.retry_after_seconds || 60)
-              )
-
-              await logScraperEvent({
-                runId,
-                level: "warning",
-                stage: "rate_limit_wait",
-                message: `Telegram rate limit reached. Waiting ${retrySeconds} seconds before continuing.`,
-                metadata: { retry_after_seconds: retrySeconds },
-              })
-
-              await new Promise((resolve) =>
-                setTimeout(resolve, retrySeconds * 1000)
-              )
-
-              await supabaseAdmin
-                .from("scraper_runs")
-                .update({
-                  status: "importing",
-                  retry_after_seconds: 0,
-                  current_stage: "resuming_after_rate_limit",
-                  updated_at: new Date().toISOString(),
-                })
-                .eq("id", runId)
-
-              const { data: queuedAgain } = await supabaseAdmin
-                .from("scraper_queue")
-                .select("*")
-                .eq("id", queueItem.id)
-                .single()
-
-              if (queuedAgain?.status === "queued") {
-                await processTelemetrQueueItem(run, queuedAgain)
-              }
-            }
-          }
+          // Discovery-only mode intentionally stops here. The existing
+          // frontend polling code will copy ready_for_ai links into the
+          // manual import textarea for review.
         }
 
         skip += pageLimit
@@ -9748,7 +9737,7 @@ async function runTelemetrImport(runId) {
         runId,
         level: "warning",
         stage: "telemetr_exhausted",
-        message: `Telemetr returned ${accepted.toLocaleString()} new public links before the available search pages were exhausted.`,
+        message: `Telemetr returned ${accepted.toLocaleString()} new public link(s) from the captured ranked catalog set. Change country or category to discover a different set.`,
         metadata: { accepted, target },
       })
     }
@@ -9808,12 +9797,6 @@ app.post("/api/admin/scraper/start", async (req, res) => {
 
     if (!user) {
       return res.status(403).json({ error: "Admin access required." })
-    }
-
-    if (!TELEMETR_API_KEY) {
-      return res.status(500).json({
-        error: "TELEMETR_API_KEY is missing from Render.",
-      })
     }
 
     const requestedTarget = Number(req.body?.target || 100)
