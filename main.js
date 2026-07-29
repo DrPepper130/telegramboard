@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 })
 
 const BACKEND_BUILD_ID =
-  "telehub-telemetr-country-id-validation-fix-2026-07-29"
+  "telehub-telemetr-peer-link-fix-2026-07-29"
 
 app.get("/", (req, res) => {
   res.status(200).json({
@@ -8834,14 +8834,16 @@ function normalizeTelemetrLink(item) {
     item?.telegram_url,
     item?.link,
     item?.url,
-    item?.invite_link
+    item?.invite_link,
+    item?.public_link
   )
 
   const rawUsername = firstNonEmpty(
     item?.username,
     item?.telegram_username,
     item?.screen_name,
-    item?.name_username
+    item?.name_username,
+    item?.peer
   )
 
   if (rawLink) {
@@ -8855,9 +8857,12 @@ function normalizeTelemetrLink(item) {
     .trim()
     .replace(/^@/, "")
     .replace(/^https?:\/\/(?:www\.)?t\.me\//i, "")
+    .replace(/^t\.me\//i, "")
     .split(/[/?#]/)[0]
 
-  return username ? `https://t.me/${username}` : ""
+  if (!/^[a-zA-Z0-9_]{3,}$/.test(username)) return ""
+
+  return `https://t.me/${username}`
 }
 
 function telemetrItemMetadata(item) {
@@ -9481,7 +9486,20 @@ async function runTelemetrImport(runId) {
           if (pauseState.stopped) return
 
           const telegramLink = normalizeTelemetrLink(item)
-          if (!telegramLink) continue
+
+          if (!telegramLink) {
+            console.warn("Telemetr result had no usable public Telegram username:", {
+              keys:
+                item && typeof item === "object"
+                  ? Object.keys(item).slice(0, 25)
+                  : [],
+              peer: item?.peer || null,
+              username: item?.username || item?.telegram_username || null,
+              internal_id: item?.internal_id || item?.id || null,
+              title: item?.title || item?.name || null,
+            })
+            continue
+          }
 
           if (await telemetrQueueAlreadyContains(runId, telegramLink)) continue
 
