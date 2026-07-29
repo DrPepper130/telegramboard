@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 })
 
 const BACKEND_BUILD_ID =
-  "telehub-telemetr-rsc-catalog-fix-2026-07-29"
+  "telehub-telemetr-subscriber-default-fix-2026-07-29"
 
 app.get("/", (req, res) => {
   res.status(200).json({
@@ -9121,7 +9121,9 @@ async function addDiscoveryResult(runId, username, metadata = {}) {
       telegram_link: telegramLink,
       username: `@${clean}`,
       title: metadata.title || clean,
-      subscribers: metadata.subscribers || null,
+      subscribers: Number.isFinite(Number(metadata.subscribers))
+        ? Number(metadata.subscribers)
+        : 0,
       category: metadata.category || null,
       status: "ready_for_ai",
       stage: "ready_for_ai",
