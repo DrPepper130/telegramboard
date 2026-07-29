@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 })
 
 const BACKEND_BUILD_ID =
-  "telehub-telemetr-nested-results-fix-2026-07-29"
+  "telehub-telemetr-country-id-validation-fix-2026-07-29"
 
 app.get("/", (req, res) => {
   res.status(200).json({
@@ -9708,9 +9708,9 @@ app.post("/api/admin/scraper/start", async (req, res) => {
 
     const country = String(req.body?.country || "")
       .trim()
-      .toUpperCase()
+      .toLowerCase()
 
-    if (!/^[A-Z]{2}$/.test(country)) {
+    if (!/^[a-z0-9_]+$/.test(country)) {
       return res.status(400).json({
         error: "Choose a valid country before starting the Telemetr import.",
         code: "TELEMETR_COUNTRY_REQUIRED",
