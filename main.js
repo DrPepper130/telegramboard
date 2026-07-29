@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 })
 
 const BACKEND_BUILD_ID =
-  "telehub-telemetr-country-selector-2026-07-29"
+  "telehub-telemetr-channel-search-fix-2026-07-29"
 
 app.get("/", (req, res) => {
   res.status(200).json({
@@ -8734,13 +8734,21 @@ async function telemetrRequest(path, params = {}) {
     },
   })
 
-  const body = await response.json().catch(() => ({}))
+  const rawBody = await response.text()
+  let body = {}
+
+  try {
+    body = rawBody ? JSON.parse(rawBody) : {}
+  } catch {
+    body = rawBody ? { raw: rawBody.slice(0, 2000) } : {}
+  }
 
   if (!response.ok) {
     const message =
       body?.message ||
       body?.error ||
       body?.detail ||
+      body?.raw ||
       `Telemetr API request failed with status ${response.status}.`
 
     const error = new Error(
@@ -8883,27 +8891,17 @@ async function getTelemetrPage({
   membersMin,
   sortBy,
 }) {
-  if (peerType === "Group") {
-    return await telemetrRequest("/v1/channels/search", {
-      peer_type: "Group",
-      country,
-      language,
-      category,
-      limit: 30,
-      skip: Math.min(skip, 900),
-    })
-  }
-
-  return await telemetrRequest("/v1/catalog/search", {
+  // Telemetr channel discovery uses /v1/channels/search.
+  // The catalog endpoint rejects this filter combination with HTTP 400.
+  // Keep the request deliberately small and apply the minimum-member filter
+  // locally after Telemetr returns the rows.
+  return await telemetrRequest("/v1/channels/search", {
+    peer_type: peerType === "Group" ? "Group" : "Channel",
     country,
     language,
     category,
-    members_min: membersMin,
-    privacy: "Public",
-    sort_by: sortBy || "Members",
-    sort_direction: "Desc",
-    limit: 100,
-    skip: Math.min(skip, 1000),
+    limit: 30,
+    skip: Math.min(skip, 900),
   })
 }
 
