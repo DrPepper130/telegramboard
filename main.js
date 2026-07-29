@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 })
 
 const BACKEND_BUILD_ID =
-  "telehub-telemetr-peer-link-fix-2026-07-29"
+  "telehub-telemetr-channel-info-resolution-2026-07-29"
 
 app.get("/", (req, res) => {
   res.status(200).json({
@@ -8920,6 +8920,76 @@ async function getTelemetrUsage() {
   return await telemetrRequest("/v1/usage/info")
 }
 
+async function getTelemetrChannelInfo(internalId) {
+  if (!internalId) return null
+
+  return await telemetrRequest("/v1/channel/info", {
+    internal_id: internalId,
+  })
+}
+
+async function resolveTelemetrPublicListing(item) {
+  const directLink = normalizeTelemetrLink(item)
+
+  // Search results often expose "peer" as the peer type ("Channel") rather
+  // than the Telegram username. Only trust a direct link when it is not one
+  // of those generic peer-type values.
+  const directUsername = extractUsernameFromLink(directLink)
+  const genericPeerValues = new Set([
+    "channel",
+    "group",
+    "supergroup",
+    "chat",
+  ])
+
+  if (
+    directLink &&
+    directUsername &&
+    !genericPeerValues.has(
+      String(directUsername).replace(/^@/, "").toLowerCase()
+    )
+  ) {
+    return {
+      link: directLink,
+      item,
+      source: "telemetr_search_result",
+    }
+  }
+
+  const internalId = firstNonEmpty(
+    item?.internal_id,
+    item?.id,
+    item?.channel_id
+  )
+
+  if (!internalId) {
+    return {
+      link: "",
+      item,
+      source: "telemetr_search_result",
+    }
+  }
+
+  const infoPayload = await getTelemetrChannelInfo(internalId)
+  const infoRows = telemetrResultRows(infoPayload)
+  const infoItem =
+    infoRows[0] ||
+    infoPayload?.channel ||
+    infoPayload?.data ||
+    infoPayload?.result ||
+    infoPayload
+
+  return {
+    link: normalizeTelemetrLink(infoItem),
+    item: {
+      ...(item && typeof item === "object" ? item : {}),
+      ...(infoItem && typeof infoItem === "object" ? infoItem : {}),
+      internal_id: internalId,
+    },
+    source: "telemetr_channel_info",
+  }
+}
+
 async function getTelemetrPage({
   peerType,
   skip,
@@ -9414,8 +9484,8 @@ async function runTelemetrImport(runId) {
       if (accepted >= target) break
 
       let skip = 0
-      const pageLimit = peerType === "Group" ? 30 : 100
-      const maximumSkip = peerType === "Group" ? 900 : 1000
+      const pageLimit = 30
+      const maximumSkip = 900
 
       while (accepted < target && skip <= maximumSkip) {
         const pauseState = await waitWhileTelemetrPaused(runId)
@@ -9485,18 +9555,45 @@ async function runTelemetrImport(runId) {
           const pauseState = await waitWhileTelemetrPaused(runId)
           if (pauseState.stopped) return
 
-          const telegramLink = normalizeTelemetrLink(item)
+          let resolved
+
+          try {
+            resolved = await resolveTelemetrPublicListing(item)
+          } catch (resolveError) {
+            await logScraperEvent({
+              runId,
+              level: "warning",
+              stage: "telemetr_info_failed",
+              message: `Could not resolve a Telemetr result into a public Telegram link: ${resolveError.message}`,
+              metadata: {
+                internal_id:
+                  item?.internal_id || item?.id || item?.channel_id || null,
+                title: item?.title || item?.name || null,
+              },
+            })
+            continue
+          }
+
+          const telegramLink = resolved.link
+          const resolvedItem = resolved.item || item
 
           if (!telegramLink) {
             console.warn("Telemetr result had no usable public Telegram username:", {
               keys:
-                item && typeof item === "object"
-                  ? Object.keys(item).slice(0, 25)
+                resolvedItem && typeof resolvedItem === "object"
+                  ? Object.keys(resolvedItem).slice(0, 25)
                   : [],
-              peer: item?.peer || null,
-              username: item?.username || item?.telegram_username || null,
-              internal_id: item?.internal_id || item?.id || null,
-              title: item?.title || item?.name || null,
+              peer: resolvedItem?.peer || null,
+              username:
+                resolvedItem?.username ||
+                resolvedItem?.telegram_username ||
+                null,
+              internal_id:
+                resolvedItem?.internal_id ||
+                resolvedItem?.id ||
+                resolvedItem?.channel_id ||
+                null,
+              title: resolvedItem?.title || resolvedItem?.name || null,
             })
             continue
           }
@@ -9504,7 +9601,7 @@ async function runTelemetrImport(runId) {
           if (await telemetrQueueAlreadyContains(runId, telegramLink)) continue
 
           const existingListing = await telemetrListingAlreadyExists(telegramLink)
-          const metadata = telemetrItemMetadata(item)
+          const metadata = telemetrItemMetadata(resolvedItem)
 
           if (existingListing) {
             const { data: duplicateRow, error: duplicateInsertError } =
@@ -9592,6 +9689,7 @@ async function runTelemetrImport(runId) {
               telemetr_internal_id: metadata.telemetr_internal_id,
               subscribers: metadata.subscribers,
               category: metadata.category,
+              resolution_source: resolved.source,
             },
           })
 
