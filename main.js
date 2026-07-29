@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 })
 
 const BACKEND_BUILD_ID =
-  "telehub-sharp-icon-normalization-plan-fix-2026-07-27"
+  "telehub-ai-import-public-context-2026-07-29"
 
 app.get("/", (req, res) => {
   res.status(200).json({
@@ -490,6 +490,104 @@ async function fetchPublicTelegramPage(listing) {
       listingType: parsedCount.listingType,
       rawDisplay: parsedCount.rawDisplay,
       source: "tme_public_page",
+    }
+  } finally {
+    clearTimeout(timeout)
+  }
+}
+
+
+function compactTelegramPostText(value) {
+  return stripHtml(value)
+    .replace(/\s+/g, " ")
+    .trim()
+}
+
+async function fetchPublicTelegramPostContext(listing, options = {}) {
+  const username = publicTelegramUsername(listing)
+
+  if (!username) {
+    const error = new Error(
+      "No public Telegram username is available for post-context scraping."
+    )
+    error.code = "TME_POST_CONTEXT_UNAVAILABLE"
+    throw error
+  }
+
+  const maxPosts = Math.max(
+    1,
+    Math.min(Number(options.maxPosts || process.env.TME_IMPORT_POST_LIMIT || 15), 30)
+  )
+  const maxCharacters = Math.max(
+    500,
+    Math.min(
+      Number(options.maxCharacters || process.env.TME_IMPORT_CONTEXT_MAX_CHARS || 7000),
+      15000
+    )
+  )
+
+  const controller = new AbortController()
+  const timeout = setTimeout(
+    () => controller.abort(),
+    Math.max(3000, Number(process.env.TME_POST_SCRAPE_TIMEOUT_MS || 12000))
+  )
+
+  try {
+    const pageUrl = `https://t.me/s/${encodeURIComponent(username)}`
+    const response = await fetch(pageUrl, {
+      method: "GET",
+      redirect: "follow",
+      signal: controller.signal,
+      headers: {
+        "User-Agent":
+          process.env.TME_SCRAPE_USER_AGENT ||
+          "Mozilla/5.0 (compatible; TeleHubBot/1.0; +https://telehub.to)",
+        Accept:
+          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.8",
+        "Cache-Control": "no-cache",
+      },
+    })
+
+    if (!response.ok) {
+      const error = new Error(
+        `Telegram public post page returned HTTP ${response.status}.`
+      )
+      error.code =
+        response.status === 429
+          ? "TME_POST_CONTEXT_RATE_LIMITED"
+          : "TME_POST_CONTEXT_HTTP_ERROR"
+      error.status = response.status
+      throw error
+    }
+
+    const html = await response.text()
+    const posts = []
+    const messageRegex =
+      /<div[^>]+class="[^"]*tgme_widget_message_text[^"]*"[^>]*>([\s\S]*?)<\/div>/gi
+
+    let match
+    let totalCharacters = 0
+
+    while ((match = messageRegex.exec(html)) && posts.length < maxPosts) {
+      const cleanText = compactTelegramPostText(match[1])
+      if (!cleanText) continue
+
+      const remaining = maxCharacters - totalCharacters
+      if (remaining <= 0) break
+
+      const clipped = cleanText.slice(0, remaining)
+      posts.push(clipped)
+      totalCharacters += clipped.length
+    }
+
+    return {
+      username,
+      pageUrl,
+      posts,
+      postCount: posts.length,
+      contextText: posts.join("\n\n---\n\n"),
+      source: "tme_public_posts",
     }
   } finally {
     clearTimeout(timeout)
@@ -7485,6 +7583,10 @@ async function generateAiImportContent(input) {
       telegram_description: input.telegramDescription || "",
       member_count: Number(input.memberCount || 0),
       listing_type: input.listingType || "channel",
+      recent_public_posts: Array.isArray(input.recentPosts)
+        ? input.recentPosts.slice(0, 20)
+        : [],
+      post_context_source: input.postContextSource || null,
       creative_profile: creativeProfile,
       variation_seed: variationSeed,
     }
@@ -7513,6 +7615,7 @@ Use only:
 - Telegram description or bio
 - member count
 - listing type
+- recent public post text, when supplied
 - creative_profile
 
 Do not invent unsupported:
@@ -7531,6 +7634,14 @@ Do not invent unsupported:
 - specific games, topics, resources, or features absent from the source
 
 Broadly rephrasing an obvious topic is allowed. Fabricating a feature is not.
+
+RECENT PUBLIC POSTS
+
+Recent public post text is optional evidence from Telegram's public web preview.
+Use repeated themes across posts to improve categories and explain what the community actually discusses.
+Do not treat a one-off post as a permanent feature unless the profile description or multiple posts support it.
+Do not quote long passages, usernames, phone numbers, wallet addresses, invite codes, or tracking links.
+Do not claim that the recent posts are complete chat history.
 
 DISPLAY NAME
 
@@ -7870,17 +7981,34 @@ async function importSingleTelegramListing(
     }
   }
 
-  const chat = await tg("getChat", { chat_id: username })
-  const listingType = normalizeTelegramType(chat.type)
+  const publicListingInput = {
+    telegram_username: username,
+    telegram_link: telegramLink,
+  }
 
-  await onStage("telegram_verified", {
-    telegram_username: cleanUsername(chat.username) || username,
-    telegram_title: chat.title || null,
-    telegram_description: chat.description || chat.bio || "",
-    listing_type: listingType,
-    telegram_chat_id: String(chat.id),
-    avatar_available: Boolean(chat.photo?.big_file_id),
-  })
+  let scraped = null
+  let chat = null
+  let profileSource = null
+  let scrapeError = null
+
+  try {
+    scraped = await fetchPublicTelegramPage(publicListingInput)
+    profileSource = scraped.source
+  } catch (err) {
+    scrapeError = err
+    console.warn("AI import public profile scrape failed; trying Bot API:", {
+      link: telegramLink,
+      code: err.code,
+      error: err.message,
+    })
+
+    chat = await tg("getChat", { chat_id: username })
+    profileSource = "telegram_bot_api_fallback"
+  }
+
+  const listingType = scraped
+    ? scraped.listingType
+    : normalizeTelegramType(chat?.type)
 
   if (!listingType) {
     return {
@@ -7890,13 +8018,50 @@ async function importSingleTelegramListing(
     }
   }
 
-  const telegramUsername = cleanUsername(chat.username) || username
-  const normalizedTelegramLink = chat.username
-    ? `https://t.me/${chat.username}`
-    : telegramLink
+  const telegramUsername = scraped
+    ? scraped.telegramUsername
+    : cleanUsername(chat?.username) || username
+
+  const normalizedTelegramLink = scraped
+    ? scraped.telegramLink
+    : chat?.username
+      ? `https://t.me/${chat.username}`
+      : telegramLink
+
+  const telegramTitle =
+    scraped?.title ||
+    chat?.title ||
+    stripTelegramHandle(telegramUsername) ||
+    "Telegram Listing"
+
+  const telegramDescription =
+    scraped?.description ||
+    chat?.description ||
+    chat?.bio ||
+    ""
+
+  const telegramChatId = chat?.id ? String(chat.id) : null
+  const memberCount = scraped
+    ? Number(scraped.memberCount || 0)
+    : await tg("getChatMemberCount", { chat_id: chat.id })
+
+  const avatarAvailable = Boolean(
+    scraped?.iconUrl || chat?.photo?.big_file_id
+  )
+
+  await onStage("telegram_verified", {
+    telegram_username: telegramUsername,
+    telegram_title: telegramTitle,
+    telegram_description: telegramDescription,
+    listing_type: listingType,
+    telegram_chat_id: telegramChatId,
+    avatar_available: avatarAvailable,
+    metadata_source: profileSource,
+    scrape_error: scrapeError?.message || null,
+  })
 
   const duplicate = await findDuplicateImportListing({
-    telegramChatId: String(chat.id),
+    telegramChatId,
     telegramUsername,
     telegramLink: normalizedTelegramLink,
   })
@@ -7910,19 +8075,53 @@ async function importSingleTelegramListing(
       existing_listing_id: duplicate.id,
       existing_name: duplicate.channel_name,
       existing_short_invite: duplicate.short_invite,
+      metadata_source: profileSource,
     }
   }
 
-  const telegramDescription = chat.description || chat.bio || ""
+  let postContext = {
+    posts: [],
+    postCount: 0,
+    contextText: "",
+    source: null,
+  }
+  let postContextError = null
+
+  try {
+    postContext = await fetchPublicTelegramPostContext(publicListingInput)
+  } catch (err) {
+    postContextError = err
+    console.warn("AI import public post-context scrape failed:", {
+      link: normalizedTelegramLink,
+      code: err.code,
+      error: err.message,
+    })
+  }
+
+  await onStage("telegram_metadata", {
+    telegram_username: telegramUsername,
+    telegram_title: telegramTitle,
+    member_count: memberCount,
+    listing_type: listingType,
+    avatar_available: avatarAvailable,
+    metadata_source: profileSource,
+    post_context_source: postContext.source,
+    public_posts_found: postContext.postCount,
+    post_context_error: postContextError?.message || null,
+  })
+
   const languageCheck = analyzeLikelyEnglishListingContent({
-    title: chat.title || telegramUsername,
-    description: telegramDescription,
+    title: telegramTitle,
+    description: [
+      telegramDescription,
+      postContext.posts.slice(0, 5).join(" "),
+    ].filter(Boolean).join(" "),
   })
 
   if (!languageCheck.isEnglish) {
     await onStage("language_filtered", {
       telegram_username: telegramUsername,
-      telegram_title: chat.title || null,
+      telegram_title: telegramTitle,
       reason: languageCheck.reason,
       language_check: languageCheck,
     })
@@ -7935,38 +8134,34 @@ async function importSingleTelegramListing(
       error: "Listing filtered because the Telegram title is fully non-Latin or the content is overwhelmingly non-Latin.",
       link: normalizedTelegramLink,
       telegram_username: telegramUsername,
-      telegram_title: chat.title || null,
+      telegram_title: telegramTitle,
       language_check: languageCheck,
+      metadata_source: profileSource,
+      public_posts_found: postContext.postCount,
     }
   }
 
-  const memberCount = await tg("getChatMemberCount", { chat_id: chat.id })
-
-  await onStage("telegram_metadata", {
-    telegram_username: telegramUsername,
-    telegram_title: chat.title || null,
-    member_count: memberCount,
-    listing_type: listingType,
-    avatar_available: Boolean(chat.photo?.big_file_id),
-  })
-
   await onStage("ai_generation_started", {
-    source_title: chat.title || telegramUsername,
+    source_title: telegramTitle,
     source_description_length: telegramDescription.length,
+    public_posts_found: postContext.postCount,
+    post_context_characters: postContext.contextText.length,
   })
 
   const aiContent = await generateAiImportContent({
-    title: chat.title || telegramUsername,
+    title: telegramTitle,
     username: telegramUsername,
     telegramDescription,
     memberCount,
     listingType,
+    recentPosts: postContext.posts,
+    postContextSource: postContext.source,
   })
 
   await onStage("ai_generated", {
     generated_name:
       aiContent.display_name ||
-      chat.title ||
+      telegramTitle ||
       stripTelegramHandle(telegramUsername) ||
       "Telegram Listing",
     description: aiContent.description,
@@ -7980,22 +8175,30 @@ async function importSingleTelegramListing(
     creative_profile: aiContent.creative_profile || null,
     variation_seed: aiContent.variation_seed || null,
     token_usage: aiContent.usage || null,
+    metadata_source: profileSource,
+    public_posts_found: postContext.postCount,
   })
 
-  const shortInviteBase = stripTelegramHandle(telegramUsername) || chat.title || "telegram-listing"
-  const shortInvite = await generateUniqueShortInviteFromBase(shortInviteBase)
+  const shortInviteBase =
+    stripTelegramHandle(telegramUsername) ||
+    telegramTitle ||
+    "telegram-listing"
+
+  const shortInvite =
+    await generateUniqueShortInviteFromBase(shortInviteBase)
 
   await onStage("slug_selected", {
     short_invite: shortInvite,
     public_path: `/channel/${shortInvite}`,
   })
 
+  const now = new Date().toISOString()
   const insertPayload = {
     user_id: adminUser.id,
     listing_type: listingType,
     channel_name:
       aiContent.display_name ||
-      chat.title ||
+      telegramTitle ||
       stripTelegramHandle(telegramUsername) ||
       "Telegram Listing",
     telegram_link: normalizedTelegramLink,
@@ -8004,16 +8207,21 @@ async function importSingleTelegramListing(
     categories: aiContent.categories,
     is_nsfw: aiContent.is_nsfw,
     short_invite: shortInvite,
-    slug: `${listingType}-${slugifyImportValue(chat.title || telegramUsername)}-${Date.now().toString().slice(-6)}`,
+    slug: `${listingType}-${slugifyImportValue(telegramTitle || telegramUsername)}-${Date.now().toString().slice(-6)}`,
     status: "approved",
     admin_reviewed: false,
-    telegram_chat_id: String(chat.id),
+    telegram_chat_id: telegramChatId,
     telegram_username: telegramUsername,
-    telegram_title: chat.title || null,
+    telegram_title: telegramTitle || null,
     telegram_description: telegramDescription || null,
     member_count: memberCount,
     votes_count: 0,
-    last_synced_at: new Date().toISOString(),
+    last_synced_at: now,
+    telegram_metadata_synced_at: now,
+    last_member_scraped_at: now,
+    last_metadata_scraped_at: now,
+    scrape_source: profileSource,
+    scrape_failure_count: 0,
     framer_sync_status: options.syncToFramer ? "not_synced" : null,
   }
 
@@ -8033,24 +8241,35 @@ async function importSingleTelegramListing(
     status: "approved",
     categories: aiContent.categories,
     description: aiContent.description,
+    metadata_source: profileSource,
+    public_posts_found: postContext.postCount,
   })
 
   let iconUrl = null
   let iconError = null
 
-  if (chat.photo?.big_file_id) {
-    try {
-      iconUrl = await uploadTelegramPhoto(chat.photo.big_file_id, inserted.id)
-    } catch (err) {
-      iconError = err.message
-      console.error("Auto import icon upload failed:", err.message)
+  try {
+    if (scraped?.iconUrl) {
+      iconUrl = await uploadRemoteTelegramPhoto(
+        scraped.iconUrl,
+        inserted.id
+      )
+    } else if (chat?.photo?.big_file_id) {
+      iconUrl = await uploadTelegramPhoto(
+        chat.photo.big_file_id,
+        inserted.id
+      )
     }
+  } catch (err) {
+    iconError = err.message
+    console.error("Auto import icon upload failed:", err.message)
   }
 
   if (iconUrl) {
     await onStage("avatar_downloaded", {
       icon_url: iconUrl,
       background_applied: Boolean(options.useIconAsBackground),
+      metadata_source: profileSource,
     })
 
     const { error: imageUpdateError } = await supabaseAdmin
@@ -8058,6 +8277,7 @@ async function importSingleTelegramListing(
       .update({
         icon_url: iconUrl,
         image_url: options.useIconAsBackground ? iconUrl : null,
+        last_icon_scraped_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
       })
       .eq("id", inserted.id)
@@ -8076,8 +8296,12 @@ async function importSingleTelegramListing(
 
     try {
       framerResult = await queueFramerSync(() =>
-        syncListingToFramerCMS(inserted.id, { publish: false, skipTelegramSync: true })
+        syncListingToFramerCMS(inserted.id, {
+          publish: false,
+          skipTelegramSync: true,
+        })
       )
+
       await onStage("framer_synced", {
         listing_id: inserted.id,
         short_invite: inserted.short_invite,
@@ -8114,8 +8338,13 @@ async function importSingleTelegramListing(
     long_description_length: String(aiContent.long_description || "").length,
     is_nsfw: aiContent.is_nsfw,
     telegram_username: telegramUsername,
-    telegram_title: chat.title || null,
-    avatar_available: Boolean(chat.photo?.big_file_id),
+    telegram_title: telegramTitle || null,
+    telegram_chat_id: telegramChatId,
+    avatar_available: avatarAvailable,
+    metadata_source: profileSource,
+    public_posts_found: postContext.postCount,
+    post_context_source: postContext.source,
+    post_context_error: postContextError?.message || null,
     ai_used: aiContent.ai_used,
     ai_error: aiContent.ai_error,
     creative_profile: aiContent.creative_profile || null,
@@ -8127,7 +8356,6 @@ async function importSingleTelegramListing(
     framer_error: framerError,
   }
 }
-
 
 async function markManualImportQueueItemComplete(originalLink, result) {
   const cleanedOriginal = cleanImportTelegramLink(originalLink)
