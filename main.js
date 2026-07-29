@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 })
 
 const BACKEND_BUILD_ID =
-  "telehub-telemetr-channel-search-fix-2026-07-29"
+  "telehub-telemetr-nested-results-fix-2026-07-29"
 
 app.get("/", (req, res) => {
   res.status(200).json({
@@ -8774,16 +8774,49 @@ async function telemetrRequest(path, params = {}) {
 
 function telemetrResultRows(payload) {
   if (Array.isArray(payload)) return payload
+  if (!payload || typeof payload !== "object") return []
 
-  const possibleArrays = [
-    payload?.channels,
-    payload?.items,
-    payload?.results,
-    payload?.data,
-    payload?.list,
+  const preferredKeys = [
+    "channels",
+    "items",
+    "results",
+    "data",
+    "list",
+    "rows",
   ]
 
-  return possibleArrays.find(Array.isArray) || []
+  for (const key of preferredKeys) {
+    const value = payload[key]
+
+    if (Array.isArray(value)) return value
+
+    if (value && typeof value === "object") {
+      const nested = telemetrResultRows(value)
+      if (nested.length) return nested
+    }
+  }
+
+  for (const value of Object.values(payload)) {
+    if (
+      Array.isArray(value) &&
+      value.some(
+        (item) =>
+          item &&
+          typeof item === "object" &&
+          (
+            item.username ||
+            item.telegram_username ||
+            item.peer ||
+            item.internal_id ||
+            item.title
+          )
+      )
+    ) {
+      return value
+    }
+  }
+
+  return []
 }
 
 function firstNonEmpty(...values) {
@@ -9425,6 +9458,14 @@ async function runTelemetrImport(runId) {
             returned: rows.length,
             total: payload?.total ?? payload?.count ?? null,
             audience_count: payload?.audience_count ?? null,
+            response_keys:
+              payload && typeof payload === "object"
+                ? Object.keys(payload).slice(0, 20)
+                : [],
+            data_keys:
+              payload?.data && typeof payload.data === "object"
+                ? Object.keys(payload.data).slice(0, 20)
+                : [],
           },
         })
 
@@ -9669,7 +9710,7 @@ app.post("/api/admin/scraper/start", async (req, res) => {
       .trim()
       .toUpperCase()
 
-    if (!/^[A-Z]{2,3}$/.test(country)) {
+    if (!/^[A-Z]{2}$/.test(country)) {
       return res.status(400).json({
         error: "Choose a valid country before starting the Telemetr import.",
         code: "TELEMETR_COUNTRY_REQUIRED",
