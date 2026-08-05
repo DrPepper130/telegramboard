@@ -51,12 +51,12 @@ let fakeOnlineCount = null
 function updateFakeOnlineCount() {
   // First real value: start somewhere between 1,000 and 2,000
   if (fakeOnlineCount === null) {
-    fakeOnlineCount = Math.floor(Math.random() * 1001) + 1000
+    fakeOnlineCount = Math.floor(Math.random() * 10001) + 10000
     return
   }
 
   // Change by 10–25 users per minute
-  const changeAmount = Math.floor(Math.random() * 16) + 10
+  const changeAmount = Math.floor(Math.random() * 160) + 100
 
   // Randomly go up or down
   const direction = Math.random() < 0.5 ? -1 : 1
@@ -64,8 +64,8 @@ function updateFakeOnlineCount() {
   fakeOnlineCount += changeAmount * direction
 
   // Keep it between 1,000 and 2,000
-  if (fakeOnlineCount < 1000) fakeOnlineCount = 1000
-  if (fakeOnlineCount > 2000) fakeOnlineCount = 2000
+  if (fakeOnlineCount < 10000) fakeOnlineCount = 10000
+  if (fakeOnlineCount > 20000) fakeOnlineCount = 20000
 }
 
 // update once per minute
