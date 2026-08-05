@@ -5520,7 +5520,59 @@ app.post("/api/telegram-clone/apply", async (req, res) => {
   }
 })
 
+app.get("/api/listings/newest-safe", async (req, res) => {
+  try {
+    const { data: listing, error } = await supabaseAdmin
+      .from("channel_listings")
+      .select(`
+        id,
+        channel_name,
+        telegram_title,
+        telegram_username,
+        telegram_link,
+        description,
+        telegram_description,
+        member_count,
+        icon_url,
+        image_url,
+        listing_type,
+        short_invite,
+        created_at
+      `)
+      .eq("status", "approved")
+      .or("is_banned.is.null,is_banned.eq.false")
+      .or("is_nsfw.is.null,is_nsfw.eq.false")
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle()
 
+    if (error) throw error
+
+    if (!listing) {
+      return res.status(404).json({
+        error: "No safe listing is currently available.",
+      })
+    }
+
+    return res.json({
+      ok: true,
+      listing: {
+        ...listing,
+        url: listing.short_invite
+          ? `https://telehub.to/channel/${encodeURIComponent(
+                listing.short_invite
+            )}`
+          : listing.telegram_link,
+      },
+    })
+  } catch (err) {
+    console.error("Newest safe listing error:", err)
+
+    return res.status(500).json({
+      error: err.message || "Could not load the newest listing.",
+    })
+  }
+})
 
 async function inspectMtProtoSource(session, sourceReference, options = {}) {
   const { Api } = require("telegram")
