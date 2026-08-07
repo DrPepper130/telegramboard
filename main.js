@@ -8329,10 +8329,18 @@ async function generateAiImportContent(input) {
       telegram_description: input.telegramDescription || "",
       member_count: Number(input.memberCount || 0),
       listing_type: input.listingType || "channel",
-      recent_public_posts: Array.isArray(input.recentPosts)
-        ? input.recentPosts.slice(0, 20)
-        : [],
+      recent_public_posts:
+        input.analyzeRecentPosts !== false && Array.isArray(input.recentPosts)
+          ? input.recentPosts.slice(
+              0,
+              Math.max(1, Math.min(Number(input.recentPostLimit || 8), 20))
+            )
+          : [],
       post_context_source: input.postContextSource || null,
+      post_analysis_enabled: input.analyzeRecentPosts !== false,
+      custom_admin_instructions: String(input.customAiPrompt || "")
+        .trim()
+        .slice(0, 8000),
       creative_profile: creativeProfile,
       variation_seed: variationSeed,
     }
@@ -8388,6 +8396,12 @@ Use repeated themes across posts to improve categories and explain what the comm
 Do not treat a one-off post as a permanent feature unless the profile description or multiple posts support it.
 Do not quote long passages, usernames, phone numbers, wallet addresses, invite codes, or tracking links.
 Do not claim that the recent posts are complete chat history.
+
+CUSTOM ADMIN INSTRUCTIONS
+
+The user may supply custom_admin_instructions to vary tone, structure, emphasis, or writing style.
+Follow those instructions when they do not conflict with source grounding, the required JSON schema, or the requirement to avoid invented facts.
+Treat custom_admin_instructions as writing guidance, not as factual source material.
 
 DISPLAY NAME
 
@@ -8835,15 +8849,32 @@ async function importSingleTelegramListing(
   }
   let postContextError = null
 
-  try {
-    postContext = await fetchPublicTelegramPostContext(publicListingInput)
-  } catch (err) {
-    postContextError = err
-    console.warn("AI import public post-context scrape failed:", {
-      link: normalizedTelegramLink,
-      code: err.code,
-      error: err.message,
-    })
+  const analyzeRecentPosts = options?.analyzeRecentPosts !== false
+  const recentPostLimit = Math.max(
+    1,
+    Math.min(Number(options?.recentPostLimit || 8), 20)
+  )
+  const postContextMaxCharacters = Math.max(
+    500,
+    Math.min(Number(options?.postContextMaxCharacters || 5000), 15000)
+  )
+  const needsPostContext =
+    analyzeRecentPosts || String(options?.backgroundMode || "") === "telegram_post"
+
+  if (needsPostContext) {
+    try {
+      postContext = await fetchPublicTelegramPostContext(publicListingInput, {
+        maxPosts: recentPostLimit,
+        maxCharacters: postContextMaxCharacters,
+      })
+    } catch (err) {
+      postContextError = err
+      console.warn("AI import public post-context scrape failed:", {
+        link: normalizedTelegramLink,
+        code: err.code,
+        error: err.message,
+      })
+    }
   }
 
   await onStage("telegram_metadata", {
@@ -8863,7 +8894,7 @@ async function importSingleTelegramListing(
     title: telegramTitle,
     description: [
       telegramDescription,
-      postContext.posts.slice(0, 5).join(" "),
+      analyzeRecentPosts ? postContext.posts.slice(0, 5).join(" ") : "",
     ].filter(Boolean).join(" "),
   })
 
@@ -8895,6 +8926,10 @@ async function importSingleTelegramListing(
     source_description_length: telegramDescription.length,
     public_posts_found: postContext.postCount,
     post_context_characters: postContext.contextText.length,
+    post_analysis_enabled: analyzeRecentPosts,
+    requested_post_limit: recentPostLimit,
+    requested_post_context_characters: postContextMaxCharacters,
+    custom_prompt_characters: String(options?.customAiPrompt || "").trim().length,
   })
 
   const aiContent = await generateAiImportContent({
@@ -8905,6 +8940,9 @@ async function importSingleTelegramListing(
     listingType,
     recentPosts: postContext.posts,
     postContextSource: postContext.source,
+    analyzeRecentPosts,
+    recentPostLimit,
+    customAiPrompt: options?.customAiPrompt || "",
   })
 
   await onStage("ai_generated", {
@@ -9256,6 +9294,18 @@ app.post("/api/admin/import-telegram-listings", async (req, res) => {
       backgroundMode: allowedBackgroundModes.has(requestedBackgroundMode)
         ? requestedBackgroundMode
         : "none",
+      analyzeRecentPosts: req.body?.analyze_recent_posts !== false,
+      recentPostLimit: Math.max(
+        1,
+        Math.min(Number(req.body?.recent_post_limit || 8), 20)
+      ),
+      postContextMaxCharacters: Math.max(
+        500,
+        Math.min(Number(req.body?.post_context_max_characters || 5000), 15000)
+      ),
+      customAiPrompt: String(req.body?.custom_ai_prompt || "")
+        .trim()
+        .slice(0, 8000),
     }
 
     const results = []
@@ -9518,6 +9568,16 @@ function continuousAutomationSettings(state) {
       ? String(raw.background_mode || "related")
       : "related",
     sync_to_framer: raw.sync_to_framer !== false,
+    analyze_recent_posts: raw.analyze_recent_posts !== false,
+    recent_post_limit: Math.max(
+      1,
+      Math.min(Number(raw.recent_post_limit || 8), 20)
+    ),
+    post_context_max_characters: Math.max(
+      500,
+      Math.min(Number(raw.post_context_max_characters || 5000), 15000)
+    ),
+    custom_ai_prompt: String(raw.custom_ai_prompt || "").trim().slice(0, 8000),
     cycle_delay_ms: Math.max(
       5000,
       Math.min(Number(raw.cycle_delay_ms || CONTINUOUS_AUTOMATION_IDLE_MS), 300000)
@@ -9571,8 +9631,6 @@ function graphHistoryEligible(history, settings, nowMs = Date.now()) {
     Number(history?.max_requested_depth || 0)
   )
 
-  // A deeper crawl request is allowed through immediately, even when the
-  // normal time-based cooldown has not expired.
   if (requestedDepth > previousRequestedDepth) return true
 
   const last = new Date(history.last_crawled_at).getTime()
@@ -11887,6 +11945,10 @@ async function processContinuousAutomationQueue(
             syncToFramer: false,
             deferFramerBatch: true,
             backgroundMode: settings.background_mode,
+            analyzeRecentPosts: settings.analyze_recent_posts,
+            recentPostLimit: settings.recent_post_limit,
+            postContextMaxCharacters: settings.post_context_max_characters,
+            customAiPrompt: settings.custom_ai_prompt,
           },
           adminUser,
           async (stage, metadata = {}) => {
@@ -12576,6 +12638,39 @@ app.post("/api/admin/automation/toggle", async (req, res) => {
         req.body?.sync_to_framer === undefined
           ? currentSettings.sync_to_framer !== false
           : req.body.sync_to_framer !== false,
+      analyze_recent_posts:
+        req.body?.analyze_recent_posts === undefined
+          ? currentSettings.analyze_recent_posts !== false
+          : req.body.analyze_recent_posts !== false,
+      recent_post_limit: Math.max(
+        1,
+        Math.min(
+          Number(
+            req.body?.recent_post_limit ||
+              currentSettings.recent_post_limit ||
+              8
+          ),
+          20
+        )
+      ),
+      post_context_max_characters: Math.max(
+        500,
+        Math.min(
+          Number(
+            req.body?.post_context_max_characters ||
+              currentSettings.post_context_max_characters ||
+              5000
+          ),
+          15000
+        )
+      ),
+      custom_ai_prompt: String(
+        req.body?.custom_ai_prompt ??
+          currentSettings.custom_ai_prompt ??
+          ""
+      )
+        .trim()
+        .slice(0, 8000),
       cycle_delay_ms: Math.max(
         5000,
         Math.min(
