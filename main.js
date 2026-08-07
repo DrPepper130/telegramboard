@@ -564,6 +564,7 @@ async function fetchPublicTelegramPostContext(listing, options = {}) {
     const html = await response.text()
     const posts = []
     const imageUrls = []
+    const telegramLinks = []
     const messageRegex =
       /<div[^>]+class="[^"]*tgme_widget_message_text[^"]*"[^>]*>([\s\S]*?)<\/div>/gi
 
@@ -582,6 +583,38 @@ async function fetchPublicTelegramPostContext(listing, options = {}) {
         const url = decodeHtmlEntities(imageMatch[1] || "").trim()
         if (url && !imageUrls.includes(url)) imageUrls.push(url)
       }
+    }
+
+    const discoveredUsernames = new Set()
+    const absoluteTelegramRegex =
+      /(?:https?:\/\/)?(?:www\.)?(?:t\.me|telegram\.me)\/([a-zA-Z0-9_]{4,})(?:\/?|[?#][^\s"'<>]*)/gi
+    const mentionRegex = /(?:^|[^a-zA-Z0-9_])@([a-zA-Z][a-zA-Z0-9_]{3,31})\b/g
+    const blockedTelegramRoutes = new Set([
+      "s", "joinchat", "addstickers", "addemoji", "share", "proxy",
+      "socks", "login", "iv", "setlanguage", "confirmphone",
+    ])
+
+    let discoveryMatch
+    while ((discoveryMatch = absoluteTelegramRegex.exec(html))) {
+      const candidate = String(discoveryMatch[1] || "").trim()
+      if (
+        candidate &&
+        !blockedTelegramRoutes.has(candidate.toLowerCase()) &&
+        /^[a-zA-Z][a-zA-Z0-9_]{3,31}$/.test(candidate)
+      ) {
+        discoveredUsernames.add(candidate)
+      }
+    }
+
+    const visibleText = stripHtml(html)
+    while ((discoveryMatch = mentionRegex.exec(visibleText))) {
+      const candidate = String(discoveryMatch[1] || "").trim()
+      if (candidate) discoveredUsernames.add(candidate)
+    }
+
+    for (const candidate of discoveredUsernames) {
+      telegramLinks.push(`https://t.me/${candidate}`)
+      if (telegramLinks.length >= 100) break
     }
 
     let match
@@ -607,6 +640,8 @@ async function fetchPublicTelegramPostContext(listing, options = {}) {
       contextText: posts.join("\n\n---\n\n"),
       imageUrls,
       imageCount: imageUrls.length,
+      telegramLinks,
+      telegramLinkCount: telegramLinks.length,
       source: "tme_public_posts",
     }
   } finally {
@@ -8878,6 +8913,8 @@ app.post("/api/admin/import-telegram-listings", async (req, res) => {
       }
     }
 
+    // Each item was synced with publish:false. Publish/deploy exactly once
+    // after the entire import batch finishes.
     let deployed = false
 
     if (options.syncToFramer && process.env.FRAMER_AUTO_DEPLOY !== "false") {
@@ -9520,7 +9557,9 @@ async function addDiscoveryResult(runId, username, metadata = {}) {
       status: "ready_for_ai",
       stage: "ready_for_ai",
       result: {
-        source: "telemetr_catalog_html",
+        source: metadata.source || "telemetr_catalog_html",
+        discovered_from: metadata.discovered_from || null,
+        depth: Number(metadata.depth || 0),
         filters: metadata.filters || null,
       },
       updated_at: new Date().toISOString(),
@@ -9744,7 +9783,234 @@ async function runRotationDiscovery(run, metadata) {
   return accepted
 }
 
+
+async function loadTelegramGraphSeedLinks(run, metadata) {
+  const requestedSeeds = Array.isArray(metadata.seed_links)
+    ? metadata.seed_links.map(cleanImportTelegramLink).filter(Boolean)
+    : []
+
+  const seedLimit = Math.max(1, Math.min(Number(metadata.seed_limit || 100), 1000))
+
+  const { data: approved, error } = await supabaseAdmin
+    .from("channel_listings")
+    .select("telegram_link, telegram_username")
+    .eq("status", "approved")
+    .or("is_banned.is.null,is_banned.eq.false")
+    .order("member_count", { ascending: false })
+    .limit(seedLimit)
+
+  if (error) throw error
+
+  const existingSeeds = (approved || [])
+    .map((listing) =>
+      cleanImportTelegramLink(
+        listing.telegram_link ||
+          (listing.telegram_username
+            ? `https://t.me/${String(listing.telegram_username).replace(/^@/, "")}`
+            : "")
+      )
+    )
+    .filter(Boolean)
+
+  return Array.from(new Set([...requestedSeeds, ...existingSeeds])).slice(0, seedLimit)
+}
+
+async function runTelegramGraphDiscovery(run, metadata) {
+  const target = Math.max(1, Number(run.requested_target || 100))
+  const maxDepth = Math.max(1, Math.min(Number(metadata.max_depth || 2), 5))
+  const perSeedLimit = Math.max(1, Math.min(Number(metadata.max_links_per_seed || 25), 100))
+  const requestDelayMs = Math.max(250, Math.min(Number(metadata.request_delay_ms || 1000), 10000))
+
+  let frontier = await loadTelegramGraphSeedLinks(run, metadata)
+  const visited = new Set()
+  let accepted = 0
+
+  await logScraperEvent({
+    runId: run.id,
+    stage: "telegram_graph_seeded",
+    message: `Telegram graph seeded with ${frontier.length} public channel(s).`,
+    metadata: { seeds: frontier.length, max_depth: maxDepth, max_links_per_seed: perSeedLimit },
+  })
+
+  for (let depth = 0; depth < maxDepth && frontier.length && accepted < target; depth += 1) {
+    const nextFrontier = []
+
+    for (const seedLink of frontier) {
+      if (accepted >= target) break
+      if (!(await waitWhilePaused(run.id))) return accepted
+
+      const normalizedSeed = normalizeTelegramLinkForComparison(seedLink)
+      if (!normalizedSeed || visited.has(normalizedSeed)) continue
+      visited.add(normalizedSeed)
+
+      const seedUsername = extractUsernameFromLink(seedLink)
+      if (!seedUsername) continue
+
+      await supabaseAdmin
+        .from("scraper_runs")
+        .update({
+          current_stage: "telegram_graph",
+          current_link: seedLink,
+          agent_last_seen_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", run.id)
+
+      try {
+        const context = await fetchPublicTelegramPostContext(
+          { telegram_username: seedUsername, telegram_link: seedLink },
+          { maxPosts: 30, maxCharacters: 12000 }
+        )
+
+        const candidates = Array.from(
+          new Set((context.telegramLinks || []).map(cleanImportTelegramLink))
+        )
+          .filter(Boolean)
+          .filter((candidate) => normalizeTelegramLinkForComparison(candidate) !== normalizedSeed)
+          .slice(0, perSeedLimit)
+
+        await logScraperEvent({
+          runId: run.id,
+          stage: "telegram_graph_seed_scanned",
+          message: `Depth ${depth + 1}: ${seedLink} exposed ${candidates.length} candidate link(s).`,
+          telegramLink: seedLink,
+          metadata: { depth: depth + 1, candidates: candidates.length, public_posts_found: context.postCount },
+        })
+
+        for (const candidateLink of candidates) {
+          if (accepted >= target) break
+          const candidateUsername = extractUsernameFromLink(candidateLink)
+          if (!candidateUsername) continue
+
+          const added = await addDiscoveryResult(
+            run.id,
+            String(candidateUsername).replace(/^@/, ""),
+            {
+              source: "telegram_graph",
+              discovered_from: seedLink,
+              depth: depth + 1,
+              filters: { source: "telegram_graph", seed: seedLink, depth: depth + 1 },
+            }
+          )
+
+          if (added.added) {
+            accepted += 1
+            if (depth + 1 < maxDepth) nextFrontier.push(candidateLink)
+          }
+        }
+      } catch (error) {
+        await logScraperEvent({
+          runId: run.id,
+          level: "warning",
+          stage: "telegram_graph_seed_failed",
+          message: `${seedLink}: ${error.message || "Could not scan public posts."}`,
+          telegramLink: seedLink,
+          metadata: { depth: depth + 1, code: error?.code || null, status: error?.status || null },
+        })
+      }
+
+      await refreshScraperRunCounters(run.id)
+      await new Promise((resolve) => setTimeout(resolve, requestDelayMs))
+    }
+
+    frontier = Array.from(new Set(nextFrontier))
+  }
+
+  return accepted
+}
+
+async function runDiscoveryImport(runId) {
+  if (activeTelemetrRuns.has(runId)) return
+  activeTelemetrRuns.add(runId)
+
+  try {
+    const { data: run, error } = await supabaseAdmin
+      .from("scraper_runs")
+      .select("*")
+      .eq("id", runId)
+      .single()
+
+    if (error) throw error
+
+    const metadata = run.metadata && typeof run.metadata === "object" ? run.metadata : {}
+    const provider = String(metadata.provider || "telemetr_catalog_html")
+
+    await supabaseAdmin
+      .from("scraper_runs")
+      .update({
+        status: "scraping",
+        current_stage:
+          provider === "telegram_graph"
+            ? "telegram_graph"
+            : metadata.rotation_mode
+              ? "rotation_discovery"
+              : "telemetr_catalog",
+        started_at: run.started_at || new Date().toISOString(),
+        agent_last_seen_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", runId)
+
+    const accepted =
+      provider === "telegram_graph"
+        ? await runTelegramGraphDiscovery(run, metadata)
+        : metadata.rotation_mode
+          ? await runRotationDiscovery(run, metadata)
+          : await runSingleFilterDiscovery(run, metadata)
+
+    const counts = await refreshScraperRunCounters(runId)
+
+    await supabaseAdmin
+      .from("scraper_runs")
+      .update({
+        status: "completed",
+        current_stage: "ready_for_review",
+        current_link: null,
+        framer_deployed: false,
+        completed_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", runId)
+
+    await logScraperEvent({
+      runId,
+      level: "success",
+      stage: "run_completed",
+      message:
+        `Discovery complete: ${counts.ready_for_ai} new link(s) are ready for review. ` +
+        `${counts.duplicate} duplicate(s) were skipped.`,
+      metadata: { accepted, counters: counts, discovery_only: true, provider },
+    })
+  } catch (error) {
+    console.error("Discovery failed:", error)
+    await supabaseAdmin
+      .from("scraper_runs")
+      .update({
+        status: "failed",
+        current_stage: "discovery_failed",
+        current_link: null,
+        completed_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", runId)
+
+    await logScraperEvent({
+      runId,
+      level: "error",
+      stage: "discovery_failed",
+      message: error.message || "Discovery failed.",
+      metadata: { code: error?.code || null, status: error?.status || null },
+    })
+  } finally {
+    activeTelemetrRuns.delete(runId)
+  }
+}
+
 async function runTelemetrImport(runId) {
+  return runDiscoveryImport(runId)
+}
+
+async function runTelemetrImportLegacy(runId) {
   if (activeTelemetrRuns.has(runId)) return
   activeTelemetrRuns.add(runId)
 
@@ -9861,7 +10127,7 @@ app.post("/api/admin/scraper/start", async (req, res) => {
 
     if (activeRun) {
       return res.status(409).json({
-        error: "A Telemetr discovery run is already active.",
+        error: "A discovery run is already active.",
         run_id: activeRun.id,
         status: activeRun.status,
       })
@@ -9877,9 +10143,22 @@ app.post("/api/admin/scraper/start", async (req, res) => {
       })
     }
 
+    const requestedSource = String(req.body?.source || "telegram_graph")
+      .trim()
+      .toLowerCase()
+    const provider =
+      requestedSource === "telemetr" || requestedSource === "telemetr_catalog_html"
+        ? "telemetr_catalog_html"
+        : "telegram_graph"
+
     const metadata = {
-      provider: "telemetr_catalog_html",
-      rotation_mode: req.body?.rotation_mode === true,
+      provider,
+      rotation_mode: provider === "telemetr_catalog_html" && req.body?.rotation_mode === true,
+      seed_links: parseTelegramImportLinks(req.body?.seed_links || ""),
+      seed_limit: Math.max(1, Math.min(Number(req.body?.seed_limit || 100), 1000)),
+      max_depth: Math.max(1, Math.min(Number(req.body?.max_depth || 2), 5)),
+      max_links_per_seed: Math.max(1, Math.min(Number(req.body?.max_links_per_seed || 25), 100)),
+      request_delay_ms: Math.max(250, Math.min(Number(req.body?.request_delay_ms || 1000), 10000)),
       country,
       category: String(req.body?.category || "all").trim(),
       subscriber_min:
@@ -9918,9 +10197,12 @@ app.post("/api/admin/scraper/start", async (req, res) => {
     const { data: run, error } = await supabaseAdmin
       .from("scraper_runs")
       .insert({
-        source: metadata.rotation_mode
-          ? "telemetr_rotation"
-          : "telemetr_filter",
+        source:
+          metadata.provider === "telegram_graph"
+            ? "telegram_graph"
+            : metadata.rotation_mode
+              ? "telemetr_rotation"
+              : "telemetr_filter",
         status: "queued",
         requested_target: Math.max(
           1,
@@ -9946,9 +10228,12 @@ app.post("/api/admin/scraper/start", async (req, res) => {
     await logScraperEvent({
       runId: run.id,
       stage: "telemetr_config",
-      message: metadata.rotation_mode
-        ? "Persistent rotation configuration saved."
-        : "Single-filter discovery configuration saved.",
+      message:
+        metadata.provider === "telegram_graph"
+          ? "Telegram graph crawler configuration saved."
+          : metadata.rotation_mode
+            ? "Persistent rotation configuration saved."
+            : "Single-filter discovery configuration saved.",
       metadata,
     })
 
