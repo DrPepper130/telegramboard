@@ -7618,6 +7618,23 @@ function cleanImportTelegramLink(value) {
   return trimmed
 }
 
+
+function normalizeTelegramLinkForComparison(value) {
+  const cleaned = cleanImportTelegramLink(value)
+  if (!cleaned) return ""
+
+  const username = extractUsernameFromLink(cleaned)
+  if (username) {
+    return `https://t.me/${String(username).replace(/^@/, "").toLowerCase()}`
+  }
+
+  return cleaned
+    .split("#")[0]
+    .split("?")[0]
+    .replace(/\/+$/g, "")
+    .toLowerCase()
+}
+
 function parseTelegramImportLinks(value) {
   const rawItems = Array.isArray(value)
     ? value
