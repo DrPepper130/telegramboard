@@ -9746,33 +9746,52 @@ async function logScraperEvent({
 async function refreshScraperRunCounters(runId) {
   const { data, error } = await supabaseAdmin
     .from("scraper_queue")
-    .select("status")
+    .select("status, stage")
     .eq("run_id", runId)
 
   if (error) throw error
 
   const counts = {
     ready_for_ai: 0,
+    processing: 0,
+    created: 0,
     duplicate: 0,
     failed: 0,
+    filtered: 0,
+    completed: 0,
   }
 
   for (const row of data || []) {
     if (Object.prototype.hasOwnProperty.call(counts, row.status)) {
       counts[row.status] += 1
     }
+
+    if (
+      row.stage === "filtered" &&
+      row.status !== "filtered"
+    ) {
+      counts.filtered += 1
+    }
   }
+
+  const processedCount =
+    counts.created +
+    counts.duplicate +
+    counts.failed +
+    counts.filtered +
+    counts.completed
 
   await supabaseAdmin
     .from("scraper_runs")
     .update({
-      discovered_count: counts.ready_for_ai,
+      discovered_count: (data || []).length,
       queued_count: counts.ready_for_ai,
-      processing_count: 0,
-      processed_count: 0,
-      created_count: 0,
+      processing_count: counts.processing,
+      processed_count: processedCount,
+      created_count: counts.created,
       duplicate_count: counts.duplicate,
       failed_count: counts.failed,
+      filtered_count: counts.filtered,
       updated_at: new Date().toISOString(),
     })
     .eq("id", runId)
@@ -10667,8 +10686,11 @@ async function runTelegramGraphDiscovery(run, metadata) {
   return accepted
 }
 
-async function runDiscoveryImport(runId) {
-  if (activeTelemetrRuns.has(runId)) return
+async function runDiscoveryImport(runId, options = {}) {
+  if (activeTelemetrRuns.has(runId)) {
+    return { ok: false, already_running: true }
+  }
+
   activeTelemetrRuns.add(runId)
 
   try {
@@ -10680,8 +10702,10 @@ async function runDiscoveryImport(runId) {
 
     if (error) throw error
 
-    const metadata = run.metadata && typeof run.metadata === "object" ? run.metadata : {}
+    const metadata =
+      run.metadata && typeof run.metadata === "object" ? run.metadata : {}
     const provider = String(metadata.provider || "telemetr_catalog_html")
+    const continuousProducer = options.continuousProducer === true
 
     await supabaseAdmin
       .from("scraper_runs")
@@ -10708,6 +10732,34 @@ async function runDiscoveryImport(runId) {
 
     const counts = await refreshScraperRunCounters(runId)
 
+    if (continuousProducer) {
+      await supabaseAdmin
+        .from("scraper_runs")
+        .update({
+          current_stage: "discovery_phase_completed",
+          current_link: null,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", runId)
+
+      await logScraperEvent({
+        runId,
+        level: "success",
+        stage: "continuous_discovery_completed",
+        message:
+          `24/7 discovery phase complete: ${accepted} new verified link(s) found. ` +
+          `AI worker will finish draining this cycle's queue.`,
+        metadata: {
+          accepted,
+          counters: counts,
+          provider,
+          continuous: true,
+        },
+      })
+
+      return { ok: true, accepted, counts }
+    }
+
     await supabaseAdmin
       .from("scraper_runs")
       .update({
@@ -10729,8 +10781,27 @@ async function runDiscoveryImport(runId) {
         `${counts.duplicate} duplicate(s) were skipped.`,
       metadata: { accepted, counters: counts, discovery_only: true, provider },
     })
+
+    return { ok: true, accepted, counts }
   } catch (error) {
     console.error("Discovery failed:", error)
+
+    if (options.continuousProducer === true) {
+      await logScraperEvent({
+        runId,
+        level: "error",
+        stage: "continuous_discovery_failed",
+        message: error.message || "24/7 discovery failed.",
+        metadata: { code: error?.code || null, status: error?.status || null },
+      })
+
+      return {
+        ok: false,
+        error: error.message || "Discovery failed.",
+        code: error?.code || null,
+      }
+    }
+
     await supabaseAdmin
       .from("scraper_runs")
       .update({
@@ -10749,6 +10820,12 @@ async function runDiscoveryImport(runId) {
       message: error.message || "Discovery failed.",
       metadata: { code: error?.code || null, status: error?.status || null },
     })
+
+    return {
+      ok: false,
+      error: error.message || "Discovery failed.",
+      code: error?.code || null,
+    }
   } finally {
     activeTelemetrRuns.delete(runId)
   }
@@ -10943,45 +11020,196 @@ function isTransientContinuousImportError(error) {
   )
 }
 
-async function publishContinuousFramerBatch(results) {
-  const needsDeploy = (results || []).some(
-    (item) => item?.created && item?.framer_synced
+async function syncAndPublishContinuousFramerBatch(batchItems, runId) {
+  const validItems = (batchItems || []).filter(
+    (entry) => entry?.result?.created && entry?.result?.listing_id
   )
 
-  if (
-    !needsDeploy ||
-    process.env.FRAMER_AUTO_DEPLOY === "false"
-  ) {
-    return false
+  if (!validItems.length || process.env.FRAMER_AUTO_DEPLOY === "false") {
+    return {
+      synced: 0,
+      failed: 0,
+      deployed: false,
+      results: [],
+    }
   }
 
-  const { connect } = await import("framer-api")
-  const framer = await connect(
-    process.env.FRAMER_PROJECT_URL,
-    process.env.FRAMER_API_KEY
-  )
+  const syncResults = []
 
-  try {
-    const publication = await framer.publish()
-    await framer.deploy(publication.deployment.id)
-    return true
-  } finally {
-    await framer.disconnect()
+  await logScraperEvent({
+    runId,
+    stage: "continuous_framer_batch_started",
+    message: `Framer CMS batch started for ${validItems.length} AI-created listing(s).`,
+    metadata: { batch_size: validItems.length },
+  })
+
+  // Do not publish while each CMS item is being created/updated.
+  // We intentionally wait until the AI worker has accumulated a batch.
+  for (const entry of validItems) {
+    try {
+      const framerResult = await queueFramerSync(() =>
+        syncListingToFramerCMS(entry.result.listing_id, {
+          publish: false,
+          skipTelegramSync: true,
+        })
+      )
+
+      const patchedResult = {
+        ...entry.result,
+        framer_synced: Boolean(framerResult?.ok),
+        framer_error: null,
+      }
+
+      await supabaseAdmin
+        .from("scraper_queue")
+        .update({
+          result: patchedResult,
+          framer_synced: Boolean(framerResult?.ok),
+          stage: "framer_synced_waiting_for_batch_publish",
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", entry.item.id)
+
+      syncResults.push({
+        queue_item_id: entry.item.id,
+        listing_id: entry.result.listing_id,
+        ok: true,
+      })
+    } catch (error) {
+      const patchedResult = {
+        ...entry.result,
+        framer_synced: false,
+        framer_error: error.message || "Framer CMS sync failed.",
+      }
+
+      await supabaseAdmin
+        .from("scraper_queue")
+        .update({
+          result: patchedResult,
+          framer_synced: false,
+          stage: "framer_sync_failed",
+          error: error.message || "Framer CMS sync failed.",
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", entry.item.id)
+
+      syncResults.push({
+        queue_item_id: entry.item.id,
+        listing_id: entry.result.listing_id,
+        ok: false,
+        error: error.message || "Framer CMS sync failed.",
+      })
+    }
+  }
+
+  const successful = syncResults.filter((item) => item.ok)
+
+  let deployed = false
+
+  if (successful.length && process.env.FRAMER_AUTO_DEPLOY !== "false") {
+    const { connect } = await import("framer-api")
+    const framer = await connect(
+      process.env.FRAMER_PROJECT_URL,
+      process.env.FRAMER_API_KEY
+    )
+
+    try {
+      const publication = await framer.publish()
+      await framer.deploy(publication.deployment.id)
+      deployed = true
+    } finally {
+      await framer.disconnect()
+    }
+  }
+
+  if (deployed) {
+    const publishedQueueIds = validItems
+      .filter((entry) =>
+        successful.some(
+          (item) => item.queue_item_id === entry.item.id
+        )
+      )
+      .map((entry) => entry.item.id)
+
+    if (publishedQueueIds.length) {
+      await supabaseAdmin
+        .from("scraper_queue")
+        .update({
+          stage: "published",
+          updated_at: new Date().toISOString(),
+        })
+        .in("id", publishedQueueIds)
+    }
+  }
+
+  await logScraperEvent({
+    runId,
+    level: syncResults.some((item) => !item.ok) ? "warning" : "success",
+    stage: "continuous_framer_batch_completed",
+    message:
+      `Framer CMS batch complete: ${successful.length}/${validItems.length} synced; ` +
+      `${deployed ? "published/deployed once" : "no deployment"}.`,
+    metadata: {
+      requested: validItems.length,
+      synced: successful.length,
+      failed: syncResults.filter((item) => !item.ok).length,
+      deployed,
+    },
+  })
+
+  return {
+    synced: successful.length,
+    failed: syncResults.filter((item) => !item.ok).length,
+    deployed,
+    results: syncResults,
   }
 }
 
-async function processContinuousAutomationQueue(runId, state) {
+async function processContinuousAutomationQueue(
+  runId,
+  state,
+  producerState
+) {
   const settings = continuousAutomationSettings(state)
   const adminUser = { id: state.created_by }
+  const framerBatchSize = Math.max(
+    1,
+    Math.min(Number(settings.import_batch_size || 20), 20)
+  )
+
   let totalProcessed = 0
   let totalCreated = 0
   let totalFailed = 0
+  let totalFramerSynced = 0
   let anyDeployed = false
+  let pendingFramerBatch = []
 
   if (!adminUser.id) {
     throw new Error(
       "24/7 automation has no admin owner. Turn it off and enable it again."
     )
+  }
+
+  const flushFramerBatch = async (force = false) => {
+    if (!settings.sync_to_framer) {
+      pendingFramerBatch = []
+      return
+    }
+
+    if (!pendingFramerBatch.length) return
+
+    if (!force && pendingFramerBatch.length < framerBatchSize) {
+      return
+    }
+
+    const batch = pendingFramerBatch.splice(
+      0,
+      force ? pendingFramerBatch.length : framerBatchSize
+    )
+
+    const result = await syncAndPublishContinuousFramerBatch(batch, runId)
+    totalFramerSynced += Number(result.synced || 0)
+    anyDeployed = anyDeployed || Boolean(result.deployed)
   }
 
   while (await isContinuousAutomationEnabled()) {
@@ -10991,24 +11219,20 @@ async function processContinuousAutomationQueue(runId, state) {
       .eq("run_id", runId)
       .eq("status", "ready_for_ai")
       .order("created_at", { ascending: true })
-      .limit(settings.import_batch_size)
+      .limit(Math.max(1, Math.min(framerBatchSize, 20)))
 
     if (error) throw error
-    if (!(queueItems || []).length) break
 
-    await supabaseAdmin
-      .from("scraper_runs")
-      .update({
-        status: "importing",
-        current_stage: "continuous_ai_import",
-        current_link: queueItems[0]?.telegram_link || null,
-        agent_last_seen_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-      })
-      .eq("id", runId)
+    if (!(queueItems || []).length) {
+      // Discovery is still producing. Do not exit just because the queue is
+      // momentarily empty; poll until discovery has finished.
+      if (!producerState.discoveryFinished) {
+        await sleep(1000)
+        continue
+      }
 
-    const batchResults = []
-    let transientBackoffSeconds = 0
+      break
+    }
 
     for (const item of queueItems) {
       if (!(await isContinuousAutomationEnabled())) break
@@ -11016,10 +11240,12 @@ async function processContinuousAutomationQueue(runId, state) {
       await markContinuousQueueItemProcessing(item, runId)
 
       try {
+        // AI + Telegram enrichment + Supabase happen immediately.
+        // Framer is deliberately deferred until the 20-listing batch is ready.
         const result = await importSingleTelegramListing(
           item.telegram_link,
           {
-            syncToFramer: settings.sync_to_framer,
+            syncToFramer: false,
             backgroundMode: settings.background_mode,
           },
           adminUser,
@@ -11032,34 +11258,54 @@ async function processContinuousAutomationQueue(runId, state) {
               })
               .eq("id", item.id)
 
-            await supabaseAdmin
-              .from("scraper_runs")
-              .update({
-                current_stage: stage,
-                current_link: item.telegram_link,
-                agent_last_seen_at: new Date().toISOString(),
-                updated_at: new Date().toISOString(),
-              })
-              .eq("id", runId)
-
             await logScraperEvent({
               runId,
               stage,
               telegramLink: item.telegram_link,
-              message: `24/7 importer: ${stage.replace(/_/g, " ")} for ${item.telegram_link}.`,
+              message: `24/7 AI worker: ${stage.replace(/_/g, " ")} for ${item.telegram_link}.`,
               metadata,
             })
           }
         )
 
-        batchResults.push(result)
         totalProcessed += 1
         if (result?.created) totalCreated += 1
-        await markContinuousQueueItemComplete(item, result)
+
+        // The listing is already persisted in Supabase. Keep its queue record
+        // complete, but make clear that Framer is waiting for the batch.
+        const resultForQueue = result?.created
+          ? {
+              ...result,
+              framer_synced: false,
+              framer_error: null,
+              framer_batch_pending: settings.sync_to_framer,
+            }
+          : result
+
+        await markContinuousQueueItemComplete(item, resultForQueue)
+
+        if (result?.created && settings.sync_to_framer) {
+          await supabaseAdmin
+            .from("scraper_queue")
+            .update({
+              stage: "waiting_for_framer_batch",
+              updated_at: new Date().toISOString(),
+            })
+            .eq("id", item.id)
+
+          pendingFramerBatch.push({
+            item,
+            result: resultForQueue,
+          })
+
+          // Framer is touched only when 20 AI-created listings are ready.
+          await flushFramerBatch(false)
+        }
       } catch (error) {
         if (isTransientContinuousImportError(error)) {
           await resetContinuousQueueItemForRetry(item, error)
-          transientBackoffSeconds = Math.max(
+
+          const transientBackoffSeconds = Math.max(
             60,
             Number(error?.retry_after_seconds || 0)
           )
@@ -11069,12 +11315,14 @@ async function processContinuousAutomationQueue(runId, state) {
             level: "warning",
             stage: "continuous_import_backoff",
             telegramLink: item.telegram_link,
-            message: `24/7 importer paused for a transient error: ${error.message}`,
+            message: `24/7 AI worker paused for a transient error: ${error.message}`,
             metadata: {
               retry_after_seconds: transientBackoffSeconds,
               code: error?.code || null,
             },
           })
+
+          await sleep(transientBackoffSeconds * 1000)
           break
         }
 
@@ -11085,7 +11333,6 @@ async function processContinuousAutomationQueue(runId, state) {
           code: error?.code || null,
         }
 
-        batchResults.push(failed)
         totalProcessed += 1
         totalFailed += 1
         await markContinuousQueueItemComplete(item, failed)
@@ -11094,40 +11341,41 @@ async function processContinuousAutomationQueue(runId, state) {
       await sleep(ADMIN_IMPORT_DELAY_MS)
     }
 
-    // Every listing in the batch synced with publish:false.
-    // Framer publishes/deploys exactly once for this completed batch.
-    if (settings.sync_to_framer) {
-      try {
-        const deployed = await publishContinuousFramerBatch(batchResults)
-        anyDeployed = anyDeployed || deployed
-      } catch (error) {
-        console.error("Continuous Framer batch deploy failed:", error)
-        await logScraperEvent({
-          runId,
-          level: "error",
-          stage: "continuous_framer_deploy_failed",
-          message: error.message || "Framer batch deployment failed.",
-        })
-      }
-    }
-
-    try {
-      await updateHomepageListingCache()
-    } catch (error) {
-      console.warn("Continuous homepage cache refresh failed:", error.message)
-    }
-
     await refreshScraperRunCounters(runId)
+  }
 
-    if (transientBackoffSeconds > 0) {
-      await sleep(transientBackoffSeconds * 1000)
+  // Do not strand a partial batch when this discovery cycle finishes.
+  // Normal steady-state batches are exactly 20; the final partial batch is
+  // flushed once at the cycle boundary or when 24/7 is turned off.
+  if (pendingFramerBatch.length) {
+    try {
+      await flushFramerBatch(true)
+    } catch (error) {
+      console.error("Final continuous Framer batch flush failed:", error)
+
+      await logScraperEvent({
+        runId,
+        level: "error",
+        stage: "continuous_framer_batch_flush_failed",
+        message:
+          error.message || "Final Framer CMS batch flush failed.",
+      })
     }
   }
+
+  try {
+    await updateHomepageListingCache()
+  } catch (error) {
+    console.warn("Continuous homepage cache refresh failed:", error.message)
+  }
+
+  await refreshScraperRunCounters(runId)
 
   return {
     processed: totalProcessed,
     created: totalCreated,
     failed: totalFailed,
+    framer_synced: totalFramerSynced,
     deployed: anyDeployed,
   }
 }
@@ -11185,28 +11433,52 @@ async function createContinuousAutomationRun(state) {
 
 async function runContinuousAutomationCycle(state) {
   const run = await createContinuousAutomationRun(state)
+  const producerState = {
+    discoveryFinished: false,
+    discoveryResult: null,
+  }
 
   await logScraperEvent({
     runId: run.id,
     stage: "continuous_cycle_started",
-    message: "24/7 Telegram graph + AI cycle started.",
+    message:
+      "24/7 concurrent cycle started: discovery and AI importing are running together.",
     metadata: continuousAutomationSettings(state),
   })
 
-  await runDiscoveryImport(run.id)
+  // Producer: Telegram graph discovery.
+  const discoveryPromise = runDiscoveryImport(run.id, {
+    continuousProducer: true,
+  })
+    .then((result) => {
+      producerState.discoveryResult = result
+      return result
+    })
+    .finally(() => {
+      producerState.discoveryFinished = true
+    })
 
-  if (!(await isContinuousAutomationEnabled())) {
-    return { runId: run.id, stopped: true }
-  }
+  // Consumer: starts immediately and polls ready_for_ai while the producer runs.
+  const importPromise = processContinuousAutomationQueue(
+    run.id,
+    state,
+    producerState
+  )
 
-  const importResult = await processContinuousAutomationQueue(run.id, state)
+  const [discoveryResult, importResult] = await Promise.all([
+    discoveryPromise,
+    importPromise,
+  ])
+
   const counts = await refreshScraperRunCounters(run.id)
   const now = new Date().toISOString()
+
+  const cycleFailed = discoveryResult?.ok === false
 
   await supabaseAdmin
     .from("scraper_runs")
     .update({
-      status: "completed",
+      status: cycleFailed ? "completed_with_errors" : "completed",
       current_stage: "continuous_cycle_completed",
       current_link: null,
       framer_deployed: Boolean(importResult.deployed),
@@ -11227,25 +11499,34 @@ async function runContinuousAutomationCycle(state) {
       current_run_id: null,
       cycle_count: Number(latestState?.cycle_count || 0) + 1,
       last_cycle_completed_at: now,
-      last_error: null,
+      last_error: cycleFailed
+        ? discoveryResult?.error || "Discovery completed with errors."
+        : null,
       updated_at: now,
     })
     .eq("id", CONTINUOUS_AUTOMATION_ROW_ID)
 
   await logScraperEvent({
     runId: run.id,
-    level: "success",
+    level: cycleFailed ? "warning" : "success",
     stage: "continuous_cycle_completed",
     message:
-      `24/7 cycle complete: ${importResult.created} listing(s) created, ` +
-      `${counts.duplicate || 0} duplicate(s), ${importResult.failed} import failure(s).`,
+      `24/7 concurrent cycle complete: ${importResult.created} listing(s) AI-created, ` +
+      `${importResult.framer_synced || 0} synced to Framer CMS in batches, ` +
+      `${counts.duplicate || 0} duplicate(s), ${importResult.failed} AI/import failure(s).`,
     metadata: {
+      discovery: discoveryResult,
       import: importResult,
       counters: counts,
     },
   })
 
-  return { runId: run.id, importResult, counts }
+  return {
+    runId: run.id,
+    discoveryResult,
+    importResult,
+    counts,
+  }
 }
 
 async function runContinuousAutomationLoop() {
