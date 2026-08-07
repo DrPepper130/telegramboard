@@ -3971,6 +3971,185 @@ app.post("/api/framer/sync-content-change", async (req, res) => {
 
 // Admin-only CMS lifecycle endpoint.
 // Reject/ban removes the public CMS page. Unban recreates and publishes it.
+
+app.get("/api/admin/listings/review-batch-status", async (req, res) => {
+  try {
+    const user = await getAdminUserFromRequest(req)
+    if (!user) {
+      return res.status(403).json({ error: "Admin access required." })
+    }
+
+    return res.json({
+      ok: true,
+      pending: await getPendingAdminReviewFramerCount(),
+      batch_size: ADMIN_REVIEW_FRAMER_BATCH_SIZE,
+      running: adminReviewFramerBatchRunning,
+    })
+  } catch (error) {
+    return res.status(500).json({
+      error: error.message || "Could not load review batch status.",
+    })
+  }
+})
+
+app.post("/api/admin/listings/review-approve", async (req, res) => {
+  try {
+    const user = await getAdminUserFromRequest(req)
+    if (!user) {
+      return res.status(403).json({ error: "Admin access required." })
+    }
+
+    const listingId = String(req.body?.listing_id || "").trim()
+    const updates =
+      req.body?.updates && typeof req.body.updates === "object"
+        ? req.body.updates
+        : {}
+
+    if (!listingId) {
+      return res.status(400).json({ error: "Missing listing_id." })
+    }
+
+    const { data: listing, error: listingError } = await supabaseAdmin
+      .from("channel_listings")
+      .select("*")
+      .eq("id", listingId)
+      .single()
+
+    if (listingError || !listing) {
+      return res.status(404).json({ error: "Listing not found." })
+    }
+
+    if (listing.is_banned) {
+      return res.status(409).json({ error: "Banned listings cannot be approved." })
+    }
+
+    const cleanString = (value, fallback = "") =>
+      value === undefined || value === null
+        ? fallback
+        : String(value).trim()
+
+    const updatePayload = {
+      listing_type:
+        String(updates.listing_type || listing.listing_type || "channel").toLowerCase() === "group"
+          ? "group"
+          : "channel",
+      channel_name: cleanString(updates.channel_name, listing.channel_name || ""),
+      telegram_title: cleanString(updates.telegram_title, listing.telegram_title || ""),
+      telegram_username: cleanString(
+        updates.telegram_username,
+        listing.telegram_username || ""
+      ),
+      telegram_link: cleanString(updates.telegram_link, listing.telegram_link || ""),
+      description: cleanString(updates.description, listing.description || ""),
+      long_description: cleanString(
+        updates.long_description,
+        listing.long_description || ""
+      ),
+      telegram_description: cleanString(
+        updates.telegram_description,
+        listing.telegram_description || ""
+      ),
+      member_count:
+        updates.member_count === undefined
+          ? Number(listing.member_count || 0)
+          : Math.max(0, Number(updates.member_count || 0)),
+      votes_count:
+        updates.votes_count === undefined
+          ? Number(listing.votes_count || 0)
+          : Math.max(0, Number(updates.votes_count || 0)),
+      short_invite: cleanString(updates.short_invite, listing.short_invite || ""),
+      is_nsfw:
+        updates.is_nsfw === undefined
+          ? Boolean(listing.is_nsfw)
+          : Boolean(updates.is_nsfw),
+      image_url:
+        updates.image_url === undefined
+          ? listing.image_url || null
+          : cleanString(updates.image_url) || null,
+      status: "approved",
+      admin_reviewed: true,
+      framer_sync_status: "pending_review_batch",
+      framer_sync_error: null,
+      updated_at: new Date().toISOString(),
+    }
+
+    const { data: updated, error: updateError } = await supabaseAdmin
+      .from("channel_listings")
+      .update(updatePayload)
+      .eq("id", listingId)
+      .select("id, channel_name, short_invite, framer_sync_status")
+      .single()
+
+    if (updateError) throw updateError
+
+    const pending = await getPendingAdminReviewFramerCount()
+    const batchStarted = pending >= ADMIN_REVIEW_FRAMER_BATCH_SIZE
+
+    if (batchStarted) {
+      kickAdminReviewFramerBatchIfReady()
+    }
+
+    return res.json({
+      ok: true,
+      listing: updated,
+      pending,
+      batch_size: ADMIN_REVIEW_FRAMER_BATCH_SIZE,
+      batch_started: batchStarted,
+      message: batchStarted
+        ? "Approved. A 20-listing Framer batch is starting."
+        : `Approved. ${pending}/${ADMIN_REVIEW_FRAMER_BATCH_SIZE} waiting for the next Framer batch.`,
+    })
+  } catch (error) {
+    console.error("Rapid admin approval failed:", error)
+    return res.status(500).json({
+      error: error.message || "Could not approve listing.",
+    })
+  }
+})
+
+app.post("/api/admin/listings/review-batch-flush", async (req, res) => {
+  try {
+    const user = await getAdminUserFromRequest(req)
+    if (!user) {
+      return res.status(403).json({ error: "Admin access required." })
+    }
+
+    const pendingBefore = await getPendingAdminReviewFramerCount()
+    if (!pendingBefore) {
+      return res.json({
+        ok: true,
+        pending: 0,
+        synced: 0,
+        message: "No reviewed listings are waiting for Framer.",
+      })
+    }
+
+    if (adminReviewFramerBatchRunning) {
+      return res.status(409).json({
+        error: "A review Framer batch is already running.",
+        pending: pendingBefore,
+      })
+    }
+
+    // Run in the request for an explicit manual flush so the admin gets
+    // a concrete success/failure result.
+    const result = await flushAdminReviewFramerBatches({ force: true })
+
+    return res.json({
+      ok: true,
+      ...result,
+      message: `Published ${result.synced || 0} reviewed listing(s) in ${
+        result.batches || 0
+      } Framer batch(es).`,
+    })
+  } catch (error) {
+    console.error("Manual review batch flush failed:", error)
+    return res.status(500).json({
+      error: error.message || "Could not publish reviewed listings.",
+    })
+  }
+})
+
 app.post("/api/admin/listings/lifecycle", async (req, res) => {
   try {
     const authHeader = req.headers.authorization || ""
@@ -11026,6 +11205,292 @@ function isTransientContinuousImportError(error) {
     message.includes("timeout") ||
     message.includes("fetch failed")
   )
+}
+
+
+let adminReviewFramerBatchRunning = false
+const ADMIN_REVIEW_FRAMER_BATCH_SIZE = 20
+
+async function syncAdminReviewListingBatchToFramer(listingIds) {
+  const cleanIds = Array.from(
+    new Set((listingIds || []).map((value) => String(value || "").trim()).filter(Boolean))
+  )
+
+  if (!cleanIds.length) {
+    return { ok: true, synced: 0, failed: 0, deployed: false, results: [] }
+  }
+
+  if (!process.env.FRAMER_API_KEY || !process.env.FRAMER_PROJECT_URL) {
+    throw new Error(
+      "Missing FRAMER_API_KEY or FRAMER_PROJECT_URL in Render environment variables."
+    )
+  }
+
+  const { data: listings, error: listingError } = await supabaseAdmin
+    .from("channel_listings")
+    .select("*")
+    .in("id", cleanIds)
+
+  if (listingError) throw listingError
+
+  const eligible = (listings || []).filter(
+    (listing) =>
+      listing &&
+      listing.status === "approved" &&
+      !listing.is_banned &&
+      listing.framer_sync_status === "pending_review_batch"
+  )
+
+  if (!eligible.length) {
+    return { ok: true, synced: 0, failed: 0, deployed: false, results: [] }
+  }
+
+  const { connect } = await import("framer-api")
+  const framer = await connect(
+    process.env.FRAMER_PROJECT_URL,
+    process.env.FRAMER_API_KEY
+  )
+
+  try {
+    const collection = await getFramerCollection(framer)
+    const fields = await collection.getFields()
+    const existingItems = await collection.getItems()
+
+    const existingById = new Map(
+      existingItems.map((item) => [String(item.id), item])
+    )
+    const existingBySlug = new Map(
+      existingItems.map((item) => [String(item.slug), item])
+    )
+
+    const entries = []
+    const results = []
+
+    // Prepare all 20 payloads first. There is no collection.addItems call
+    // inside this loop.
+    for (const listing of eligible) {
+      try {
+        const fullPayload = await buildFullFramerFieldData(
+          listing,
+          fields,
+          framer
+        )
+
+        const cmsSlug = fullPayload.cmsSlug
+        const existingItem =
+          (listing.framer_cms_item_id
+            ? existingById.get(String(listing.framer_cms_item_id))
+            : null) ||
+          existingBySlug.get(String(cmsSlug)) ||
+          null
+
+        const payload = {
+          slug: cmsSlug,
+          fieldData: fullPayload.fieldData,
+        }
+
+        if (existingItem?.id) payload.id = existingItem.id
+
+        const result = {
+          listing_id: listing.id,
+          ok: null,
+          slug: cmsSlug,
+          existing_cms_item_id: existingItem?.id || null,
+          warnings: fullPayload.warnings || [],
+        }
+
+        entries.push({ listing, payload, result })
+        results.push(result)
+      } catch (error) {
+        results.push({
+          listing_id: listing.id,
+          ok: false,
+          error: error.message || "Could not prepare Framer payload.",
+        })
+      }
+    }
+
+    if (!entries.length) {
+      return {
+        ok: false,
+        synced: 0,
+        failed: results.filter((item) => item.ok === false).length,
+        deployed: false,
+        results,
+      }
+    }
+
+    console.log("ADMIN REVIEW FRAMER BATCH:", {
+      requested: eligible.length,
+      prepared: entries.length,
+      add_items_calls: 1,
+    })
+
+    // One CMS array call for the entire review batch.
+    await collection.addItems(entries.map((entry) => entry.payload))
+
+    for (const entry of entries) entry.result.ok = true
+
+    let deployed = false
+    if (process.env.FRAMER_AUTO_DEPLOY !== "false") {
+      const publication = await framer.publish()
+      await framer.deploy(publication.deployment.id)
+      deployed = true
+    }
+
+    const itemsAfter = await collection.getItems()
+    const afterBySlug = new Map(
+      itemsAfter.map((item) => [String(item.slug), item])
+    )
+    const now = new Date().toISOString()
+
+    for (const entry of entries) {
+      const cmsItem =
+        (entry.result.existing_cms_item_id
+          ? itemsAfter.find(
+              (item) =>
+                String(item.id) === String(entry.result.existing_cms_item_id)
+            )
+          : null) ||
+        afterBySlug.get(String(entry.result.slug)) ||
+        null
+
+      const warningText =
+        Array.isArray(entry.result.warnings) && entry.result.warnings.length
+          ? entry.result.warnings.join(" | ")
+          : null
+
+      await supabaseAdmin
+        .from("channel_listings")
+        .update({
+          framer_cms_item_id: cmsItem?.id || entry.listing.framer_cms_item_id || null,
+          framer_sync_status: deployed ? "synced" : "pending_review_batch",
+          framer_synced_at: deployed ? now : entry.listing.framer_synced_at || null,
+          framer_sync_error: deployed
+            ? warningText
+            : "Admin review batch uploaded but was not deployed.",
+          updated_at: now,
+        })
+        .eq("id", entry.listing.id)
+    }
+
+    console.log("ADMIN REVIEW FRAMER BATCH COMPLETE:", {
+      synced: deployed ? entries.length : 0,
+      failed: results.filter((item) => item.ok === false).length,
+      deployed,
+    })
+
+    return {
+      ok: results.every((item) => item.ok !== false),
+      synced: deployed ? entries.length : 0,
+      failed: results.filter((item) => item.ok === false).length,
+      deployed,
+      results,
+    }
+  } catch (error) {
+    const now = new Date().toISOString()
+    await supabaseAdmin
+      .from("channel_listings")
+      .update({
+        framer_sync_status: "pending_review_batch",
+        framer_sync_error: String(error.message || "Admin review Framer batch failed.").slice(0, 2000),
+        updated_at: now,
+      })
+      .in("id", cleanIds)
+
+    throw error
+  } finally {
+    await framer.disconnect()
+  }
+}
+
+async function getPendingAdminReviewFramerCount() {
+  const { count, error } = await supabaseAdmin
+    .from("channel_listings")
+    .select("*", { count: "exact", head: true })
+    .eq("status", "approved")
+    .eq("is_banned", false)
+    .eq("framer_sync_status", "pending_review_batch")
+
+  if (error) throw error
+  return Number(count || 0)
+}
+
+async function flushAdminReviewFramerBatches(options = {}) {
+  if (adminReviewFramerBatchRunning) {
+    return {
+      ok: true,
+      already_running: true,
+      pending: await getPendingAdminReviewFramerCount(),
+    }
+  }
+
+  adminReviewFramerBatchRunning = true
+
+  try {
+    let totalSynced = 0
+    let totalFailed = 0
+    let batches = 0
+
+    while (true) {
+      const { data: pending, error } = await supabaseAdmin
+        .from("channel_listings")
+        .select("id")
+        .eq("status", "approved")
+        .eq("is_banned", false)
+        .eq("framer_sync_status", "pending_review_batch")
+        .order("updated_at", { ascending: true })
+        .limit(ADMIN_REVIEW_FRAMER_BATCH_SIZE)
+
+      if (error) throw error
+
+      const rows = pending || []
+      if (!rows.length) break
+      if (rows.length < ADMIN_REVIEW_FRAMER_BATCH_SIZE && options.force !== true) {
+        break
+      }
+
+      const result = await queueFramerSync(() =>
+        syncAdminReviewListingBatchToFramer(rows.map((row) => row.id))
+      )
+
+      batches += 1
+      totalSynced += Number(result.synced || 0)
+      totalFailed += Number(result.failed || 0)
+
+      // Avoid an infinite loop when Framer could not clear this batch.
+      if (!result.deployed || result.synced === 0) break
+
+      if (options.force === true) {
+        // force is used for the final partial batch; after one partial upload,
+        // continue only if another full batch still exists.
+        options = { ...options, force: false }
+      }
+    }
+
+    return {
+      ok: totalFailed === 0,
+      batches,
+      synced: totalSynced,
+      failed: totalFailed,
+      pending: await getPendingAdminReviewFramerCount(),
+    }
+  } finally {
+    adminReviewFramerBatchRunning = false
+  }
+}
+
+function kickAdminReviewFramerBatchIfReady() {
+  setImmediate(async () => {
+    try {
+      const pending = await getPendingAdminReviewFramerCount()
+      if (pending >= ADMIN_REVIEW_FRAMER_BATCH_SIZE) {
+        await flushAdminReviewFramerBatches()
+      }
+    } catch (error) {
+      console.error("Admin review Framer batch worker failed:", error)
+    }
+  })
 }
 
 async function syncAndPublishContinuousFramerBatch(batchItems, runId) {
