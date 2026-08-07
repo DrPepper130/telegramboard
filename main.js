@@ -4624,11 +4624,13 @@ async function buildHomepageListings(limit = 18) {
       status,
       created_at,
       updated_at,
-      last_synced_at
+      last_synced_at,
+      framer_sync_status
       `)
     .eq("status", "approved")
     .or("is_banned.is.null,is_banned.eq.false")
     .or("is_nsfw.is.null,is_nsfw.eq.false")
+    .or("framer_sync_status.is.null,framer_sync_status.neq.pending_batch")
 
   if (listingsError) throw listingsError
 
@@ -7405,6 +7407,7 @@ app.get("/api/listings/ranked", async (req, res) => {
       .select("*")
       .eq("status", "approved")
       .eq("is_banned", false)
+      .or("framer_sync_status.is.null,framer_sync_status.neq.pending_batch")
 
     if (listingsError) throw listingsError
 
@@ -8789,7 +8792,12 @@ async function importSingleTelegramListing(
     last_metadata_scraped_at: now,
     scrape_source: profileSource,
     scrape_failure_count: 0,
-    framer_sync_status: options.syncToFramer ? "not_synced" : null,
+    framer_sync_status:
+      options.deferFramerBatch === true
+        ? "pending_batch"
+        : options.syncToFramer
+          ? "not_synced"
+          : null,
   }
 
   const { data: inserted, error: insertError } = await supabaseAdmin
@@ -11025,7 +11033,7 @@ async function syncAndPublishContinuousFramerBatch(batchItems, runId) {
     (entry) => entry?.result?.created && entry?.result?.listing_id
   )
 
-  if (!validItems.length || process.env.FRAMER_AUTO_DEPLOY === "false") {
+  if (!validItems.length) {
     return {
       synced: 0,
       failed: 0,
@@ -11034,134 +11042,274 @@ async function syncAndPublishContinuousFramerBatch(batchItems, runId) {
     }
   }
 
-  const syncResults = []
+  if (!process.env.FRAMER_API_KEY || !process.env.FRAMER_PROJECT_URL) {
+    throw new Error(
+      "Missing FRAMER_API_KEY or FRAMER_PROJECT_URL in Render environment variables."
+    )
+  }
+
+  const listingIds = validItems.map((entry) => entry.result.listing_id)
+
+  const { data: listings, error: listingError } = await supabaseAdmin
+    .from("channel_listings")
+    .select("*")
+    .in("id", listingIds)
+
+  if (listingError) throw listingError
+
+  const listingById = new Map(
+    (listings || []).map((listing) => [String(listing.id), listing])
+  )
 
   await logScraperEvent({
     runId,
     stage: "continuous_framer_batch_started",
-    message: `Framer CMS batch started for ${validItems.length} AI-created listing(s).`,
-    metadata: { batch_size: validItems.length },
-  })
-
-  // Do not publish while each CMS item is being created/updated.
-  // We intentionally wait until the AI worker has accumulated a batch.
-  for (const entry of validItems) {
-    try {
-      const framerResult = await queueFramerSync(() =>
-        syncListingToFramerCMS(entry.result.listing_id, {
-          publish: false,
-          skipTelegramSync: true,
-        })
-      )
-
-      const patchedResult = {
-        ...entry.result,
-        framer_synced: Boolean(framerResult?.ok),
-        framer_error: null,
-      }
-
-      await supabaseAdmin
-        .from("scraper_queue")
-        .update({
-          result: patchedResult,
-          framer_synced: Boolean(framerResult?.ok),
-          stage: "framer_synced_waiting_for_batch_publish",
-          updated_at: new Date().toISOString(),
-        })
-        .eq("id", entry.item.id)
-
-      syncResults.push({
-        queue_item_id: entry.item.id,
-        listing_id: entry.result.listing_id,
-        ok: true,
-      })
-    } catch (error) {
-      const patchedResult = {
-        ...entry.result,
-        framer_synced: false,
-        framer_error: error.message || "Framer CMS sync failed.",
-      }
-
-      await supabaseAdmin
-        .from("scraper_queue")
-        .update({
-          result: patchedResult,
-          framer_synced: false,
-          stage: "framer_sync_failed",
-          error: error.message || "Framer CMS sync failed.",
-          updated_at: new Date().toISOString(),
-        })
-        .eq("id", entry.item.id)
-
-      syncResults.push({
-        queue_item_id: entry.item.id,
-        listing_id: entry.result.listing_id,
-        ok: false,
-        error: error.message || "Framer CMS sync failed.",
-      })
-    }
-  }
-
-  const successful = syncResults.filter((item) => item.ok)
-
-  let deployed = false
-
-  if (successful.length && process.env.FRAMER_AUTO_DEPLOY !== "false") {
-    const { connect } = await import("framer-api")
-    const framer = await connect(
-      process.env.FRAMER_PROJECT_URL,
-      process.env.FRAMER_API_KEY
-    )
-
-    try {
-      const publication = await framer.publish()
-      await framer.deploy(publication.deployment.id)
-      deployed = true
-    } finally {
-      await framer.disconnect()
-    }
-  }
-
-  if (deployed) {
-    const publishedQueueIds = validItems
-      .filter((entry) =>
-        successful.some(
-          (item) => item.queue_item_id === entry.item.id
-        )
-      )
-      .map((entry) => entry.item.id)
-
-    if (publishedQueueIds.length) {
-      await supabaseAdmin
-        .from("scraper_queue")
-        .update({
-          stage: "published",
-          updated_at: new Date().toISOString(),
-        })
-        .in("id", publishedQueueIds)
-    }
-  }
-
-  await logScraperEvent({
-    runId,
-    level: syncResults.some((item) => !item.ok) ? "warning" : "success",
-    stage: "continuous_framer_batch_completed",
     message:
-      `Framer CMS batch complete: ${successful.length}/${validItems.length} synced; ` +
-      `${deployed ? "published/deployed once" : "no deployment"}.`,
+      `True bulk Framer CMS batch started for ${validItems.length} AI-created listing(s).`,
     metadata: {
-      requested: validItems.length,
-      synced: successful.length,
-      failed: syncResults.filter((item) => !item.ok).length,
-      deployed,
+      batch_size: validItems.length,
+      framer_api_calls_expected: 1,
     },
   })
 
-  return {
-    synced: successful.length,
-    failed: syncResults.filter((item) => !item.ok).length,
-    deployed,
-    results: syncResults,
+  const { connect } = await import("framer-api")
+  const framer = await connect(
+    process.env.FRAMER_PROJECT_URL,
+    process.env.FRAMER_API_KEY
+  )
+
+  try {
+    const collection = await getFramerCollection(framer)
+    const fields = await collection.getFields()
+    const existingItems = await collection.getItems()
+
+    const existingById = new Map(
+      existingItems.map((item) => [String(item.id), item])
+    )
+    const existingBySlug = new Map(
+      existingItems.map((item) => [String(item.slug), item])
+    )
+
+    const entries = []
+    const results = []
+
+    // Build every CMS payload first. No Framer write occurs inside this loop.
+    for (const queueEntry of validItems) {
+      const listing = listingById.get(String(queueEntry.result.listing_id))
+
+      if (
+        !listing ||
+        listing.status !== "approved" ||
+        listing.is_banned
+      ) {
+        results.push({
+          queue_item_id: queueEntry.item.id,
+          listing_id: queueEntry.result.listing_id,
+          ok: false,
+          skipped: true,
+          error: "Listing is no longer eligible for Framer CMS.",
+        })
+        continue
+      }
+
+      try {
+        const fullPayload = await buildFullFramerFieldData(
+          listing,
+          fields,
+          framer
+        )
+
+        const cmsSlug = fullPayload.cmsSlug
+        const existingItem =
+          (listing.framer_cms_item_id
+            ? existingById.get(String(listing.framer_cms_item_id))
+            : null) ||
+          existingBySlug.get(String(cmsSlug)) ||
+          null
+
+        const payload = {
+          slug: cmsSlug,
+          fieldData: fullPayload.fieldData,
+        }
+
+        // Existing items update by id; brand-new AI listings intentionally
+        // omit id so Framer creates them as part of the same addItems array.
+        if (existingItem?.id) {
+          payload.id = existingItem.id
+        }
+
+        const result = {
+          queue_item_id: queueEntry.item.id,
+          listing_id: listing.id,
+          slug: cmsSlug,
+          ok: null,
+          warnings: fullPayload.warnings || [],
+          existing_cms_item_id: existingItem?.id || null,
+        }
+
+        entries.push({
+          queueEntry,
+          listing,
+          payload,
+          result,
+        })
+        results.push(result)
+      } catch (error) {
+        results.push({
+          queue_item_id: queueEntry.item.id,
+          listing_id: listing.id,
+          ok: false,
+          error: error.message || "Could not build Framer CMS payload.",
+        })
+      }
+    }
+
+    if (!entries.length) {
+      return {
+        synced: 0,
+        failed: results.filter((item) => item.ok === false).length,
+        deployed: false,
+        results,
+      }
+    }
+
+    // THIS is the important change:
+    // One array -> one collection.addItems() call for the whole 20-listing batch.
+    await collection.addItems(entries.map((entry) => entry.payload))
+
+    for (const entry of entries) {
+      entry.result.ok = true
+    }
+
+    let deployed = false
+
+    if (process.env.FRAMER_AUTO_DEPLOY !== "false") {
+      const publication = await framer.publish()
+      await framer.deploy(publication.deployment.id)
+      deployed = true
+    }
+
+    // Resolve CMS item ids after the array upload.
+    const itemsAfterBatch = await collection.getItems()
+    const afterBySlug = new Map(
+      itemsAfterBatch.map((item) => [String(item.slug), item])
+    )
+
+    const now = new Date().toISOString()
+
+    for (const entry of entries) {
+      const cmsItem =
+        (entry.result.existing_cms_item_id
+          ? itemsAfterBatch.find(
+              (item) =>
+                String(item.id) ===
+                String(entry.result.existing_cms_item_id)
+            )
+          : null) ||
+        afterBySlug.get(String(entry.result.slug)) ||
+        null
+
+      const warningText =
+        Array.isArray(entry.result.warnings) &&
+        entry.result.warnings.length
+          ? entry.result.warnings.join(" | ")
+          : null
+
+      if (deployed) {
+        await supabaseAdmin
+          .from("channel_listings")
+          .update({
+            framer_cms_item_id: cmsItem?.id || null,
+            framer_sync_status: "synced",
+            framer_synced_at: now,
+            framer_sync_error: warningText,
+            updated_at: now,
+          })
+          .eq("id", entry.listing.id)
+
+        const patchedResult = {
+          ...entry.queueEntry.result,
+          framer_synced: true,
+          framer_error: null,
+          framer_batch_pending: false,
+        }
+
+        await supabaseAdmin
+          .from("scraper_queue")
+          .update({
+            result: patchedResult,
+            framer_synced: true,
+            stage: "published",
+            error: null,
+            updated_at: now,
+          })
+          .eq("id", entry.queueEntry.item.id)
+      } else {
+        await supabaseAdmin
+          .from("channel_listings")
+          .update({
+            framer_sync_status: "pending_batch",
+            framer_sync_error:
+              "CMS batch uploaded but was not deployed.",
+            updated_at: now,
+          })
+          .eq("id", entry.listing.id)
+      }
+    }
+
+    await logScraperEvent({
+      runId,
+      level: deployed ? "success" : "warning",
+      stage: "continuous_framer_batch_completed",
+      message:
+        `Framer array batch complete: ${entries.length} listing(s) sent in one addItems call; ` +
+        `${deployed ? "one publish/deploy completed" : "deployment skipped"}.`,
+      metadata: {
+        requested: validItems.length,
+        array_size: entries.length,
+        framer_add_items_calls: 1,
+        deployed,
+        failed: results.filter((item) => item.ok === false).length,
+      },
+    })
+
+    return {
+      synced: deployed ? entries.length : 0,
+      failed: results.filter((item) => item.ok === false).length,
+      deployed,
+      results,
+    }
+  } catch (error) {
+    const now = new Date().toISOString()
+
+    // Keep these listings private/pending so a later batch/retry can handle them.
+    if (listingIds.length) {
+      await supabaseAdmin
+        .from("channel_listings")
+        .update({
+          framer_sync_status: "pending_batch",
+          framer_sync_error: String(
+            error.message || "Framer bulk batch failed."
+          ).slice(0, 2000),
+          updated_at: now,
+        })
+        .in("id", listingIds)
+    }
+
+    await logScraperEvent({
+      runId,
+      level: "error",
+      stage: "continuous_framer_batch_failed",
+      message:
+        error.message || "True bulk Framer CMS batch failed.",
+      metadata: {
+        batch_size: validItems.length,
+      },
+    })
+
+    throw error
+  } finally {
+    await framer.disconnect()
   }
 }
 
@@ -11246,6 +11394,7 @@ async function processContinuousAutomationQueue(
           item.telegram_link,
           {
             syncToFramer: false,
+            deferFramerBatch: true,
             backgroundMode: settings.background_mode,
           },
           adminUser,
