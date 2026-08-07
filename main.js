@@ -9545,7 +9545,7 @@ async function loadGraphCrawlHistory(normalizedLinks) {
     const { data, error } = await supabaseAdmin
       .from("telegram_graph_crawl_history")
       .select(
-        "normalized_link, telegram_username, last_crawled_at, last_success_at, last_result_count, last_verified_count, last_new_count, crawl_count, last_status"
+        "normalized_link, telegram_username, last_crawled_at, last_success_at, last_result_count, last_verified_count, last_new_count, crawl_count, last_status, max_requested_depth"
       )
       .in("normalized_link", batch)
 
@@ -9561,6 +9561,19 @@ async function loadGraphCrawlHistory(normalizedLinks) {
 
 function graphHistoryEligible(history, settings, nowMs = Date.now()) {
   if (!history?.last_crawled_at) return true
+
+  const requestedDepth = Math.max(
+    1,
+    Math.min(Number(settings?.max_depth || 1), 5)
+  )
+  const previousRequestedDepth = Math.max(
+    0,
+    Number(history?.max_requested_depth || 0)
+  )
+
+  // A deeper crawl request is allowed through immediately, even when the
+  // normal time-based cooldown has not expired.
+  if (requestedDepth > previousRequestedDepth) return true
 
   const last = new Date(history.last_crawled_at).getTime()
   if (!Number.isFinite(last)) return true
@@ -9582,6 +9595,7 @@ async function recordGraphCrawlHistory({
   rawCandidates = 0,
   verifiedCount = 0,
   newCount = 0,
+  requestedMaxDepth = 1,
   status = "completed",
   error = null,
 }) {
@@ -9590,7 +9604,7 @@ async function recordGraphCrawlHistory({
 
   const { data: previous, error: previousError } = await supabaseAdmin
     .from("telegram_graph_crawl_history")
-    .select("crawl_count")
+    .select("crawl_count, max_requested_depth")
     .eq("normalized_link", normalizedLink)
     .maybeSingle()
 
@@ -9611,6 +9625,10 @@ async function recordGraphCrawlHistory({
     last_verified_count: Number(verifiedCount || 0),
     last_new_count: Number(newCount || 0),
     crawl_count: Number(previous?.crawl_count || 0) + 1,
+    max_requested_depth: Math.max(
+      Number(previous?.max_requested_depth || 0),
+      Math.max(1, Math.min(Number(requestedMaxDepth || 1), 5))
+    ),
     last_status: status,
     last_error: error ? String(error).slice(0, 2000) : null,
     updated_at: now,
@@ -10434,6 +10452,10 @@ async function loadTelegramGraphSeedLinks(run, metadata) {
   )
 
   const settings = {
+    max_depth: Math.max(
+      1,
+      Math.min(Number(metadata.max_depth || 2), 5)
+    ),
     crawl_cooldown_hours: Math.max(
       1,
       Number(metadata.crawl_cooldown_hours || GRAPH_CRAWL_COOLDOWN_HOURS)
@@ -10522,6 +10544,7 @@ async function loadTelegramGraphSeedLinks(run, metadata) {
         skipped_by_history: skippedByHistory,
         selected: selected.length,
         requested_seed_limit: seedLimit,
+        requested_max_depth: settings.max_depth,
         crawl_cooldown_hours: settings.crawl_cooldown_hours,
         empty_crawl_cooldown_hours: settings.empty_crawl_cooldown_hours,
       },
@@ -10817,6 +10840,7 @@ async function runTelegramGraphDiscovery(run, metadata) {
           rawCandidates: rawCandidateCount,
           verifiedCount: verifiedFromSeed,
           newCount: newFromSeed,
+          requestedMaxDepth: maxDepth,
           status: "completed",
         })
       } catch (error) {
@@ -10826,6 +10850,7 @@ async function runTelegramGraphDiscovery(run, metadata) {
           rawCandidates: rawCandidateCount,
           verifiedCount: verifiedFromSeed,
           newCount: newFromSeed,
+          requestedMaxDepth: maxDepth,
           status: "failed",
           error: error.message || "Could not scan public posts.",
         })
