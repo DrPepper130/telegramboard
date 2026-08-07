@@ -10216,29 +10216,51 @@ async function runTelegramGraphDiscovery(run, metadata) {
             }
           )
 
+          // A verified channel/group counts toward this seed's traversal limit
+          // even when it was already queued or already exists in TeleHub.
+          // This prevents duplicates from blocking depth-2+ graph expansion.
+          verifiedFromSeed += 1
+
           if (added.added) {
             accepted += 1
-            verifiedFromSeed += 1
+          }
 
-            await logScraperEvent({
-              runId: run.id,
-              level: "success",
-              stage: "telegram_graph_verified",
-              message: `Verified ${verified.listingType}: @${verified.username} (${Number(
-                verified.memberCount || 0
-              ).toLocaleString()} ${verified.listingType === "channel" ? "subscribers" : "members"}).`,
-              telegramLink: verified.telegramLink,
-              metadata: {
-                depth: depth + 1,
-                discovered_from: seedLink,
-                listing_type: verified.listingType,
-                member_count: verified.memberCount,
-                verified_from_seed: verifiedFromSeed,
-                per_seed_limit: perSeedLimit,
-              },
-            })
+          await logScraperEvent({
+            runId: run.id,
+            level: added.added ? "success" : "info",
+            stage: added.added
+              ? "telegram_graph_verified"
+              : "telegram_graph_verified_existing",
+            message: added.added
+              ? `Verified ${verified.listingType}: @${verified.username} (${Number(
+                    verified.memberCount || 0
+                  ).toLocaleString()} ${verified.listingType === "channel" ? "subscribers" : "members"}).`
+              : `Verified existing ${verified.listingType}: @${verified.username}; using it as a graph node (${added.reason || "already_known"}).`,
+            telegramLink: verified.telegramLink,
+            metadata: {
+              depth: depth + 1,
+              discovered_from: seedLink,
+              listing_type: verified.listingType,
+              member_count: verified.memberCount,
+              verified_from_seed: verifiedFromSeed,
+              per_seed_limit: perSeedLimit,
+              newly_queued: Boolean(added.added),
+              discovery_result: added.reason || (added.added ? "added" : "already_known"),
+            },
+          })
 
-            if (depth + 1 < maxDepth) {
+          // Traversal is separate from importing. Any verified public channel/group
+          // may be crawled at the next depth, even if it was discovered in an earlier run.
+          if (depth + 1 < maxDepth) {
+            const normalizedNext = normalizeTelegramLinkForComparison(
+              verified.telegramLink
+            )
+
+            if (
+              normalizedNext &&
+              normalizedNext !== normalizedSeed &&
+              !visited.has(normalizedNext)
+            ) {
               nextFrontier.push(verified.telegramLink)
             }
           }
@@ -10258,7 +10280,27 @@ async function runTelegramGraphDiscovery(run, metadata) {
       await new Promise((resolve) => setTimeout(resolve, requestDelayMs))
     }
 
-    frontier = Array.from(new Set(nextFrontier))
+    frontier = Array.from(
+      new Map(
+        nextFrontier
+          .map((link) => [normalizeTelegramLinkForComparison(link), link])
+          .filter(([normalized]) => Boolean(normalized))
+      ).values()
+    )
+
+    if (depth + 1 < maxDepth) {
+      await logScraperEvent({
+        runId: run.id,
+        stage: "telegram_graph_depth_advanced",
+        message: `Depth ${depth + 1} complete; ${frontier.length} verified node(s) queued for depth ${depth + 2}.`,
+        metadata: {
+          completed_depth: depth + 1,
+          next_depth: depth + 2,
+          next_frontier_size: frontier.length,
+          new_links_accepted_so_far: accepted,
+        },
+      })
+    }
   }
 
   return accepted
