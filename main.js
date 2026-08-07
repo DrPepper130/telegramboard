@@ -375,20 +375,176 @@ function parseDisplayedTelegramCount(rawText) {
     .trim()
 
   const match = normalized.match(
-    /([\d\s.,]+)\s+(members?|subscribers?|participants?)/i
+    /([\d\s.,]+)\s*([kmb])?\s+(members?|subscribers?|participants?)/i
   )
 
   if (!match) return null
 
   const countText = match[1].trim()
-  const digitsOnly = countText.replace(/[^\d]/g, "")
+  const suffix = String(match[2] || "").toLowerCase()
 
-  if (!digitsOnly) return null
+  let memberCount = null
+
+  if (suffix) {
+    const numeric = Number(
+      countText
+        .replace(/\s+/g, "")
+        .replace(/,(?=\d{1,2}$)/, ".")
+        .replace(/,/g, "")
+    )
+
+    if (Number.isFinite(numeric)) {
+      const multiplier =
+        suffix === "k"
+          ? 1_000
+          : suffix === "m"
+            ? 1_000_000
+            : suffix === "b"
+              ? 1_000_000_000
+              : 1
+
+      memberCount = Math.round(numeric * multiplier)
+    }
+  } else {
+    const digitsOnly = countText.replace(/[^\d]/g, "")
+    if (digitsOnly) memberCount = Number(digitsOnly)
+  }
+
+  if (!Number.isFinite(memberCount)) return null
 
   return {
-    memberCount: Number(digitsOnly),
-    listingType: /subscribers?/i.test(match[2]) ? "channel" : "group",
+    memberCount,
+    listingType: /subscribers?/i.test(match[3]) ? "channel" : "group",
     rawDisplay: match[0],
+  }
+}
+
+
+function classifyTelegramPublicPage(html, username) {
+  const rawHtml = String(html || "")
+  const decodedHtml = decodeHtmlEntities(rawHtml)
+  const visibleText = stripHtml(decodedHtml).replace(/\s+/g, " ").trim()
+
+  const htmlTitle =
+    stripHtml(
+      rawHtml.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1] || ""
+    ) || ""
+
+  const actionText =
+    stripHtml(
+      rawHtml.match(
+        /<div[^>]+class=["'][^"']*tgme_page_action[^"']*["'][^>]*>[\s\S]*?<a[^>]*>([\s\S]*?)<\/a>/i
+      )?.[1] || ""
+    ) || ""
+
+  const extras = []
+  const extraRegex =
+    /<div[^>]+class=["'][^"']*tgme_page_extra[^"']*["'][^>]*>([\s\S]*?)<\/div>/gi
+  let extraMatch
+  while ((extraMatch = extraRegex.exec(rawHtml))) {
+    const value = stripHtml(extraMatch[1] || "").replace(/\s+/g, " ").trim()
+    if (value) extras.push(value)
+  }
+
+  const extraText = extras.join(" | ")
+  const parsedCount = parseDisplayedTelegramCount(extraText)
+
+  const hasPreviewChannel =
+    /class=["'][^"']*tgme_page_context_link[^"']*["'][^>]*href=["'][^"']*\/s\/[^"']+["']/i.test(
+      rawHtml
+    ) ||
+    /\bPreview channel\b/i.test(visibleText)
+
+  const hasMonthlyUsers =
+    /\b[\d\s.,]+\s+(?:monthly\s+users?|monthly\s+active\s+users?)\b/i.test(
+      extraText
+    ) || /\bmonthly users?\b/i.test(visibleText)
+
+  const isBotAction =
+    /\bStart Bot\b/i.test(actionText) ||
+    /\bStart Bot\b/i.test(visibleText) ||
+    /\byou can launch\b/i.test(visibleText)
+
+  const isUserPage =
+    /^Telegram:\s*Contact\s+@/i.test(htmlTitle) ||
+    /\bSend Message\b/i.test(actionText) ||
+    /\byou can contact\b/i.test(visibleText)
+
+  const isViewPage =
+    /^Telegram:\s*View\s+@/i.test(htmlTitle) ||
+    /\bView in Telegram\b/i.test(actionText)
+
+  if (hasMonthlyUsers || isBotAction) {
+    return {
+      entityType: "bot",
+      listingType: null,
+      memberCount: null,
+      rawDisplay: extraText || null,
+      htmlTitle,
+      actionText,
+      reason: hasMonthlyUsers ? "monthly_users" : "start_bot",
+    }
+  }
+
+  if (isUserPage) {
+    return {
+      entityType: "user",
+      listingType: null,
+      memberCount: null,
+      rawDisplay: extraText || null,
+      htmlTitle,
+      actionText,
+      reason: "contact_page",
+    }
+  }
+
+  if (parsedCount?.listingType === "channel") {
+    return {
+      entityType: "channel",
+      listingType: "channel",
+      memberCount: parsedCount.memberCount,
+      rawDisplay: parsedCount.rawDisplay,
+      htmlTitle,
+      actionText,
+      reason:
+        hasPreviewChannel || isViewPage
+          ? "subscriber_count_and_channel_structure"
+          : "subscriber_count",
+    }
+  }
+
+  if (parsedCount?.listingType === "group") {
+    return {
+      entityType: "group",
+      listingType: "group",
+      memberCount: parsedCount.memberCount,
+      rawDisplay: parsedCount.rawDisplay,
+      htmlTitle,
+      actionText,
+      reason: "member_count",
+    }
+  }
+
+  if (hasPreviewChannel || isViewPage) {
+    return {
+      entityType: "unknown_channel_like",
+      listingType: null,
+      memberCount: null,
+      rawDisplay: extraText || null,
+      htmlTitle,
+      actionText,
+      reason: "channel_structure_without_count",
+    }
+  }
+
+  return {
+    entityType: "unknown",
+    listingType: null,
+    memberCount: null,
+    rawDisplay: extraText || null,
+    htmlTitle,
+    actionText,
+    reason: "unrecognized_public_page",
   }
 }
 
@@ -456,10 +612,6 @@ async function fetchPublicTelegramPage(listing) {
         /<meta[^>]+property=["']og:description["'][^>]+content=["']([^"']*)["']/i
       )
 
-    const extraMatch = html.match(
-      /<div[^>]+class="[^"]*tgme_page_extra[^"]*"[^>]*>([\s\S]*?)<\/div>/i
-    )
-
     const imageMatch =
       html.match(
         /<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i
@@ -468,14 +620,41 @@ async function fetchPublicTelegramPage(listing) {
         /<img[^>]+class="[^"]*tgme_page_photo_image[^"]*"[^>]+src=["']([^"']+)["']/i
       )
 
-    const extraText = stripHtml(extraMatch?.[1] || "")
-    const parsedCount = parseDisplayedTelegramCount(extraText)
+    const classification = classifyTelegramPublicPage(html, username)
 
-    if (!parsedCount) {
+    if (classification.entityType === "bot") {
       const error = new Error(
-        "Telegram public page did not expose a readable member count."
+        "Telegram public page is a bot or mini-app, not a channel/group."
       )
-      error.code = "TME_SCRAPE_COUNT_MISSING"
+      error.code = "TME_ENTITY_BOT"
+      error.entity_type = "bot"
+      error.classification_reason = classification.reason
+      throw error
+    }
+
+    if (classification.entityType === "user") {
+      const error = new Error(
+        "Telegram public page is a personal/user account, not a channel/group."
+      )
+      error.code = "TME_ENTITY_USER"
+      error.entity_type = "user"
+      error.classification_reason = classification.reason
+      throw error
+    }
+
+    if (
+      classification.listingType !== "channel" &&
+      classification.listingType !== "group"
+    ) {
+      const error = new Error(
+        "Telegram public page could not be confidently classified as a channel or group."
+      )
+      error.code =
+        classification.entityType === "unknown_channel_like"
+          ? "TME_ENTITY_CHANNEL_LIKE_NO_COUNT"
+          : "TME_ENTITY_UNKNOWN"
+      error.entity_type = classification.entityType
+      error.classification_reason = classification.reason
       throw error
     }
 
@@ -486,10 +665,12 @@ async function fetchPublicTelegramPage(listing) {
       title: stripHtml(titleMatch?.[1] || ""),
       description: stripHtml(descriptionMatch?.[1] || ""),
       iconUrl: decodeHtmlEntities(imageMatch?.[1] || "") || null,
-      memberCount: parsedCount.memberCount,
-      listingType: parsedCount.listingType,
-      rawDisplay: parsedCount.rawDisplay,
-      source: "tme_public_page",
+      memberCount: classification.memberCount,
+      listingType: classification.listingType,
+      rawDisplay: classification.rawDisplay,
+      entityType: classification.entityType,
+      classificationReason: classification.reason,
+      source: "tme_public_page_structural",
     }
   } finally {
     clearTimeout(timeout)
@@ -9856,7 +10037,7 @@ async function verifyTelegramGraphCandidate(candidateLink) {
   if (isObviousTelegramBotUsername(cleanUsernameValue)) {
     return {
       ok: false,
-      reason: "obvious_bot",
+      reason: "filtered_bot_username",
       username: cleanUsernameValue,
     }
   }
@@ -9897,12 +10078,24 @@ async function verifyTelegramGraphCandidate(candidateLink) {
       source: profile.source || "tme_public_page",
     }
   } catch (error) {
+    const reason =
+      error?.code === "TME_ENTITY_BOT"
+        ? "filtered_bot"
+        : error?.code === "TME_ENTITY_USER"
+          ? "filtered_user"
+          : error?.code === "TME_ENTITY_CHANNEL_LIKE_NO_COUNT"
+            ? "filtered_channel_like_no_count"
+            : error?.code === "TME_ENTITY_UNKNOWN"
+              ? "filtered_unknown"
+              : error?.code || "telegram_verification_failed"
+
     return {
       ok: false,
-      reason: error?.code || "telegram_verification_failed",
+      reason,
       username: cleanUsernameValue,
       error: error?.message || "Telegram verification failed.",
       status: error?.status || null,
+      classification_reason: error?.classification_reason || null,
     }
   }
 }
