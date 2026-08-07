@@ -8943,7 +8943,8 @@ async function importSingleTelegramListing(
 
   const now = new Date().toISOString()
   const insertPayload = {
-    user_id: adminUser.id,
+    // Auto-imported listings stay unclaimed until a real owner verifies and claims them.
+    user_id: null,
     listing_type: listingType,
     channel_name:
       aiContent.display_name ||
