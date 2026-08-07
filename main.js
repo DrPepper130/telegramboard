@@ -9205,6 +9205,240 @@ const PORT = process.env.PORT || 3000
 const SCRAPER_EVENT_LIMIT = 250
 const activeTelemetrRuns = new Set()
 
+const CONTINUOUS_AUTOMATION_ROW_ID = "global"
+const CONTINUOUS_AUTOMATION_WORKER_ID =
+  `render-${process.pid}-${Math.random().toString(36).slice(2, 10)}`
+const CONTINUOUS_AUTOMATION_LEASE_SECONDS = Math.max(
+  300,
+  Number(process.env.CONTINUOUS_AUTOMATION_LEASE_SECONDS || 3600)
+)
+const CONTINUOUS_AUTOMATION_IDLE_MS = Math.max(
+  5000,
+  Number(process.env.CONTINUOUS_AUTOMATION_IDLE_MS || 15000)
+)
+const GRAPH_CRAWL_COOLDOWN_HOURS = Math.max(
+  1,
+  Number(process.env.GRAPH_CRAWL_COOLDOWN_HOURS || 168)
+)
+const GRAPH_EMPTY_CRAWL_COOLDOWN_HOURS = Math.max(
+  GRAPH_CRAWL_COOLDOWN_HOURS,
+  Number(process.env.GRAPH_EMPTY_CRAWL_COOLDOWN_HOURS || 720)
+)
+
+let continuousAutomationLoopPromise = null
+
+async function getContinuousAutomationState() {
+  const { data, error } = await supabaseAdmin
+    .from("telehub_automation_state")
+    .select("*")
+    .eq("id", CONTINUOUS_AUTOMATION_ROW_ID)
+    .maybeSingle()
+
+  if (error) throw error
+
+  return (
+    data || {
+      id: CONTINUOUS_AUTOMATION_ROW_ID,
+      enabled: false,
+      settings: {},
+      current_run_id: null,
+      cycle_count: 0,
+    }
+  )
+}
+
+async function claimContinuousAutomationLease() {
+  const { data, error } = await supabaseAdmin.rpc(
+    "claim_telehub_automation_lease",
+    {
+      p_worker_id: CONTINUOUS_AUTOMATION_WORKER_ID,
+      p_lease_seconds: CONTINUOUS_AUTOMATION_LEASE_SECONDS,
+    }
+  )
+
+  if (error) throw error
+  return data === true
+}
+
+async function heartbeatContinuousAutomationLease() {
+  const { error } = await supabaseAdmin
+    .from("telehub_automation_state")
+    .update({
+      last_heartbeat_at: new Date().toISOString(),
+      lease_expires_at: new Date(
+        Date.now() + CONTINUOUS_AUTOMATION_LEASE_SECONDS * 1000
+      ).toISOString(),
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", CONTINUOUS_AUTOMATION_ROW_ID)
+    .eq("lease_owner", CONTINUOUS_AUTOMATION_WORKER_ID)
+
+  if (error) {
+    console.warn("Continuous automation heartbeat failed:", error.message)
+  }
+}
+
+async function releaseContinuousAutomationLease() {
+  const { error } = await supabaseAdmin.rpc(
+    "release_telehub_automation_lease",
+    { p_worker_id: CONTINUOUS_AUTOMATION_WORKER_ID }
+  )
+
+  if (error) {
+    console.warn("Continuous automation lease release failed:", error.message)
+  }
+}
+
+async function isContinuousAutomationEnabled() {
+  try {
+    const state = await getContinuousAutomationState()
+    return state?.enabled === true
+  } catch (error) {
+    console.warn("Could not read continuous automation state:", error.message)
+    return false
+  }
+}
+
+function continuousAutomationSettings(state) {
+  const raw =
+    state?.settings && typeof state.settings === "object"
+      ? state.settings
+      : {}
+
+  return {
+    seed_limit: Math.max(1, Math.min(Number(raw.seed_limit || 1000), 10000)),
+    max_depth: Math.max(1, Math.min(Number(raw.max_depth || 2), 5)),
+    max_links_per_seed: Math.max(
+      1,
+      Math.min(Number(raw.max_links_per_seed || 10), 100)
+    ),
+    request_delay_ms: Math.max(
+      250,
+      Math.min(Number(raw.request_delay_ms || 2000), 10000)
+    ),
+    target_per_cycle: Math.max(
+      1,
+      Math.min(Number(raw.target_per_cycle || 500), 10000)
+    ),
+    import_batch_size: Math.max(
+      1,
+      Math.min(Number(raw.import_batch_size || 20), MAX_ADMIN_IMPORT_LIMIT)
+    ),
+    background_mode: ["none", "icon", "related", "telegram_post"].includes(
+      String(raw.background_mode || "related")
+    )
+      ? String(raw.background_mode || "related")
+      : "related",
+    sync_to_framer: raw.sync_to_framer !== false,
+    cycle_delay_ms: Math.max(
+      5000,
+      Math.min(Number(raw.cycle_delay_ms || CONTINUOUS_AUTOMATION_IDLE_MS), 300000)
+    ),
+    crawl_cooldown_hours: Math.max(
+      1,
+      Number(raw.crawl_cooldown_hours || GRAPH_CRAWL_COOLDOWN_HOURS)
+    ),
+    empty_crawl_cooldown_hours: Math.max(
+      1,
+      Number(raw.empty_crawl_cooldown_hours || GRAPH_EMPTY_CRAWL_COOLDOWN_HOURS)
+    ),
+  }
+}
+
+async function loadGraphCrawlHistory(normalizedLinks) {
+  const links = Array.from(
+    new Set((normalizedLinks || []).filter(Boolean))
+  )
+
+  const byLink = new Map()
+
+  for (let index = 0; index < links.length; index += 200) {
+    const batch = links.slice(index, index + 200)
+    const { data, error } = await supabaseAdmin
+      .from("telegram_graph_crawl_history")
+      .select(
+        "normalized_link, telegram_username, last_crawled_at, last_success_at, last_result_count, last_verified_count, last_new_count, crawl_count, last_status"
+      )
+      .in("normalized_link", batch)
+
+    if (error) throw error
+
+    for (const row of data || []) {
+      byLink.set(row.normalized_link, row)
+    }
+  }
+
+  return byLink
+}
+
+function graphHistoryEligible(history, settings, nowMs = Date.now()) {
+  if (!history?.last_crawled_at) return true
+
+  const last = new Date(history.last_crawled_at).getTime()
+  if (!Number.isFinite(last)) return true
+
+  const productive = Number(history.last_verified_count || 0) > 0
+  const cooldownHours = productive
+    ? Number(settings.crawl_cooldown_hours || GRAPH_CRAWL_COOLDOWN_HOURS)
+    : Number(
+        settings.empty_crawl_cooldown_hours ||
+          GRAPH_EMPTY_CRAWL_COOLDOWN_HOURS
+      )
+
+  return nowMs - last >= cooldownHours * 60 * 60 * 1000
+}
+
+async function recordGraphCrawlHistory({
+  seedLink,
+  seedUsername,
+  rawCandidates = 0,
+  verifiedCount = 0,
+  newCount = 0,
+  status = "completed",
+  error = null,
+}) {
+  const normalizedLink = normalizeTelegramLinkForComparison(seedLink)
+  if (!normalizedLink) return
+
+  const { data: previous, error: previousError } = await supabaseAdmin
+    .from("telegram_graph_crawl_history")
+    .select("crawl_count")
+    .eq("normalized_link", normalizedLink)
+    .maybeSingle()
+
+  if (previousError) {
+    console.warn("Could not read graph crawl history:", previousError.message)
+  }
+
+  const now = new Date().toISOString()
+  const payload = {
+    normalized_link: normalizedLink,
+    telegram_username: String(
+      seedUsername || extractUsernameFromLink(seedLink) || ""
+    )
+      .replace(/^@/, "")
+      .toLowerCase() || null,
+    last_crawled_at: now,
+    last_result_count: Number(rawCandidates || 0),
+    last_verified_count: Number(verifiedCount || 0),
+    last_new_count: Number(newCount || 0),
+    crawl_count: Number(previous?.crawl_count || 0) + 1,
+    last_status: status,
+    last_error: error ? String(error).slice(0, 2000) : null,
+    updated_at: now,
+    ...(verifiedCount > 0 ? { last_success_at: now } : {}),
+  }
+
+  const { error: upsertError } = await supabaseAdmin
+    .from("telegram_graph_crawl_history")
+    .upsert(payload, { onConflict: "normalized_link" })
+
+  if (upsertError) {
+    console.warn("Could not save graph crawl history:", upsertError.message)
+  }
+}
+
+
 async function getAdminUserFromRequest(req) {
   const authHeader = String(req.headers.authorization || "")
   const token = authHeader.replace(/^Bearer\s+/i, "").trim()
@@ -9987,15 +10221,39 @@ async function loadTelegramGraphSeedLinks(run, metadata) {
     ? metadata.seed_links.map(cleanImportTelegramLink).filter(Boolean)
     : []
 
-  const seedLimit = Math.max(1, Math.min(Number(metadata.seed_limit || 100), 1000))
+  const seedLimit = Math.max(
+    1,
+    Math.min(Number(metadata.seed_limit || 100), 10000)
+  )
+
+  const settings = {
+    crawl_cooldown_hours: Math.max(
+      1,
+      Number(metadata.crawl_cooldown_hours || GRAPH_CRAWL_COOLDOWN_HOURS)
+    ),
+    empty_crawl_cooldown_hours: Math.max(
+      1,
+      Number(
+        metadata.empty_crawl_cooldown_hours ||
+          GRAPH_EMPTY_CRAWL_COOLDOWN_HOURS
+      )
+    ),
+  }
+
+  // Pull a much larger pool than the requested frontier because recently
+  // crawled channels will be skipped by persistent crawl history.
+  const poolLimit = Math.max(
+    seedLimit,
+    Math.min(seedLimit * 10, 10000)
+  )
 
   const { data: approved, error } = await supabaseAdmin
     .from("channel_listings")
-    .select("telegram_link, telegram_username")
+    .select("telegram_link, telegram_username, member_count")
     .eq("status", "approved")
     .or("is_banned.is.null,is_banned.eq.false")
     .order("member_count", { ascending: false })
-    .limit(seedLimit)
+    .limit(poolLimit)
 
   if (error) throw error
 
@@ -10010,7 +10268,60 @@ async function loadTelegramGraphSeedLinks(run, metadata) {
     )
     .filter(Boolean)
 
-  return Array.from(new Set([...requestedSeeds, ...existingSeeds])).slice(0, seedLimit)
+  const explicitNormalized = new Set(
+    requestedSeeds.map(normalizeTelegramLinkForComparison).filter(Boolean)
+  )
+
+  const candidates = Array.from(
+    new Map(
+      [...requestedSeeds, ...existingSeeds]
+        .map((link) => [normalizeTelegramLinkForComparison(link), link])
+        .filter(([normalized]) => Boolean(normalized))
+    ).values()
+  )
+
+  const history = await loadGraphCrawlHistory(
+    candidates.map(normalizeTelegramLinkForComparison)
+  )
+
+  const selected = []
+  let skippedByHistory = 0
+
+  for (const link of candidates) {
+    if (selected.length >= seedLimit) break
+
+    const normalized = normalizeTelegramLinkForComparison(link)
+    if (!normalized) continue
+
+    // Explicitly pasted seeds are always honored. Automatic seeds respect
+    // persistent crawl history so 24/7 mode keeps moving forward.
+    if (
+      !explicitNormalized.has(normalized) &&
+      !graphHistoryEligible(history.get(normalized), settings)
+    ) {
+      skippedByHistory += 1
+      continue
+    }
+
+    selected.push(link)
+  }
+
+  if (skippedByHistory > 0) {
+    await logScraperEvent({
+      runId: run.id,
+      stage: "telegram_graph_history_skip",
+      message: `Crawl history skipped ${skippedByHistory} recently scanned seed(s); ${selected.length} eligible seed(s) selected.`,
+      metadata: {
+        skipped_by_history: skippedByHistory,
+        selected: selected.length,
+        requested_seed_limit: seedLimit,
+        crawl_cooldown_hours: settings.crawl_cooldown_hours,
+        empty_crawl_cooldown_hours: settings.empty_crawl_cooldown_hours,
+      },
+    })
+  }
+
+  return selected
 }
 
 
@@ -10103,8 +10414,14 @@ async function verifyTelegramGraphCandidate(candidateLink) {
 async function runTelegramGraphDiscovery(run, metadata) {
   const target = Math.max(1, Number(run.requested_target || 100))
   const maxDepth = Math.max(1, Math.min(Number(metadata.max_depth || 2), 5))
-  const perSeedLimit = Math.max(1, Math.min(Number(metadata.max_links_per_seed || 25), 100))
-  const requestDelayMs = Math.max(250, Math.min(Number(metadata.request_delay_ms || 1000), 10000))
+  const perSeedLimit = Math.max(
+    1,
+    Math.min(Number(metadata.max_links_per_seed || 25), 100)
+  )
+  const requestDelayMs = Math.max(
+    250,
+    Math.min(Number(metadata.request_delay_ms || 1000), 10000)
+  )
 
   let frontier = await loadTelegramGraphSeedLinks(run, metadata)
   const visited = new Set()
@@ -10113,16 +10430,28 @@ async function runTelegramGraphDiscovery(run, metadata) {
   await logScraperEvent({
     runId: run.id,
     stage: "telegram_graph_seeded",
-    message: `Telegram graph seeded with ${frontier.length} public channel(s).`,
-    metadata: { seeds: frontier.length, max_depth: maxDepth, max_links_per_seed: perSeedLimit },
+    message: `Telegram graph seeded with ${frontier.length} eligible public channel(s).`,
+    metadata: {
+      seeds: frontier.length,
+      max_depth: maxDepth,
+      max_links_per_seed: perSeedLimit,
+    },
   })
 
-  for (let depth = 0; depth < maxDepth && frontier.length && accepted < target; depth += 1) {
+  for (
+    let depth = 0;
+    depth < maxDepth && frontier.length && accepted < target;
+    depth += 1
+  ) {
     const nextFrontier = []
 
     for (const seedLink of frontier) {
       if (accepted >= target) break
       if (!(await waitWhilePaused(run.id))) return accepted
+
+      if (metadata.continuous && !(await isContinuousAutomationEnabled())) {
+        return accepted
+      }
 
       const normalizedSeed = normalizeTelegramLinkForComparison(seedLink)
       if (!normalizedSeed || visited.has(normalizedSeed)) continue
@@ -10141,6 +10470,10 @@ async function runTelegramGraphDiscovery(run, metadata) {
         })
         .eq("id", run.id)
 
+      let rawCandidateCount = 0
+      let verifiedFromSeed = 0
+      let newFromSeed = 0
+
       try {
         const context = await fetchPublicTelegramPostContext(
           { telegram_username: seedUsername, telegram_link: seedLink },
@@ -10151,10 +10484,16 @@ async function runTelegramGraphDiscovery(run, metadata) {
           new Set((context.telegramLinks || []).map(cleanImportTelegramLink))
         )
           .filter(Boolean)
-          .filter((candidate) => normalizeTelegramLinkForComparison(candidate) !== normalizedSeed)
-          // "Links per seed" now means verified channels/groups per seed.
-          // We inspect a much larger raw pool so bots/users do not consume the limit.
-          .slice(0, Math.min(100, Math.max(perSeedLimit * 10, perSeedLimit)))
+          .filter(
+            (candidate) =>
+              normalizeTelegramLinkForComparison(candidate) !== normalizedSeed
+          )
+          .slice(
+            0,
+            Math.min(100, Math.max(perSeedLimit * 10, perSeedLimit))
+          )
+
+        rawCandidateCount = candidates.length
 
         await logScraperEvent({
           runId: run.id,
@@ -10169,10 +10508,9 @@ async function runTelegramGraphDiscovery(run, metadata) {
           },
         })
 
-        let verifiedFromSeed = 0
-
         for (const candidateLink of candidates) {
           if (accepted >= target || verifiedFromSeed >= perSeedLimit) break
+
           const candidateUsername = extractUsernameFromLink(candidateLink)
           if (!candidateUsername) continue
 
@@ -10196,33 +10534,29 @@ async function runTelegramGraphDiscovery(run, metadata) {
             continue
           }
 
-          const added = await addDiscoveryResult(
-            run.id,
-            verified.username,
-            {
+          const added = await addDiscoveryResult(run.id, verified.username, {
+            source: "telegram_graph",
+            discovered_from: seedLink,
+            depth: depth + 1,
+            title: verified.title,
+            subscribers: verified.memberCount,
+            category: null,
+            filters: {
               source: "telegram_graph",
-              discovered_from: seedLink,
+              seed: seedLink,
               depth: depth + 1,
-              title: verified.title,
-              subscribers: verified.memberCount,
-              category: null,
-              filters: {
-                source: "telegram_graph",
-                seed: seedLink,
-                depth: depth + 1,
-                verified_type: verified.listingType,
-                verification_source: verified.source,
-              },
-            }
-          )
+              verified_type: verified.listingType,
+              verification_source: verified.source,
+            },
+          })
 
-          // A verified channel/group counts toward this seed's traversal limit
-          // even when it was already queued or already exists in TeleHub.
-          // This prevents duplicates from blocking depth-2+ graph expansion.
+          // Traversal and importing are deliberately separate. Already-known
+          // verified communities are still useful graph nodes.
           verifiedFromSeed += 1
 
           if (added.added) {
             accepted += 1
+            newFromSeed += 1
           }
 
           await logScraperEvent({
@@ -10233,8 +10567,12 @@ async function runTelegramGraphDiscovery(run, metadata) {
               : "telegram_graph_verified_existing",
             message: added.added
               ? `Verified ${verified.listingType}: @${verified.username} (${Number(
-                    verified.memberCount || 0
-                  ).toLocaleString()} ${verified.listingType === "channel" ? "subscribers" : "members"}).`
+                  verified.memberCount || 0
+                ).toLocaleString()} ${
+                  verified.listingType === "channel"
+                    ? "subscribers"
+                    : "members"
+                }).`
               : `Verified existing ${verified.listingType}: @${verified.username}; using it as a graph node (${added.reason || "already_known"}).`,
             telegramLink: verified.telegramLink,
             metadata: {
@@ -10243,14 +10581,14 @@ async function runTelegramGraphDiscovery(run, metadata) {
               listing_type: verified.listingType,
               member_count: verified.memberCount,
               verified_from_seed: verifiedFromSeed,
+              new_from_seed: newFromSeed,
               per_seed_limit: perSeedLimit,
               newly_queued: Boolean(added.added),
-              discovery_result: added.reason || (added.added ? "added" : "already_known"),
+              discovery_result:
+                added.reason || (added.added ? "added" : "already_known"),
             },
           })
 
-          // Traversal is separate from importing. Any verified public channel/group
-          // may be crawled at the next depth, even if it was discovered in an earlier run.
           if (depth + 1 < maxDepth) {
             const normalizedNext = normalizeTelegramLinkForComparison(
               verified.telegramLink
@@ -10265,14 +10603,37 @@ async function runTelegramGraphDiscovery(run, metadata) {
             }
           }
         }
+
+        await recordGraphCrawlHistory({
+          seedLink,
+          seedUsername,
+          rawCandidates: rawCandidateCount,
+          verifiedCount: verifiedFromSeed,
+          newCount: newFromSeed,
+          status: "completed",
+        })
       } catch (error) {
+        await recordGraphCrawlHistory({
+          seedLink,
+          seedUsername,
+          rawCandidates: rawCandidateCount,
+          verifiedCount: verifiedFromSeed,
+          newCount: newFromSeed,
+          status: "failed",
+          error: error.message || "Could not scan public posts.",
+        })
+
         await logScraperEvent({
           runId: run.id,
           level: "warning",
           stage: "telegram_graph_seed_failed",
           message: `${seedLink}: ${error.message || "Could not scan public posts."}`,
           telegramLink: seedLink,
-          metadata: { depth: depth + 1, code: error?.code || null, status: error?.status || null },
+          metadata: {
+            depth: depth + 1,
+            code: error?.code || null,
+            status: error?.status || null,
+          },
         })
       }
 
@@ -10497,11 +10858,476 @@ async function runTelemetrImportLegacy(runId) {
   }
 }
 
+
+async function markContinuousQueueItemProcessing(item, runId) {
+  const now = new Date().toISOString()
+
+  const { error } = await supabaseAdmin
+    .from("scraper_queue")
+    .update({
+      status: "processing",
+      stage: "ai_import",
+      error: null,
+      updated_at: now,
+    })
+    .eq("id", item.id)
+    .eq("run_id", runId)
+
+  if (error) throw error
+}
+
+async function markContinuousQueueItemComplete(item, result) {
+  const finalStatus = result?.created
+    ? "created"
+    : result?.skipped
+      ? "duplicate"
+      : result?.ok === false
+        ? "failed"
+        : "completed"
+
+  const finalStage = result?.created
+    ? "completed"
+    : result?.filtered
+      ? "filtered"
+      : result?.skipped
+        ? "duplicate"
+        : result?.ok === false
+          ? "failed"
+          : "completed"
+
+  const { error } = await supabaseAdmin
+    .from("scraper_queue")
+    .update({
+      status: finalStatus,
+      stage: finalStage,
+      listing_id:
+        result?.listing_id || result?.existing_listing_id || null,
+      result: result || null,
+      framer_synced: Boolean(result?.framer_synced),
+      error: result?.ok === false ? result?.error || "Import failed." : null,
+      completed_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", item.id)
+
+  if (error) throw error
+}
+
+async function resetContinuousQueueItemForRetry(item, error) {
+  const { error: updateError } = await supabaseAdmin
+    .from("scraper_queue")
+    .update({
+      status: "ready_for_ai",
+      stage: "ready_for_ai",
+      error: String(error?.message || "Temporary importer error.").slice(0, 2000),
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", item.id)
+
+  if (updateError) {
+    console.warn("Could not reset queue item for retry:", updateError.message)
+  }
+}
+
+function isTransientContinuousImportError(error) {
+  const message = String(error?.message || "").toLowerCase()
+
+  return (
+    error?.code === "TELEGRAM_RATE_LIMITED" ||
+    error?.status === 429 ||
+    message.includes("rate limit") ||
+    message.includes("too many requests") ||
+    message.includes("temporarily unavailable") ||
+    message.includes("timeout") ||
+    message.includes("fetch failed")
+  )
+}
+
+async function publishContinuousFramerBatch(results) {
+  const needsDeploy = (results || []).some(
+    (item) => item?.created && item?.framer_synced
+  )
+
+  if (
+    !needsDeploy ||
+    process.env.FRAMER_AUTO_DEPLOY === "false"
+  ) {
+    return false
+  }
+
+  const { connect } = await import("framer-api")
+  const framer = await connect(
+    process.env.FRAMER_PROJECT_URL,
+    process.env.FRAMER_API_KEY
+  )
+
+  try {
+    const publication = await framer.publish()
+    await framer.deploy(publication.deployment.id)
+    return true
+  } finally {
+    await framer.disconnect()
+  }
+}
+
+async function processContinuousAutomationQueue(runId, state) {
+  const settings = continuousAutomationSettings(state)
+  const adminUser = { id: state.created_by }
+  let totalProcessed = 0
+  let totalCreated = 0
+  let totalFailed = 0
+  let anyDeployed = false
+
+  if (!adminUser.id) {
+    throw new Error(
+      "24/7 automation has no admin owner. Turn it off and enable it again."
+    )
+  }
+
+  while (await isContinuousAutomationEnabled()) {
+    const { data: queueItems, error } = await supabaseAdmin
+      .from("scraper_queue")
+      .select("*")
+      .eq("run_id", runId)
+      .eq("status", "ready_for_ai")
+      .order("created_at", { ascending: true })
+      .limit(settings.import_batch_size)
+
+    if (error) throw error
+    if (!(queueItems || []).length) break
+
+    await supabaseAdmin
+      .from("scraper_runs")
+      .update({
+        status: "importing",
+        current_stage: "continuous_ai_import",
+        current_link: queueItems[0]?.telegram_link || null,
+        agent_last_seen_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", runId)
+
+    const batchResults = []
+    let transientBackoffSeconds = 0
+
+    for (const item of queueItems) {
+      if (!(await isContinuousAutomationEnabled())) break
+
+      await markContinuousQueueItemProcessing(item, runId)
+
+      try {
+        const result = await importSingleTelegramListing(
+          item.telegram_link,
+          {
+            syncToFramer: settings.sync_to_framer,
+            backgroundMode: settings.background_mode,
+          },
+          adminUser,
+          async (stage, metadata = {}) => {
+            await supabaseAdmin
+              .from("scraper_queue")
+              .update({
+                stage,
+                updated_at: new Date().toISOString(),
+              })
+              .eq("id", item.id)
+
+            await supabaseAdmin
+              .from("scraper_runs")
+              .update({
+                current_stage: stage,
+                current_link: item.telegram_link,
+                agent_last_seen_at: new Date().toISOString(),
+                updated_at: new Date().toISOString(),
+              })
+              .eq("id", runId)
+
+            await logScraperEvent({
+              runId,
+              stage,
+              telegramLink: item.telegram_link,
+              message: `24/7 importer: ${stage.replace(/_/g, " ")} for ${item.telegram_link}.`,
+              metadata,
+            })
+          }
+        )
+
+        batchResults.push(result)
+        totalProcessed += 1
+        if (result?.created) totalCreated += 1
+        await markContinuousQueueItemComplete(item, result)
+      } catch (error) {
+        if (isTransientContinuousImportError(error)) {
+          await resetContinuousQueueItemForRetry(item, error)
+          transientBackoffSeconds = Math.max(
+            60,
+            Number(error?.retry_after_seconds || 0)
+          )
+
+          await logScraperEvent({
+            runId,
+            level: "warning",
+            stage: "continuous_import_backoff",
+            telegramLink: item.telegram_link,
+            message: `24/7 importer paused for a transient error: ${error.message}`,
+            metadata: {
+              retry_after_seconds: transientBackoffSeconds,
+              code: error?.code || null,
+            },
+          })
+          break
+        }
+
+        const failed = {
+          ok: false,
+          link: item.telegram_link,
+          error: error.message || "Import failed.",
+          code: error?.code || null,
+        }
+
+        batchResults.push(failed)
+        totalProcessed += 1
+        totalFailed += 1
+        await markContinuousQueueItemComplete(item, failed)
+      }
+
+      await sleep(ADMIN_IMPORT_DELAY_MS)
+    }
+
+    // Every listing in the batch synced with publish:false.
+    // Framer publishes/deploys exactly once for this completed batch.
+    if (settings.sync_to_framer) {
+      try {
+        const deployed = await publishContinuousFramerBatch(batchResults)
+        anyDeployed = anyDeployed || deployed
+      } catch (error) {
+        console.error("Continuous Framer batch deploy failed:", error)
+        await logScraperEvent({
+          runId,
+          level: "error",
+          stage: "continuous_framer_deploy_failed",
+          message: error.message || "Framer batch deployment failed.",
+        })
+      }
+    }
+
+    try {
+      await updateHomepageListingCache()
+    } catch (error) {
+      console.warn("Continuous homepage cache refresh failed:", error.message)
+    }
+
+    await refreshScraperRunCounters(runId)
+
+    if (transientBackoffSeconds > 0) {
+      await sleep(transientBackoffSeconds * 1000)
+    }
+  }
+
+  return {
+    processed: totalProcessed,
+    created: totalCreated,
+    failed: totalFailed,
+    deployed: anyDeployed,
+  }
+}
+
+async function createContinuousAutomationRun(state) {
+  const settings = continuousAutomationSettings(state)
+  const now = new Date().toISOString()
+  const metadata = {
+    provider: "telegram_graph",
+    continuous: true,
+    seed_links: [],
+    seed_limit: settings.seed_limit,
+    max_depth: settings.max_depth,
+    max_links_per_seed: settings.max_links_per_seed,
+    request_delay_ms: settings.request_delay_ms,
+    crawl_cooldown_hours: settings.crawl_cooldown_hours,
+    empty_crawl_cooldown_hours: settings.empty_crawl_cooldown_hours,
+  }
+
+  const { data: run, error } = await supabaseAdmin
+    .from("scraper_runs")
+    .insert({
+      source: "telegram_graph_24_7",
+      status: "queued",
+      requested_target: settings.target_per_cycle,
+      country_id: "global",
+      sort: "graph",
+      sync_to_framer: settings.sync_to_framer,
+      use_icon_as_background: settings.background_mode === "icon",
+      created_by: state.created_by,
+      discovery_stop_requested: false,
+      stop_all_requested: false,
+      current_stage: "queued",
+      metadata,
+      created_at: now,
+      updated_at: now,
+    })
+    .select("*")
+    .single()
+
+  if (error) throw error
+
+  await supabaseAdmin
+    .from("telehub_automation_state")
+    .update({
+      current_run_id: String(run.id),
+      last_cycle_started_at: now,
+      last_error: null,
+      updated_at: now,
+    })
+    .eq("id", CONTINUOUS_AUTOMATION_ROW_ID)
+
+  return run
+}
+
+async function runContinuousAutomationCycle(state) {
+  const run = await createContinuousAutomationRun(state)
+
+  await logScraperEvent({
+    runId: run.id,
+    stage: "continuous_cycle_started",
+    message: "24/7 Telegram graph + AI cycle started.",
+    metadata: continuousAutomationSettings(state),
+  })
+
+  await runDiscoveryImport(run.id)
+
+  if (!(await isContinuousAutomationEnabled())) {
+    return { runId: run.id, stopped: true }
+  }
+
+  const importResult = await processContinuousAutomationQueue(run.id, state)
+  const counts = await refreshScraperRunCounters(run.id)
+  const now = new Date().toISOString()
+
+  await supabaseAdmin
+    .from("scraper_runs")
+    .update({
+      status: "completed",
+      current_stage: "continuous_cycle_completed",
+      current_link: null,
+      framer_deployed: Boolean(importResult.deployed),
+      completed_at: now,
+      updated_at: now,
+    })
+    .eq("id", run.id)
+
+  const { data: latestState } = await supabaseAdmin
+    .from("telehub_automation_state")
+    .select("cycle_count")
+    .eq("id", CONTINUOUS_AUTOMATION_ROW_ID)
+    .single()
+
+  await supabaseAdmin
+    .from("telehub_automation_state")
+    .update({
+      current_run_id: null,
+      cycle_count: Number(latestState?.cycle_count || 0) + 1,
+      last_cycle_completed_at: now,
+      last_error: null,
+      updated_at: now,
+    })
+    .eq("id", CONTINUOUS_AUTOMATION_ROW_ID)
+
+  await logScraperEvent({
+    runId: run.id,
+    level: "success",
+    stage: "continuous_cycle_completed",
+    message:
+      `24/7 cycle complete: ${importResult.created} listing(s) created, ` +
+      `${counts.duplicate || 0} duplicate(s), ${importResult.failed} import failure(s).`,
+    metadata: {
+      import: importResult,
+      counters: counts,
+    },
+  })
+
+  return { runId: run.id, importResult, counts }
+}
+
+async function runContinuousAutomationLoop() {
+  while (true) {
+    const state = await getContinuousAutomationState()
+    if (!state?.enabled) break
+
+    let claimed = false
+    let heartbeatTimer = null
+
+    try {
+      claimed = await claimContinuousAutomationLease()
+
+      if (!claimed) {
+        await sleep(10000)
+        continue
+      }
+
+      heartbeatTimer = setInterval(() => {
+        heartbeatContinuousAutomationLease().catch((error) =>
+          console.warn("Automation heartbeat error:", error.message)
+        )
+      }, 60000)
+
+      await runContinuousAutomationCycle(state)
+    } catch (error) {
+      console.error("24/7 automation cycle failed:", error)
+
+      await supabaseAdmin
+        .from("telehub_automation_state")
+        .update({
+          last_error: String(error.message || "Automation cycle failed.").slice(
+            0,
+            4000
+          ),
+          last_cycle_completed_at: new Date().toISOString(),
+          current_run_id: null,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", CONTINUOUS_AUTOMATION_ROW_ID)
+    } finally {
+      if (heartbeatTimer) clearInterval(heartbeatTimer)
+      if (claimed) await releaseContinuousAutomationLease()
+    }
+
+    const refreshed = await getContinuousAutomationState()
+    if (!refreshed?.enabled) break
+
+    const settings = continuousAutomationSettings(refreshed)
+    await sleep(settings.cycle_delay_ms)
+  }
+}
+
+function kickContinuousAutomationWorker() {
+  if (continuousAutomationLoopPromise) return continuousAutomationLoopPromise
+
+  continuousAutomationLoopPromise = runContinuousAutomationLoop()
+    .catch((error) => {
+      console.error("24/7 automation worker stopped unexpectedly:", error)
+    })
+    .finally(() => {
+      continuousAutomationLoopPromise = null
+    })
+
+  return continuousAutomationLoopPromise
+}
+
 app.post("/api/admin/scraper/start", async (req, res) => {
   try {
     const user = await getAdminUserFromRequest(req)
     if (!user) {
       return res.status(403).json({ error: "Admin access required." })
+    }
+
+    const automationState = await getContinuousAutomationState()
+    if (automationState?.enabled) {
+      return res.status(409).json({
+        error:
+          "24/7 automation is enabled. Turn it off before starting a manual discovery run.",
+        automation_enabled: true,
+        run_id: automationState.current_run_id || null,
+      })
     }
 
     const { data: activeRun } = await supabaseAdmin
@@ -10546,6 +11372,17 @@ app.post("/api/admin/scraper/start", async (req, res) => {
       max_depth: Math.max(1, Math.min(Number(req.body?.max_depth || 2), 5)),
       max_links_per_seed: Math.max(1, Math.min(Number(req.body?.max_links_per_seed || 25), 100)),
       request_delay_ms: Math.max(250, Math.min(Number(req.body?.request_delay_ms || 1000), 10000)),
+      crawl_cooldown_hours: Math.max(
+        1,
+        Number(req.body?.crawl_cooldown_hours || GRAPH_CRAWL_COOLDOWN_HOURS)
+      ),
+      empty_crawl_cooldown_hours: Math.max(
+        1,
+        Number(
+          req.body?.empty_crawl_cooldown_hours ||
+            GRAPH_EMPTY_CRAWL_COOLDOWN_HOURS
+        )
+      ),
       country,
       category: String(req.body?.category || "all").trim(),
       subscriber_min:
@@ -10698,6 +11535,213 @@ app.post("/api/admin/scraper/rotation/reset", async (req, res) => {
     return res.json({ ok: true })
   } catch (error) {
     return res.status(500).json({ error: error.message })
+  }
+})
+
+
+app.get("/api/admin/automation/status", async (req, res) => {
+  try {
+    const user = await getAdminUserFromRequest(req)
+    if (!user) {
+      return res.status(403).json({ error: "Admin access required." })
+    }
+
+    const state = await getContinuousAutomationState()
+
+    const { count: historyCount, error: historyError } = await supabaseAdmin
+      .from("telegram_graph_crawl_history")
+      .select("*", { count: "exact", head: true })
+
+    if (historyError) throw historyError
+
+    return res.json({
+      ok: true,
+      automation: {
+        ...state,
+        settings: continuousAutomationSettings(state),
+        crawl_history_count: Number(historyCount || 0),
+        worker_active: Boolean(continuousAutomationLoopPromise),
+      },
+    })
+  } catch (error) {
+    return res.status(500).json({
+      error: error.message || "Could not load 24/7 automation status.",
+    })
+  }
+})
+
+app.post("/api/admin/automation/toggle", async (req, res) => {
+  try {
+    const user = await getAdminUserFromRequest(req)
+    if (!user) {
+      return res.status(403).json({ error: "Admin access required." })
+    }
+
+    const enabled = req.body?.enabled === true
+    const current = await getContinuousAutomationState()
+    const currentSettings =
+      current?.settings && typeof current.settings === "object"
+        ? current.settings
+        : {}
+
+    const settings = {
+      ...currentSettings,
+      seed_limit: Math.max(
+        1,
+        Math.min(Number(req.body?.seed_limit || currentSettings.seed_limit || 1000), 10000)
+      ),
+      max_depth: Math.max(
+        1,
+        Math.min(Number(req.body?.max_depth || currentSettings.max_depth || 2), 5)
+      ),
+      max_links_per_seed: Math.max(
+        1,
+        Math.min(
+          Number(
+            req.body?.max_links_per_seed ||
+              currentSettings.max_links_per_seed ||
+              10
+          ),
+          100
+        )
+      ),
+      request_delay_ms: Math.max(
+        250,
+        Math.min(
+          Number(
+            req.body?.request_delay_ms ||
+              currentSettings.request_delay_ms ||
+              2000
+          ),
+          10000
+        )
+      ),
+      target_per_cycle: Math.max(
+        1,
+        Math.min(
+          Number(
+            req.body?.target_per_cycle ||
+              currentSettings.target_per_cycle ||
+              500
+          ),
+          10000
+        )
+      ),
+      import_batch_size: Math.max(
+        1,
+        Math.min(
+          Number(
+            req.body?.import_batch_size ||
+              currentSettings.import_batch_size ||
+              20
+          ),
+          MAX_ADMIN_IMPORT_LIMIT
+        )
+      ),
+      background_mode: ["none", "icon", "related", "telegram_post"].includes(
+        String(
+          req.body?.background_mode ||
+            currentSettings.background_mode ||
+            "related"
+        )
+      )
+        ? String(
+            req.body?.background_mode ||
+              currentSettings.background_mode ||
+              "related"
+          )
+        : "related",
+      sync_to_framer:
+        req.body?.sync_to_framer === undefined
+          ? currentSettings.sync_to_framer !== false
+          : req.body.sync_to_framer !== false,
+      cycle_delay_ms: Math.max(
+        5000,
+        Math.min(
+          Number(
+            req.body?.cycle_delay_ms ||
+              currentSettings.cycle_delay_ms ||
+              CONTINUOUS_AUTOMATION_IDLE_MS
+          ),
+          300000
+        )
+      ),
+      crawl_cooldown_hours: Math.max(
+        1,
+        Number(
+          req.body?.crawl_cooldown_hours ||
+            currentSettings.crawl_cooldown_hours ||
+            GRAPH_CRAWL_COOLDOWN_HOURS
+        )
+      ),
+      empty_crawl_cooldown_hours: Math.max(
+        1,
+        Number(
+          req.body?.empty_crawl_cooldown_hours ||
+            currentSettings.empty_crawl_cooldown_hours ||
+            GRAPH_EMPTY_CRAWL_COOLDOWN_HOURS
+        )
+      ),
+    }
+
+    const now = new Date().toISOString()
+
+    const { data: state, error } = await supabaseAdmin
+      .from("telehub_automation_state")
+      .upsert(
+        {
+          id: CONTINUOUS_AUTOMATION_ROW_ID,
+          enabled,
+          created_by: user.id,
+          settings,
+          ...(enabled
+            ? {
+                last_error: null,
+              }
+            : {
+                current_run_id: null,
+                lease_owner: null,
+                lease_expires_at: null,
+              }),
+          updated_at: now,
+        },
+        { onConflict: "id" }
+      )
+      .select("*")
+      .single()
+
+    if (error) throw error
+
+    if (!enabled && current?.current_run_id) {
+      await supabaseAdmin
+        .from("scraper_runs")
+        .update({
+          status: "stopped",
+          discovery_stop_requested: true,
+          stop_all_requested: true,
+          updated_at: now,
+        })
+        .eq("id", current.current_run_id)
+    }
+
+    if (enabled) {
+      setImmediate(() => kickContinuousAutomationWorker())
+    } else {
+      await releaseContinuousAutomationLease()
+    }
+
+    return res.json({
+      ok: true,
+      automation: {
+        ...state,
+        settings: continuousAutomationSettings(state),
+      },
+    })
+  } catch (error) {
+    console.error("24/7 automation toggle failed:", error)
+    return res.status(500).json({
+      error: error.message || "Could not change 24/7 automation.",
+    })
   }
 })
 
@@ -10905,4 +11949,16 @@ app.get("/api/admin/feedback/growth-challenges", async (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`)
+
+  // 24/7 automation state lives in Supabase, so a Render restart does not
+  // disable it. If enabled, resume the worker after the server is listening.
+  setTimeout(() => {
+    getContinuousAutomationState()
+      .then((state) => {
+        if (state?.enabled) kickContinuousAutomationWorker()
+      })
+      .catch((error) =>
+        console.error("Could not resume 24/7 automation on startup:", error)
+      )
+  }, 3000)
 })
