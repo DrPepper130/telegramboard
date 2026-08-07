@@ -563,8 +563,26 @@ async function fetchPublicTelegramPostContext(listing, options = {}) {
 
     const html = await response.text()
     const posts = []
+    const imageUrls = []
     const messageRegex =
       /<div[^>]+class="[^"]*tgme_widget_message_text[^"]*"[^>]*>([\s\S]*?)<\/div>/gi
+
+    // Public Telegram post pages expose photo URLs in inline background-image
+    // styles. Video posts often expose a poster image instead.
+    const photoRegex =
+      /class=["'][^"']*tgme_widget_message_photo_wrap[^"']*["'][^>]*style=["'][^"']*background-image\s*:\s*url\((?:&quot;|["']?)(https?:[^)"'&]+)(?:&quot;|["']?)\)/gi
+    const posterRegex =
+      /<video[^>]+poster=["'](https?:[^"']+)["']/gi
+    const imageTagRegex =
+      /<img[^>]+class=["'][^"']*tgme_widget_message_photo[^"']*["'][^>]+src=["'](https?:[^"']+)["']/gi
+
+    for (const regex of [photoRegex, posterRegex, imageTagRegex]) {
+      let imageMatch
+      while ((imageMatch = regex.exec(html)) && imageUrls.length < 20) {
+        const url = decodeHtmlEntities(imageMatch[1] || "").trim()
+        if (url && !imageUrls.includes(url)) imageUrls.push(url)
+      }
+    }
 
     let match
     let totalCharacters = 0
@@ -587,6 +605,8 @@ async function fetchPublicTelegramPostContext(listing, options = {}) {
       posts,
       postCount: posts.length,
       contextText: posts.join("\n\n---\n\n"),
+      imageUrls,
+      imageCount: imageUrls.length,
       source: "tme_public_posts",
     }
   } finally {
@@ -701,6 +721,265 @@ async function normalizeTelegramIconBuffer(
       `Reported content type: ${cleanReportedType || "unknown"}. ` +
       `Sharp error: ${err.message}`
     )
+  }
+}
+
+
+function stableStringHash(value) {
+  let hash = 2166136261
+  const text = String(value || "")
+
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index)
+    hash = Math.imul(hash, 16777619)
+  }
+
+  return hash >>> 0
+}
+
+async function uploadRemoteListingBackground(remoteUrl, listingId, source = "remote") {
+  if (!remoteUrl) return null
+
+  const controller = new AbortController()
+  const timeout = setTimeout(
+    () => controller.abort(),
+    Math.max(4000, Number(process.env.BACKGROUND_FETCH_TIMEOUT_MS || 15000))
+  )
+
+  try {
+    const imageRes = await fetch(remoteUrl, {
+      redirect: "follow",
+      signal: controller.signal,
+      headers: {
+        "User-Agent":
+          process.env.TME_SCRAPE_USER_AGENT ||
+          "Mozilla/5.0 (compatible; TeleHubBot/1.0; +https://telehub.to)",
+        Accept: "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+      },
+    })
+
+    if (!imageRes.ok) {
+      throw new Error(`Background image returned HTTP ${imageRes.status}.`)
+    }
+
+    const contentLength = Number(imageRes.headers.get("content-length") || 0)
+    if (contentLength > 12 * 1024 * 1024) {
+      throw new Error("Background image is larger than 12MB.")
+    }
+
+    const inputBuffer = Buffer.from(await imageRes.arrayBuffer())
+    if (!inputBuffer.length || inputBuffer.length > 12 * 1024 * 1024) {
+      throw new Error("Background image was empty or larger than 12MB.")
+    }
+
+    const outputBuffer = await sharp(inputBuffer, {
+      failOn: "error",
+      density: 144,
+    })
+      .rotate()
+      .resize({
+        width: 1600,
+        height: 900,
+        fit: "cover",
+        position: "attention",
+        withoutEnlargement: false,
+      })
+      .jpeg({
+        quality: 82,
+        mozjpeg: true,
+      })
+      .toBuffer()
+
+    const cleanSource = String(source || "remote")
+      .toLowerCase()
+      .replace(/[^a-z0-9_-]+/g, "-")
+      .slice(0, 30)
+
+    const path =
+      `listing-backgrounds/${listingId}-${cleanSource}-${Date.now()}.jpg`
+
+    const { error } = await supabaseAdmin.storage
+      .from("listing-images")
+      .upload(path, outputBuffer, {
+        contentType: "image/jpeg",
+        cacheControl: "31536000",
+        upsert: false,
+      })
+
+    if (error) throw error
+
+    const { data } = supabaseAdmin.storage
+      .from("listing-images")
+      .getPublicUrl(path)
+
+    return data.publicUrl
+  } finally {
+    clearTimeout(timeout)
+  }
+}
+
+function buildRelatedBackgroundQuery(aiContent, listingType) {
+  const categories = Array.isArray(aiContent?.categories)
+    ? aiContent.categories.filter(Boolean).slice(0, 2)
+    : []
+
+  const raw = [
+    ...categories,
+    aiContent?.display_name,
+    listingType === "group" ? "community" : "news",
+  ]
+    .filter(Boolean)
+    .join(" ")
+
+  return raw
+    .replace(/[^\p{L}\p{N}\s-]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 120)
+}
+
+async function findPexelsRelatedBackground(query, seed) {
+  const apiKey = String(process.env.PEXELS_API_KEY || "").trim()
+  if (!apiKey) {
+    const error = new Error(
+      "PEXELS_API_KEY is not set. Add it in Render to test related-image backgrounds."
+    )
+    error.code = "PEXELS_API_KEY_MISSING"
+    throw error
+  }
+
+  const searchUrl =
+    `https://api.pexels.com/v1/search?orientation=landscape&per_page=20&query=` +
+    encodeURIComponent(query || "abstract technology")
+
+  const response = await fetch(searchUrl, {
+    headers: {
+      Authorization: apiKey,
+      "User-Agent": "TeleHub/1.0",
+    },
+  })
+
+  const data = await response.json().catch(() => ({}))
+
+  if (!response.ok) {
+    throw new Error(
+      data?.error || `Pexels search returned HTTP ${response.status}.`
+    )
+  }
+
+  const photos = Array.isArray(data?.photos) ? data.photos : []
+  const usable = photos.filter(
+    (photo) => photo?.src?.landscape || photo?.src?.large2x || photo?.src?.large
+  )
+
+  if (!usable.length) {
+    throw new Error(`No related landscape images were found for "${query}".`)
+  }
+
+  const selected = usable[stableStringHash(seed) % usable.length]
+
+  return {
+    remoteUrl:
+      selected.src.landscape ||
+      selected.src.large2x ||
+      selected.src.large,
+    provider: "pexels",
+    providerId: selected.id || null,
+    photographer: selected.photographer || null,
+    photographerUrl: selected.photographer_url || null,
+    sourcePageUrl: selected.url || null,
+    query,
+  }
+}
+
+async function chooseAndUploadImportBackground({
+  mode,
+  listingId,
+  iconUrl,
+  postContext,
+  aiContent,
+  listingType,
+  seed,
+}) {
+  const cleanMode = String(mode || "none").toLowerCase()
+
+  if (cleanMode === "none") {
+    return { imageUrl: null, source: "none" }
+  }
+
+  if (cleanMode === "icon") {
+    return {
+      imageUrl: iconUrl || null,
+      source: iconUrl ? "telegram_icon" : "none",
+      error: iconUrl ? null : "Telegram icon was unavailable.",
+    }
+  }
+
+  if (cleanMode === "telegram_post") {
+    const candidates = Array.isArray(postContext?.imageUrls)
+      ? postContext.imageUrls.filter(Boolean)
+      : []
+
+    if (!candidates.length) {
+      return {
+        imageUrl: null,
+        source: "telegram_post",
+        error: "No usable image was found in the recent public Telegram posts.",
+      }
+    }
+
+    // Try several candidates because a Telegram CDN URL may occasionally expire
+    // or point to a format Sharp cannot decode.
+    const startIndex = stableStringHash(seed) % candidates.length
+    let lastError = null
+
+    for (let offset = 0; offset < Math.min(candidates.length, 5); offset += 1) {
+      const candidate = candidates[(startIndex + offset) % candidates.length]
+
+      try {
+        const imageUrl = await uploadRemoteListingBackground(
+          candidate,
+          listingId,
+          "telegram-post"
+        )
+
+        return {
+          imageUrl,
+          source: "telegram_post",
+          remoteUrl: candidate,
+        }
+      } catch (error) {
+        lastError = error
+      }
+    }
+
+    return {
+      imageUrl: null,
+      source: "telegram_post",
+      error: lastError?.message || "Telegram post images could not be uploaded.",
+    }
+  }
+
+  if (cleanMode === "related") {
+    const query = buildRelatedBackgroundQuery(aiContent, listingType)
+    const related = await findPexelsRelatedBackground(query, seed)
+    const imageUrl = await uploadRemoteListingBackground(
+      related.remoteUrl,
+      listingId,
+      "pexels"
+    )
+
+    return {
+      imageUrl,
+      source: "related",
+      ...related,
+    }
+  }
+
+  return {
+    imageUrl: null,
+    source: "none",
+    error: `Unsupported background mode: ${cleanMode}`,
   }
 }
 
@@ -8135,6 +8414,8 @@ async function importSingleTelegramListing(
     posts: [],
     postCount: 0,
     contextText: "",
+    imageUrls: [],
+    imageCount: 0,
     source: null,
   }
   let postContextError = null
@@ -8159,6 +8440,7 @@ async function importSingleTelegramListing(
     metadata_source: profileSource,
     post_context_source: postContext.source,
     public_posts_found: postContext.postCount,
+    public_post_images_found: postContext.imageCount || 0,
     post_context_error: postContextError?.message || null,
   })
 
@@ -8317,21 +8599,57 @@ async function importSingleTelegramListing(
     console.error("Auto import icon upload failed:", err.message)
   }
 
-  if (iconUrl) {
-    await onStage("avatar_downloaded", {
-      icon_url: iconUrl,
-      background_applied: Boolean(options.useIconAsBackground),
-      metadata_source: profileSource,
+  let backgroundResult = {
+    imageUrl: null,
+    source: "none",
+    error: null,
+  }
+
+  try {
+    backgroundResult = await chooseAndUploadImportBackground({
+      mode: options.backgroundMode,
+      listingId: inserted.id,
+      iconUrl,
+      postContext,
+      aiContent,
+      listingType,
+      seed: `${inserted.id}:${normalizedTelegramLink}`,
     })
+  } catch (err) {
+    backgroundResult = {
+      imageUrl: null,
+      source: String(options.backgroundMode || "none"),
+      error: err.message,
+    }
+    console.error("Auto import background selection failed:", err.message)
+  }
+
+  await onStage("listing_media_selected", {
+    icon_url: iconUrl,
+    image_url: backgroundResult.imageUrl,
+    background_mode: options.backgroundMode,
+    background_source: backgroundResult.source,
+    background_error: backgroundResult.error || null,
+    public_post_images_found: postContext.imageCount || 0,
+    related_query: backgroundResult.query || null,
+    related_provider_id: backgroundResult.providerId || null,
+    metadata_source: profileSource,
+  })
+
+  if (iconUrl || backgroundResult.imageUrl) {
+    const mediaUpdate = {
+      icon_url: iconUrl,
+      image_url: backgroundResult.imageUrl,
+      updated_at: new Date().toISOString(),
+    }
+
+    if (iconUrl) {
+      mediaUpdate.last_icon_scraped_at = new Date().toISOString()
+    }
 
     const { error: imageUpdateError } = await supabaseAdmin
       .from("channel_listings")
-      .update({
-        icon_url: iconUrl,
-        image_url: options.useIconAsBackground ? iconUrl : null,
-        last_icon_scraped_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-      })
+      .update(mediaUpdate)
       .eq("id", inserted.id)
 
     if (imageUpdateError) throw imageUpdateError
@@ -8360,8 +8678,9 @@ async function importSingleTelegramListing(
         framer_synced: Boolean(framerResult?.ok),
         public_url: `https://telehub.to/channel/${inserted.short_invite}`,
         icon_applied: Boolean(iconUrl),
-        background_applied:
-          Boolean(iconUrl) && Boolean(options.useIconAsBackground),
+        background_applied: Boolean(backgroundResult.imageUrl),
+        background_source: backgroundResult.source,
+        background_error: backgroundResult.error || null,
       })
     } catch (err) {
       framerError = err.message
@@ -8404,6 +8723,13 @@ async function importSingleTelegramListing(
     ai_token_usage: aiContent.usage || null,
     icon_url: iconUrl,
     icon_error: iconError,
+    image_url: backgroundResult.imageUrl,
+    background_mode: options.backgroundMode,
+    background_source: backgroundResult.source,
+    background_error: backgroundResult.error || null,
+    related_background_query: backgroundResult.query || null,
+    related_background_provider_id: backgroundResult.providerId || null,
+    public_post_images_found: postContext.imageCount || 0,
     framer_synced: !!framerResult?.ok,
     framer_error: framerError,
   }
@@ -8492,9 +8818,23 @@ app.post("/api/admin/import-telegram-listings", async (req, res) => {
       return res.status(400).json({ error: "Paste at least one public Telegram link." })
     }
 
+    const requestedBackgroundMode = String(
+      req.body?.background_mode ||
+      (req.body?.use_icon_as_background !== false ? "icon" : "none")
+    ).toLowerCase()
+
+    const allowedBackgroundModes = new Set([
+      "none",
+      "icon",
+      "related",
+      "telegram_post",
+    ])
+
     const options = {
       syncToFramer: req.body?.sync_to_framer !== false,
-      useIconAsBackground: req.body?.use_icon_as_background !== false,
+      backgroundMode: allowedBackgroundModes.has(requestedBackgroundMode)
+        ? requestedBackgroundMode
+        : "none",
     }
 
     const results = []
