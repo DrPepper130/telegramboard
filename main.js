@@ -9832,6 +9832,81 @@ async function loadTelegramGraphSeedLinks(run, metadata) {
   return Array.from(new Set([...requestedSeeds, ...existingSeeds])).slice(0, seedLimit)
 }
 
+
+function isObviousTelegramBotUsername(username) {
+  const clean = String(username || "")
+    .replace(/^@/, "")
+    .trim()
+
+  if (!clean) return true
+
+  return /(?:_?bot|robot)$/i.test(clean)
+}
+
+async function verifyTelegramGraphCandidate(candidateLink) {
+  const username = extractUsernameFromLink(candidateLink)
+
+  if (!username) {
+    return { ok: false, reason: "invalid_username" }
+  }
+
+  const cleanUsernameValue = String(username).replace(/^@/, "")
+
+  // Cheap prefilter: Telegram bot usernames conventionally end in "bot".
+  if (isObviousTelegramBotUsername(cleanUsernameValue)) {
+    return {
+      ok: false,
+      reason: "obvious_bot",
+      username: cleanUsernameValue,
+    }
+  }
+
+  try {
+    const profile = await fetchPublicTelegramPage({
+      telegram_username: `@${cleanUsernameValue}`,
+      telegram_link: `https://t.me/${cleanUsernameValue}`,
+    })
+
+    if (
+      profile?.listingType !== "channel" &&
+      profile?.listingType !== "group"
+    ) {
+      return {
+        ok: false,
+        reason: "not_channel_or_group",
+        username: cleanUsernameValue,
+      }
+    }
+
+    if (!Number.isFinite(Number(profile.memberCount))) {
+      return {
+        ok: false,
+        reason: "missing_member_count",
+        username: cleanUsernameValue,
+      }
+    }
+
+    return {
+      ok: true,
+      username: String(profile.telegramUsername || `@${cleanUsernameValue}`).replace(/^@/, ""),
+      telegramLink: profile.telegramLink || `https://t.me/${cleanUsernameValue}`,
+      listingType: profile.listingType,
+      memberCount: Number(profile.memberCount || 0),
+      title: profile.title || cleanUsernameValue,
+      description: profile.description || "",
+      source: profile.source || "tme_public_page",
+    }
+  } catch (error) {
+    return {
+      ok: false,
+      reason: error?.code || "telegram_verification_failed",
+      username: cleanUsernameValue,
+      error: error?.message || "Telegram verification failed.",
+      status: error?.status || null,
+    }
+  }
+}
+
 async function runTelegramGraphDiscovery(run, metadata) {
   const target = Math.max(1, Number(run.requested_target || 100))
   const maxDepth = Math.max(1, Math.min(Number(metadata.max_depth || 2), 5))
@@ -9899,20 +9974,51 @@ async function runTelegramGraphDiscovery(run, metadata) {
           const candidateUsername = extractUsernameFromLink(candidateLink)
           if (!candidateUsername) continue
 
+          const verified = await verifyTelegramGraphCandidate(candidateLink)
+
+          if (!verified.ok) {
+            await logScraperEvent({
+              runId: run.id,
+              level: "info",
+              stage: "telegram_graph_filtered",
+              message: `Filtered @${String(candidateUsername).replace(/^@/, "")}: ${verified.reason}.`,
+              telegramLink: candidateLink,
+              metadata: {
+                depth: depth + 1,
+                reason: verified.reason,
+                error: verified.error || null,
+                status: verified.status || null,
+                discovered_from: seedLink,
+              },
+            })
+            continue
+          }
+
           const added = await addDiscoveryResult(
             run.id,
-            String(candidateUsername).replace(/^@/, ""),
+            verified.username,
             {
               source: "telegram_graph",
               discovered_from: seedLink,
               depth: depth + 1,
-              filters: { source: "telegram_graph", seed: seedLink, depth: depth + 1 },
+              title: verified.title,
+              subscribers: verified.memberCount,
+              category: null,
+              filters: {
+                source: "telegram_graph",
+                seed: seedLink,
+                depth: depth + 1,
+                verified_type: verified.listingType,
+                verification_source: verified.source,
+              },
             }
           )
 
           if (added.added) {
             accepted += 1
-            if (depth + 1 < maxDepth) nextFrontier.push(candidateLink)
+            if (depth + 1 < maxDepth) {
+              nextFrontier.push(verified.telegramLink)
+            }
           }
         }
       } catch (error) {
@@ -10244,7 +10350,7 @@ app.post("/api/admin/scraper/start", async (req, res) => {
 
     await logScraperEvent({
       runId: run.id,
-      stage: "telemetr_config",
+      stage: metadata.provider === "telegram_graph" ? "telegram_graph_config" : "telemetr_config",
       message:
         metadata.provider === "telegram_graph"
           ? "Telegram graph crawler configuration saved."
