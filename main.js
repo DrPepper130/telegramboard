@@ -10152,18 +10152,27 @@ async function runTelegramGraphDiscovery(run, metadata) {
         )
           .filter(Boolean)
           .filter((candidate) => normalizeTelegramLinkForComparison(candidate) !== normalizedSeed)
-          .slice(0, perSeedLimit)
+          // "Links per seed" now means verified channels/groups per seed.
+          // We inspect a much larger raw pool so bots/users do not consume the limit.
+          .slice(0, Math.min(100, Math.max(perSeedLimit * 10, perSeedLimit)))
 
         await logScraperEvent({
           runId: run.id,
           stage: "telegram_graph_seed_scanned",
-          message: `Depth ${depth + 1}: ${seedLink} exposed ${candidates.length} candidate link(s).`,
+          message: `Depth ${depth + 1}: ${seedLink} exposed ${candidates.length} raw candidate link(s); seeking up to ${perSeedLimit} verified channel/group result(s).`,
           telegramLink: seedLink,
-          metadata: { depth: depth + 1, candidates: candidates.length, public_posts_found: context.postCount },
+          metadata: {
+            depth: depth + 1,
+            raw_candidates: candidates.length,
+            verified_target_per_seed: perSeedLimit,
+            public_posts_found: context.postCount,
+          },
         })
 
+        let verifiedFromSeed = 0
+
         for (const candidateLink of candidates) {
-          if (accepted >= target) break
+          if (accepted >= target || verifiedFromSeed >= perSeedLimit) break
           const candidateUsername = extractUsernameFromLink(candidateLink)
           if (!candidateUsername) continue
 
@@ -10209,6 +10218,26 @@ async function runTelegramGraphDiscovery(run, metadata) {
 
           if (added.added) {
             accepted += 1
+            verifiedFromSeed += 1
+
+            await logScraperEvent({
+              runId: run.id,
+              level: "success",
+              stage: "telegram_graph_verified",
+              message: `Verified ${verified.listingType}: @${verified.username} (${Number(
+                verified.memberCount || 0
+              ).toLocaleString()} ${verified.listingType === "channel" ? "subscribers" : "members"}).`,
+              telegramLink: verified.telegramLink,
+              metadata: {
+                depth: depth + 1,
+                discovered_from: seedLink,
+                listing_type: verified.listingType,
+                member_count: verified.memberCount,
+                verified_from_seed: verifiedFromSeed,
+                per_seed_limit: perSeedLimit,
+              },
+            })
+
             if (depth + 1 < maxDepth) {
               nextFrontier.push(verified.telegramLink)
             }
