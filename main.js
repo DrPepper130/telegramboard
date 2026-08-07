@@ -9545,18 +9545,18 @@ function continuousAutomationSettings(state) {
 
   return {
     seed_limit: Math.max(1, Math.min(Number(raw.seed_limit || 1000), 10000)),
-    max_depth: Math.max(1, Math.min(Number(raw.max_depth || 2), 5)),
+    max_depth: Math.max(1, Math.min(Number(raw.max_depth || 3), 5)),
     max_links_per_seed: Math.max(
       1,
-      Math.min(Number(raw.max_links_per_seed || 10), 100)
+      Math.min(Number(raw.max_links_per_seed || 25), 100)
     ),
     request_delay_ms: Math.max(
       250,
-      Math.min(Number(raw.request_delay_ms || 2000), 10000)
+      Math.min(Number(raw.request_delay_ms || 1000), 10000)
     ),
     target_per_cycle: Math.max(
       1,
-      Math.min(Number(raw.target_per_cycle || 500), 10000)
+      Math.min(Number(raw.target_per_cycle || 1000), 10000)
     ),
     import_batch_size: Math.max(
       1,
@@ -9571,13 +9571,16 @@ function continuousAutomationSettings(state) {
     analyze_recent_posts: raw.analyze_recent_posts !== false,
     recent_post_limit: Math.max(
       1,
-      Math.min(Number(raw.recent_post_limit || 8), 20)
+      Math.min(Number(raw.recent_post_limit || 20), 20)
     ),
     post_context_max_characters: Math.max(
       500,
       Math.min(Number(raw.post_context_max_characters || 5000), 15000)
     ),
     custom_ai_prompt: String(raw.custom_ai_prompt || "").trim().slice(0, 8000),
+    discovery_focus: discoveryFocusSettings(raw).focus,
+    preferred_topics: String(raw.preferred_topics || "").trim().slice(0, 3000),
+    avoid_topics: String(raw.avoid_topics || "").trim().slice(0, 3000),
     cycle_delay_ms: Math.max(
       5000,
       Math.min(Number(raw.cycle_delay_ms || CONTINUOUS_AUTOMATION_IDLE_MS), 300000)
@@ -10499,6 +10502,159 @@ async function runRotationDiscovery(run, metadata) {
 }
 
 
+
+const TELEGRAM_DISCOVERY_FOCUS_PRESETS = {
+  balanced: {
+    prefer: [],
+    avoid: [],
+  },
+  mainstream: {
+    prefer: [
+      "minecraft", "roblox", "fortnite", "gaming", "game", "youtube",
+      "youtuber", "twitch", "streamer", "content creator", "creator",
+      "video editing", "memes", "meme", "anime", "manga", "music",
+      "movies", "film", "technology", "tech", "coding", "programming",
+      "cars", "automotive", "fitness", "art", "photography", "education",
+      "hobbies", "design", "sports", "science"
+    ],
+    avoid: [
+      "breaking news", "politics", "political", "geopolitics", "war news",
+      "local news", "stock market", "stocks", "forex", "finance news",
+      "crypto news", "breaking", "headline", "daily news"
+    ],
+  },
+  gaming: {
+    prefer: [
+      "minecraft", "roblox", "fortnite", "gaming", "game", "games",
+      "steam", "xbox", "playstation", "nintendo", "esports", "cs2",
+      "counter-strike", "valorant", "gta", "pokemon"
+    ],
+    avoid: ["breaking news", "politics", "geopolitics", "finance news"],
+  },
+  creators: {
+    prefer: [
+      "youtube", "youtuber", "twitch", "streamer", "content creator",
+      "creator", "video editing", "editing", "photography", "design",
+      "art", "social media", "podcast", "filmmaking", "animation"
+    ],
+    avoid: ["breaking news", "politics", "geopolitics", "finance news"],
+  },
+  entertainment: {
+    prefer: [
+      "anime", "manga", "music", "movies", "film", "tv", "television",
+      "memes", "meme", "gaming", "comedy", "entertainment", "celebrity",
+      "art", "books"
+    ],
+    avoid: ["breaking news", "politics", "geopolitics", "finance news"],
+  },
+  tech: {
+    prefer: [
+      "technology", "tech", "coding", "programming", "software",
+      "developer", "developers", "ai", "artificial intelligence",
+      "cybersecurity", "linux", "android", "apple", "computer", "hardware"
+    ],
+    avoid: ["breaking news", "politics", "geopolitics", "finance news"],
+  },
+  custom: {
+    prefer: [],
+    avoid: [],
+  },
+}
+
+function parseDiscoveryFocusTerms(value, limit = 80) {
+  return Array.from(
+    new Set(
+      String(value || "")
+        .split(/[\n,;|]+/)
+        .map((item) => item.trim().toLowerCase())
+        .filter((item) => item.length >= 2)
+    )
+  ).slice(0, limit)
+}
+
+function discoveryFocusSettings(metadata = {}) {
+  const requestedFocus = String(metadata.discovery_focus || "mainstream")
+    .trim()
+    .toLowerCase()
+  const focus = Object.prototype.hasOwnProperty.call(
+    TELEGRAM_DISCOVERY_FOCUS_PRESETS,
+    requestedFocus
+  )
+    ? requestedFocus
+    : "mainstream"
+
+  const preset = TELEGRAM_DISCOVERY_FOCUS_PRESETS[focus]
+  const customPrefer = parseDiscoveryFocusTerms(metadata.preferred_topics)
+  const customAvoid = parseDiscoveryFocusTerms(metadata.avoid_topics)
+
+  return {
+    focus,
+    prefer: Array.from(new Set([...(preset.prefer || []), ...customPrefer])),
+    avoid: Array.from(new Set([...(preset.avoid || []), ...customAvoid])),
+  }
+}
+
+function scoreDiscoveryFocusText(value, focusSettings) {
+  const text = String(value || "").toLowerCase()
+  if (!text) return 0
+
+  let score = 0
+
+  for (const term of focusSettings?.prefer || []) {
+    if (term && text.includes(term)) {
+      score += term.includes(" ") ? 5 : 3
+    }
+  }
+
+  for (const term of focusSettings?.avoid || []) {
+    if (term && text.includes(term)) {
+      score -= term.includes(" ") ? 7 : 4
+    }
+  }
+
+  return Math.max(-30, Math.min(30, score))
+}
+
+function scoreTelegramDiscoveryCandidate(candidate, focusSettings) {
+  const sourceText = [
+    candidate?.title,
+    candidate?.description,
+    candidate?.username,
+    Array.isArray(candidate?.categories) ? candidate.categories.join(" ") : "",
+  ]
+    .filter(Boolean)
+    .join(" ")
+
+  return scoreDiscoveryFocusText(sourceText, focusSettings)
+}
+
+function deterministicDiscoveryFraction(value) {
+  let hash = 2166136261
+  const text = String(value || "")
+
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index)
+    hash = Math.imul(hash, 16777619)
+  }
+
+  return (hash >>> 0) / 4294967295
+}
+
+function shouldExploreDeprioritizedCandidate(candidate, score, focusSettings) {
+  if (focusSettings?.focus === "balanced") return true
+  if (score >= -2) return true
+
+  // Strongly deprioritized results still get a small deterministic exploration
+  // budget so TeleHub keeps discovering new graph clusters instead of creating
+  // a hard topic filter.
+  const explorationRate = score <= -10 ? 0.08 : score <= -6 ? 0.14 : 0.22
+  return (
+    deterministicDiscoveryFraction(
+      `${focusSettings?.focus}:${candidate?.telegramLink || candidate?.username}`
+    ) < explorationRate
+  )
+}
+
 async function loadTelegramGraphSeedLinks(run, metadata) {
   const requestedSeeds = Array.isArray(metadata.seed_links)
     ? metadata.seed_links.map(cleanImportTelegramLink).filter(Boolean)
@@ -10510,6 +10666,7 @@ async function loadTelegramGraphSeedLinks(run, metadata) {
   )
 
   const settings = {
+    ...discoveryFocusSettings(metadata),
     max_depth: Math.max(
       1,
       Math.min(Number(metadata.max_depth || 2), 5)
@@ -10536,7 +10693,7 @@ async function loadTelegramGraphSeedLinks(run, metadata) {
 
   const { data: approved, error } = await supabaseAdmin
     .from("channel_listings")
-    .select("telegram_link, telegram_username, member_count")
+    .select("telegram_link, telegram_username, member_count, channel_name, telegram_title, description, telegram_description, categories")
     .eq("status", "approved")
     .or("is_banned.is.null,is_banned.eq.false")
     .order("member_count", { ascending: false })
@@ -10544,8 +10701,33 @@ async function loadTelegramGraphSeedLinks(run, metadata) {
 
   if (error) throw error
 
+  const focusSettings = discoveryFocusSettings(metadata)
+
   const existingSeeds = (approved || [])
-    .map((listing) =>
+    .map((listing, originalIndex) => ({
+      listing,
+      originalIndex,
+      focusScore: scoreTelegramDiscoveryCandidate(
+        {
+          title: listing.channel_name || listing.telegram_title,
+          description: [
+            listing.description,
+            listing.telegram_description,
+          ]
+            .filter(Boolean)
+            .join(" "),
+          username: listing.telegram_username,
+          categories: listing.categories,
+        },
+        focusSettings
+      ),
+    }))
+    .sort(
+      (a, b) =>
+        b.focusScore - a.focusScore ||
+        a.originalIndex - b.originalIndex
+    )
+    .map(({ listing }) =>
       cleanImportTelegramLink(
         listing.telegram_link ||
           (listing.telegram_username
@@ -10603,6 +10785,9 @@ async function loadTelegramGraphSeedLinks(run, metadata) {
         selected: selected.length,
         requested_seed_limit: seedLimit,
         requested_max_depth: settings.max_depth,
+        discovery_focus: settings.focus,
+        preferred_topic_count: settings.prefer.length,
+        deprioritized_topic_count: settings.avoid.length,
         crawl_cooldown_hours: settings.crawl_cooldown_hours,
         empty_crawl_cooldown_hours: settings.empty_crawl_cooldown_hours,
       },
@@ -10710,6 +10895,7 @@ async function runTelegramGraphDiscovery(run, metadata) {
     250,
     Math.min(Number(metadata.request_delay_ms || 1000), 10000)
   )
+  const focusSettings = discoveryFocusSettings(metadata)
 
   let frontier = await loadTelegramGraphSeedLinks(run, metadata)
   const visited = new Set()
@@ -10723,6 +10909,9 @@ async function runTelegramGraphDiscovery(run, metadata) {
       seeds: frontier.length,
       max_depth: maxDepth,
       max_links_per_seed: perSeedLimit,
+      discovery_focus: focusSettings.focus,
+      preferred_topics: focusSettings.prefer,
+      deprioritized_topics: focusSettings.avoid,
     },
   })
 
@@ -10822,6 +11011,36 @@ async function runTelegramGraphDiscovery(run, metadata) {
             continue
           }
 
+          const focusScore = scoreTelegramDiscoveryCandidate(
+            verified,
+            focusSettings
+          )
+
+          if (
+            !shouldExploreDeprioritizedCandidate(
+              verified,
+              focusScore,
+              focusSettings
+            )
+          ) {
+            await logScraperEvent({
+              runId: run.id,
+              level: "info",
+              stage: "telegram_graph_focus_deprioritized",
+              message: `Deprioritized @${verified.username} for ${focusSettings.focus} discovery (score ${focusScore}); crawler continued looking for a better-fit node.`,
+              telegramLink: verified.telegramLink,
+              metadata: {
+                depth: depth + 1,
+                discovered_from: seedLink,
+                discovery_focus: focusSettings.focus,
+                focus_score: focusScore,
+                listing_type: verified.listingType,
+                member_count: verified.memberCount,
+              },
+            })
+            continue
+          }
+
           const added = await addDiscoveryResult(run.id, verified.username, {
             source: "telegram_graph",
             discovered_from: seedLink,
@@ -10835,6 +11054,8 @@ async function runTelegramGraphDiscovery(run, metadata) {
               depth: depth + 1,
               verified_type: verified.listingType,
               verification_source: verified.source,
+              discovery_focus: focusSettings.focus,
+              focus_score: focusScore,
             },
           })
 
@@ -10871,6 +11092,8 @@ async function runTelegramGraphDiscovery(run, metadata) {
               verified_from_seed: verifiedFromSeed,
               new_from_seed: newFromSeed,
               per_seed_limit: perSeedLimit,
+              discovery_focus: focusSettings.focus,
+              focus_score: focusScore,
               newly_queued: Boolean(added.added),
               discovery_result:
                 added.reason || (added.added ? "added" : "already_known"),
@@ -10887,7 +11110,11 @@ async function runTelegramGraphDiscovery(run, metadata) {
               normalizedNext !== normalizedSeed &&
               !visited.has(normalizedNext)
             ) {
-              nextFrontier.push(verified.telegramLink)
+              if (focusScore > 0) {
+                nextFrontier.unshift(verified.telegramLink)
+              } else {
+                nextFrontier.push(verified.telegramLink)
+              }
             }
           }
         }
@@ -12093,6 +12320,9 @@ async function createContinuousAutomationRun(state) {
     max_depth: settings.max_depth,
     max_links_per_seed: settings.max_links_per_seed,
     request_delay_ms: settings.request_delay_ms,
+    discovery_focus: settings.discovery_focus,
+    preferred_topics: settings.preferred_topics,
+    avoid_topics: settings.avoid_topics,
     crawl_cooldown_hours: settings.crawl_cooldown_hours,
     empty_crawl_cooldown_hours: settings.empty_crawl_cooldown_hours,
   }
@@ -12355,6 +12585,15 @@ app.post("/api/admin/scraper/start", async (req, res) => {
       max_depth: Math.max(1, Math.min(Number(req.body?.max_depth || 2), 5)),
       max_links_per_seed: Math.max(1, Math.min(Number(req.body?.max_links_per_seed || 25), 100)),
       request_delay_ms: Math.max(250, Math.min(Number(req.body?.request_delay_ms || 1000), 10000)),
+      discovery_focus: String(req.body?.discovery_focus || "mainstream")
+        .trim()
+        .toLowerCase(),
+      preferred_topics: String(req.body?.preferred_topics || "")
+        .trim()
+        .slice(0, 3000),
+      avoid_topics: String(req.body?.avoid_topics || "")
+        .trim()
+        .slice(0, 3000),
       crawl_cooldown_hours: Math.max(
         1,
         Number(req.body?.crawl_cooldown_hours || GRAPH_CRAWL_COOLDOWN_HOURS)
@@ -12575,7 +12814,7 @@ app.post("/api/admin/automation/toggle", async (req, res) => {
       ),
       max_depth: Math.max(
         1,
-        Math.min(Number(req.body?.max_depth || currentSettings.max_depth || 2), 5)
+        Math.min(Number(req.body?.max_depth || currentSettings.max_depth || 3), 5)
       ),
       max_links_per_seed: Math.max(
         1,
@@ -12583,7 +12822,7 @@ app.post("/api/admin/automation/toggle", async (req, res) => {
           Number(
             req.body?.max_links_per_seed ||
               currentSettings.max_links_per_seed ||
-              10
+              25
           ),
           100
         )
@@ -12594,7 +12833,7 @@ app.post("/api/admin/automation/toggle", async (req, res) => {
           Number(
             req.body?.request_delay_ms ||
               currentSettings.request_delay_ms ||
-              2000
+              1000
           ),
           10000
         )
@@ -12605,7 +12844,7 @@ app.post("/api/admin/automation/toggle", async (req, res) => {
           Number(
             req.body?.target_per_cycle ||
               currentSettings.target_per_cycle ||
-              500
+              1000
           ),
           10000
         )
@@ -12648,7 +12887,7 @@ app.post("/api/admin/automation/toggle", async (req, res) => {
           Number(
             req.body?.recent_post_limit ||
               currentSettings.recent_post_limit ||
-              8
+              20
           ),
           20
         )
@@ -12671,6 +12910,26 @@ app.post("/api/admin/automation/toggle", async (req, res) => {
       )
         .trim()
         .slice(0, 8000),
+      discovery_focus: discoveryFocusSettings({
+        discovery_focus:
+          req.body?.discovery_focus ??
+          currentSettings.discovery_focus ??
+          "mainstream",
+      }).focus,
+      preferred_topics: String(
+        req.body?.preferred_topics ??
+          currentSettings.preferred_topics ??
+          ""
+      )
+        .trim()
+        .slice(0, 3000),
+      avoid_topics: String(
+        req.body?.avoid_topics ??
+          currentSettings.avoid_topics ??
+          ""
+      )
+        .trim()
+        .slice(0, 3000),
       cycle_delay_ms: Math.max(
         5000,
         Math.min(
