@@ -3,7 +3,7 @@ const path = require("path")
 
 const sourcePath = path.join(__dirname, "main.js")
 const runtimePath = path.join(__dirname, "main.runtime.js")
-const FIX_CUTOFF_ISO = "2026-08-08T00:40:00.000Z"
+const FIX_CUTOFF_ISO = "2026-08-08T00:49:00.000Z"
 
 function replaceOnce(source, oldText, newText, label) {
   const first = source.indexOf(oldText)
