@@ -1,6 +1,6 @@
 {
   "scripts": {
-    "start": "node main.js"
+    "start": "node main-wrapper.js"
   },
   "engines": {
     "node": ">=18"
