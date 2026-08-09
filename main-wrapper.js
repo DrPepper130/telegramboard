@@ -152,6 +152,44 @@ const GRAPH_HISTORY_DEPTH_FIX_CUTOFF = Date.parse("${FIX_CUTOFF_ISO}")
     "failed remaining-depth history"
   )
 
+  patched = replaceOnce(
+    patched,
+    `    const { data: listings, error: listingsError } = await supabaseAdmin
+      .from("channel_listings")
+      .select("*")
+      .eq("status", "approved")
+      .eq("is_banned", false)
+      .or("framer_sync_status.is.null,framer_sync_status.neq.pending_batch")
+
+    if (listingsError) throw listingsError
+`,
+    `    // Supabase/PostgREST commonly caps a single SELECT response at 1,000
+    // rows. Fetch the complete approved directory in stable 1,000-row pages so
+    // /all search, categories, pagination and ranking use every listing.
+    const listings = []
+    const listingPageSize = 1000
+
+    for (let from = 0; ; from += listingPageSize) {
+      const { data: listingPage, error: listingsError } = await supabaseAdmin
+        .from("channel_listings")
+        .select("*")
+        .eq("status", "approved")
+        .eq("is_banned", false)
+        .or("framer_sync_status.is.null,framer_sync_status.neq.pending_batch")
+        .order("id", { ascending: true })
+        .range(from, from + listingPageSize - 1)
+
+      if (listingsError) throw listingsError
+
+      const rows = listingPage || []
+      listings.push(...rows)
+
+      if (rows.length < listingPageSize) break
+    }
+`,
+    "ranked listings pagination"
+  )
+
   return patched
 }
 
