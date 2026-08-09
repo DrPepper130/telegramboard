@@ -1,0 +1,198 @@
+name: Patch TeleHub main.js directly
+
+on:
+  push:
+    paths:
+      - ".telehub-patch-trigger"
+
+permissions:
+  contents: write
+
+jobs:
+  patch-main:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Patch main.js
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          path = Path("main.js")
+          text = path.read_text(encoding="utf-8")
+
+          def replace_once(old, new, label):
+              global text
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{label}: expected 1 match, found {count}")
+              text = text.replace(old, new, 1)
+
+          replace_once(
+          '''const BACKEND_BUILD_ID =
+            "telehub-telemetr-nonoverlapping-ranges-2026-07-29"
+          ''',
+          '''const BACKEND_BUILD_ID =
+            "telehub-direct-main-resume-pagination-fix-2026-08-08"
+          ''',
+          "build id")
+
+          cutoff_block = '''const GRAPH_EMPTY_CRAWL_COOLDOWN_HOURS = Math.max(
+            GRAPH_CRAWL_COOLDOWN_HOURS,
+            Number(process.env.GRAPH_EMPTY_CRAWL_COOLDOWN_HOURS || 720)
+          )
+          '''
+          replace_once(
+              cutoff_block,
+              cutoff_block + 'const GRAPH_HISTORY_DEPTH_FIX_CUTOFF = Date.parse("2026-08-09T00:55:00.000Z")\n',
+              "history cutoff",
+          )
+
+          replace_once(
+          '''function graphHistoryEligible(history, settings, nowMs = Date.now()) {
+            if (!history?.last_crawled_at) return true
+
+            const requestedDepth = Math.max(
+              1,
+              Math.min(Number(settings?.max_depth || 1), 5)
+            )
+          ''',
+          '''function graphHistoryEligible(history, settings, nowMs = Date.now()) {
+            if (!history?.last_crawled_at) return true
+
+            // Rows written before the corrected depth semantics used the run-wide max
+            // depth for every graph node. Let those rows through once so they can be
+            // rewritten using the remaining depth from the specific node.
+            const lastCrawledMs = new Date(history.last_crawled_at).getTime()
+            if (
+              Number.isFinite(GRAPH_HISTORY_DEPTH_FIX_CUTOFF) &&
+              Number.isFinite(lastCrawledMs) &&
+              lastCrawledMs < GRAPH_HISTORY_DEPTH_FIX_CUTOFF
+            ) {
+              return true
+            }
+
+            // Failed or interrupted scans should never be trapped behind the normal
+            // productive/empty crawl cooldown.
+            if (
+              history.last_status &&
+              !["completed", "success"].includes(
+                String(history.last_status).trim().toLowerCase()
+              )
+            ) {
+              return true
+            }
+
+            const requestedDepth = Math.max(
+              1,
+              Math.min(Number(settings?.max_depth || 1), 5)
+            )
+          ''',
+          "history eligibility")
+
+          replace_once(
+          '''  const last = new Date(history.last_crawled_at).getTime()
+            if (!Number.isFinite(last)) return true
+          ''',
+          '''  const last = lastCrawledMs
+            if (!Number.isFinite(last)) return true
+          ''',
+          "history timestamp")
+
+          replace_once(
+              '.select("crawl_count, max_requested_depth")',
+              '.select("crawl_count, max_requested_depth, last_crawled_at")',
+              "history previous select",
+          )
+
+          replace_once(
+          '''    max_requested_depth: Math.max(
+                Number(previous?.max_requested_depth || 0),
+                Math.max(1, Math.min(Number(requestedMaxDepth || 1), 5))
+              ),
+          ''',
+          '''    max_requested_depth: Math.max(
+                Number.isFinite(new Date(previous?.last_crawled_at || "").getTime()) &&
+                new Date(previous?.last_crawled_at || "").getTime() <
+                  GRAPH_HISTORY_DEPTH_FIX_CUTOFF
+                  ? 0
+                  : Number(previous?.max_requested_depth || 0),
+                Math.max(1, Math.min(Number(requestedMaxDepth || 1), 5))
+              ),
+          ''',
+          "history legacy depth reset")
+
+          replace_once(
+          '''          requestedMaxDepth: maxDepth,
+                    status: "completed",
+          ''',
+          '''          requestedMaxDepth: Math.max(1, maxDepth - depth),
+                    status: "completed",
+          ''',
+          "completed remaining depth")
+
+          replace_once(
+          '''          requestedMaxDepth: maxDepth,
+                    status: "failed",
+          ''',
+          '''          requestedMaxDepth: Math.max(1, maxDepth - depth),
+                    status: "failed",
+          ''',
+          "failed remaining depth")
+
+          replace_once(
+          '''    const { data: listings, error: listingsError } = await supabaseAdmin
+                .from("channel_listings")
+                .select("*")
+                .eq("status", "approved")
+                .eq("is_banned", false)
+                .or("framer_sync_status.is.null,framer_sync_status.neq.pending_batch")
+
+              if (listingsError) throw listingsError
+          ''',
+          '''    // Supabase/PostgREST can cap a single SELECT response at 1,000 rows.
+              // Read the entire approved directory in stable pages so /all search,
+              // categories, pagination, and ranking are not silently truncated.
+              const listings = []
+              const listingPageSize = 1000
+
+              for (let from = 0; ; from += listingPageSize) {
+                const { data: listingPage, error: listingsError } = await supabaseAdmin
+                  .from("channel_listings")
+                  .select("*")
+                  .eq("status", "approved")
+                  .eq("is_banned", false)
+                  .or("framer_sync_status.is.null,framer_sync_status.neq.pending_batch")
+                  .order("id", { ascending: true })
+                  .range(from, from + listingPageSize - 1)
+
+                if (listingsError) throw listingsError
+
+                const rows = listingPage || []
+                listings.push(...rows)
+
+                if (rows.length < listingPageSize) break
+              }
+          ''',
+          "ranked listings pagination")
+
+          path.write_text(text, encoding="utf-8")
+          PY
+
+      - name: Syntax check
+        run: node --check main.js
+
+      - name: Commit direct backend patch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add main.js
+          git commit -m "Apply crawler resume and ranked pagination fixes directly" || exit 0
+          git push
