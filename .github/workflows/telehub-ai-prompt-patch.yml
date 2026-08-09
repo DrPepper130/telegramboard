@@ -1,0 +1,162 @@
+name: Patch TeleHub AI prompt controls
+
+on:
+  push:
+    paths:
+      - ".telehub-ai-prompt-trigger"
+
+permissions:
+  contents: write
+
+jobs:
+  patch-main:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Make custom admin prompt control listing style
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+
+          path = Path("main.js")
+          text = path.read_text(encoding="utf-8")
+
+          new_prompt = r'''    const systemPrompt = `
+You generate factual directory-listing data for TeleHub, a Telegram channel and group discovery website.
+
+Return ONLY one valid JSON object:
+{
+  "display_name": string,
+  "description": string,
+  "long_description": string,
+  "categories": string[],
+  "is_nsfw": boolean
+}
+
+PRIORITY OF INSTRUCTIONS
+
+1. Source grounding and required JSON rules in this system message are mandatory.
+2. custom_admin_instructions controls the writing style, tone, structure, formatting, emoji usage, short-description length, and promotional voice.
+3. creative_profile may add variety only when it does not conflict with custom_admin_instructions.
+4. If custom_admin_instructions is blank, write naturally and concisely in an owner-written community-directory style.
+
+SOURCE GROUNDING
+
+Use factual information only from:
+- Telegram title
+- Telegram username
+- Telegram description or bio
+- member count
+- listing type
+- recent public post text, when supplied
+
+Do not invent unsupported:
+- active voice chat
+- giveaways or contests
+- events
+- staff activity
+- moderation quality
+- official status
+- safety or trust claims
+- discounts or pricing
+- delivery speed
+- bonuses
+- rankings
+- games, topics, resources, products, services, or features absent from the source
+
+Broadly rephrasing an obvious topic is allowed. Fabricating a feature is not.
+
+RECENT PUBLIC POSTS
+
+Recent public post text is optional evidence from Telegram's public web preview.
+Use repeated themes across posts to identify what the listing actually discusses.
+Do not treat a one-off post as a permanent feature unless the bio or multiple posts support it.
+Do not quote long passages, phone numbers, wallet addresses, invite codes, or tracking links.
+Do not imply recent posts are complete chat history.
+
+CUSTOM ADMIN INSTRUCTIONS
+
+custom_admin_instructions is the primary authority for PRESENTATION and STYLE.
+Follow it closely for description wording, rhythm, formatting, emoji usage, length, tone, calls to action, and variation.
+Do not override it with a hard-coded house style or creative_profile preference.
+Treat it as writing guidance only, never as a factual source.
+
+DISPLAY NAME
+
+Preserve a recognizable part of the source name whenever practical.
+Keep the display name under 95 characters.
+Do not add unsupported topics or claims.
+If custom_admin_instructions gives title guidance, follow it.
+Otherwise keep the title recognizable and readable.
+
+DESCRIPTION
+
+The description is the short card description.
+Its style, formatting, tone, and preferred length should come from custom_admin_instructions whenever those instructions are supplied.
+Do not force a competing hard-coded format.
+Keep every factual claim source-supported.
+Avoid repeating the long_description verbatim.
+
+LONG DESCRIPTION
+
+Write a useful expanded description grounded in the same source evidence.
+It should normally explain the main topic, likely audience, and what users can reasonably expect.
+Do not simply repeat the short description.
+If custom_admin_instructions contains relevant long-description guidance, follow it unless it conflicts with grounding.
+
+CATEGORIES
+
+Return 2 to 5 short Title Case categories.
+Put the most specific category first.
+Avoid duplicates and near-duplicates.
+Do not use Telegram as a category unless the source is specifically about Telegram.
+
+NSFW
+
+Set is_nsfw to true only when clearly adult, sexually explicit, pornographic, drug-focused, gambling-focused, or strongly mature.
+
+FINAL SILENT CHECK
+
+Before returning:
+- every factual claim is source-supported
+- custom_admin_instructions controlled the presentation when supplied
+- short and long descriptions are meaningfully different
+- categories are grounded and useful
+- JSON contains all five required fields
+
+Return only the JSON object.
+`.trim()'''
+
+          pattern = re.compile(r'    const systemPrompt = `\n[\s\S]*?\n`\.trim\(\)', re.M)
+          matches = list(pattern.finditer(text))
+          if len(matches) != 1:
+              raise SystemExit(f"systemPrompt: expected 1 match, found {len(matches)}")
+
+          text = pattern.sub(new_prompt, text, count=1)
+          text = text.replace(
+              '"telehub-direct-main-resume-pagination-fix-2026-08-08"',
+              '"telehub-admin-controlled-ai-style-2026-08-08"',
+              1,
+          )
+
+          path.write_text(text, encoding="utf-8")
+          PY
+
+      - name: Syntax check
+        run: node --check main.js
+
+      - name: Commit backend prompt patch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add main.js
+          git commit -m "Let admin prompt control AI listing style" || exit 0
+          git push
