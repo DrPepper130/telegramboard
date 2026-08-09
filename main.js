@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 })
 
 const BACKEND_BUILD_ID =
-  "telehub-telemetr-nonoverlapping-ranges-2026-07-29"
+  "telehub-direct-main-resume-pagination-fix-2026-08-08"
 
 app.get("/", (req, res) => {
   res.status(200).json({
@@ -7581,14 +7581,29 @@ async function fetchMemberSnapshotsInBatches(listingIds, since) {
 
 app.get("/api/listings/ranked", async (req, res) => {
   try {
-    const { data: listings, error: listingsError } = await supabaseAdmin
-      .from("channel_listings")
-      .select("*")
-      .eq("status", "approved")
-      .eq("is_banned", false)
-      .or("framer_sync_status.is.null,framer_sync_status.neq.pending_batch")
+    // Supabase/PostgREST can cap a single SELECT response at 1,000 rows.
+    // Read the entire approved directory in stable pages so /all search,
+    // categories, pagination, and ranking are not silently truncated.
+    const listings = []
+    const listingPageSize = 1000
 
-    if (listingsError) throw listingsError
+    for (let from = 0; ; from += listingPageSize) {
+      const { data: listingPage, error: listingsError } = await supabaseAdmin
+        .from("channel_listings")
+        .select("*")
+        .eq("status", "approved")
+        .eq("is_banned", false)
+        .or("framer_sync_status.is.null,framer_sync_status.neq.pending_batch")
+        .order("id", { ascending: true })
+        .range(from, from + listingPageSize - 1)
+
+      if (listingsError) throw listingsError
+
+      const rows = listingPage || []
+      listings.push(...rows)
+
+      if (rows.length < listingPageSize) break
+    }
 
     const listingIds = (listings || []).map((item) => item.id)
 
@@ -9462,6 +9477,7 @@ const GRAPH_EMPTY_CRAWL_COOLDOWN_HOURS = Math.max(
   GRAPH_CRAWL_COOLDOWN_HOURS,
   Number(process.env.GRAPH_EMPTY_CRAWL_COOLDOWN_HOURS || 720)
 )
+const GRAPH_HISTORY_DEPTH_FIX_CUTOFF = Date.parse("2026-08-09T00:55:00.000Z")
 
 let continuousAutomationLoopPromise = null
 
@@ -9625,6 +9641,29 @@ async function loadGraphCrawlHistory(normalizedLinks) {
 function graphHistoryEligible(history, settings, nowMs = Date.now()) {
   if (!history?.last_crawled_at) return true
 
+  // Rows written before the corrected depth semantics used the run-wide max
+  // depth for every graph node. Let those rows through once so they can be
+  // rewritten using the remaining depth from the specific node.
+  const lastCrawledMs = new Date(history.last_crawled_at).getTime()
+  if (
+    Number.isFinite(GRAPH_HISTORY_DEPTH_FIX_CUTOFF) &&
+    Number.isFinite(lastCrawledMs) &&
+    lastCrawledMs < GRAPH_HISTORY_DEPTH_FIX_CUTOFF
+  ) {
+    return true
+  }
+
+  // Failed or interrupted scans should never be trapped behind the normal
+  // productive/empty crawl cooldown.
+  if (
+    history.last_status &&
+    !["completed", "success"].includes(
+      String(history.last_status).trim().toLowerCase()
+    )
+  ) {
+    return true
+  }
+
   const requestedDepth = Math.max(
     1,
     Math.min(Number(settings?.max_depth || 1), 5)
@@ -9636,7 +9675,7 @@ function graphHistoryEligible(history, settings, nowMs = Date.now()) {
 
   if (requestedDepth > previousRequestedDepth) return true
 
-  const last = new Date(history.last_crawled_at).getTime()
+  const last = lastCrawledMs
   if (!Number.isFinite(last)) return true
 
   const productive = Number(history.last_verified_count || 0) > 0
@@ -9665,7 +9704,7 @@ async function recordGraphCrawlHistory({
 
   const { data: previous, error: previousError } = await supabaseAdmin
     .from("telegram_graph_crawl_history")
-    .select("crawl_count, max_requested_depth")
+    .select("crawl_count, max_requested_depth, last_crawled_at")
     .eq("normalized_link", normalizedLink)
     .maybeSingle()
 
@@ -9687,7 +9726,11 @@ async function recordGraphCrawlHistory({
     last_new_count: Number(newCount || 0),
     crawl_count: Number(previous?.crawl_count || 0) + 1,
     max_requested_depth: Math.max(
-      Number(previous?.max_requested_depth || 0),
+      Number.isFinite(new Date(previous?.last_crawled_at || "").getTime()) &&
+      new Date(previous?.last_crawled_at || "").getTime() <
+        GRAPH_HISTORY_DEPTH_FIX_CUTOFF
+        ? 0
+        : Number(previous?.max_requested_depth || 0),
       Math.max(1, Math.min(Number(requestedMaxDepth || 1), 5))
     ),
     last_status: status,
@@ -11125,7 +11168,7 @@ async function runTelegramGraphDiscovery(run, metadata) {
           rawCandidates: rawCandidateCount,
           verifiedCount: verifiedFromSeed,
           newCount: newFromSeed,
-          requestedMaxDepth: maxDepth,
+          requestedMaxDepth: Math.max(1, maxDepth - depth),
           status: "completed",
         })
       } catch (error) {
@@ -11135,7 +11178,7 @@ async function runTelegramGraphDiscovery(run, metadata) {
           rawCandidates: rawCandidateCount,
           verifiedCount: verifiedFromSeed,
           newCount: newFromSeed,
-          requestedMaxDepth: maxDepth,
+          requestedMaxDepth: Math.max(1, maxDepth - depth),
           status: "failed",
           error: error.message || "Could not scan public posts.",
         })
