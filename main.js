@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 })
 
 const BACKEND_BUILD_ID =
-  "telehub-admin-controlled-ai-style-2026-08-08"
+  "telehub-coldstart-ranking-mix-2026-08-09"
 
 app.get("/", (req, res) => {
   res.status(200).json({
@@ -4723,6 +4723,24 @@ function normalizeLogScore(value, maxValue) {
   return Math.min(100, (Math.log10(num + 1) / Math.log10(max + 1)) * 100)
 }
 
+function stableRankingTieBreak(listing) {
+  const value = String(
+    listing?.id ||
+    listing?.telegram_link ||
+    listing?.telegram_username ||
+    listing?.channel_name ||
+    ''
+  )
+
+  let hash = 2166136261
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index)
+    hash = Math.imul(hash, 16777619)
+  }
+
+  return hash >>> 0
+}
+
 function getFreshnessScore(listing) {
   // Freshness is based only on when the listing was actually created.
   // Routine metadata/member refreshes should not make an old listing "new" again.
@@ -4756,11 +4774,22 @@ function calculateRankingScore(listing, maxStats) {
     maxStats.maxGrowth
   )
 
-  const freshnessScore = getFreshnessScore(listing)
+  const rawFreshnessScore = getFreshnessScore(listing)
 
-  // Member count contributes up to 5 points. Log scaling keeps a huge
-  // channel from overwhelming the rest of the ranking signals.
-  // 1,000,000 members reaches the full member-count component.
+  // Untouched listings should not cluster at the top just because they were
+  // imported recently. If there are no votes, referrals, or measured growth,
+  // keep only 20% of the already-small freshness signal.
+  const hasRankingActivity =
+    Number(listing.votes_count || 0) > 0 ||
+    Number(listing.referral_boost_score || 0) > 0 ||
+    Number(listing.member_growth_24h || 0) > 0
+
+  const freshnessScore = hasRankingActivity
+    ? rawFreshnessScore
+    : rawFreshnessScore * 0.2
+
+  // Member count stays a 5% signal with log scaling so older untouched
+  // listings can compete naturally with newly imported untouched listings.
   const memberCountScore = normalizeLogScore(
     listing.member_count || 0,
     1_000_000
@@ -7676,10 +7705,12 @@ app.get("/api/listings/ranked", async (req, res) => {
           return b.ranking_score - a.ranking_score
         }
 
-        return (
-          new Date(b.created_at).getTime() -
-          new Date(a.created_at).getTime()
-        )
+        // Never break ranking ties by newest-first. Prefer member count, then
+        // use a stable age-neutral hash so old/new untouched listings mix.
+        const memberDiff = Number(b.member_count || 0) - Number(a.member_count || 0)
+        if (memberDiff !== 0) return memberDiff
+
+        return stableRankingTieBreak(a) - stableRankingTieBreak(b)
       })
 
     return res.json({
@@ -7842,10 +7873,12 @@ app.get("/api/listings/homepage", async (req, res) => {
           return b.ranking_score - a.ranking_score
         }
 
-        return (
-          new Date(b.created_at).getTime() -
-          new Date(a.created_at).getTime()
-        )
+        // Never break ranking ties by newest-first. Prefer member count, then
+        // use a stable age-neutral hash so old/new untouched listings mix.
+        const memberDiff = Number(b.member_count || 0) - Number(a.member_count || 0)
+        if (memberDiff !== 0) return memberDiff
+
+        return stableRankingTieBreak(a) - stableRankingTieBreak(b)
       })
       .slice(0, limit)
 
