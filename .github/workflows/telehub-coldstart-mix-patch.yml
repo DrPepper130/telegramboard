@@ -1,0 +1,143 @@
+name: Patch TeleHub cold-start ranking mix
+
+on:
+  push:
+    paths:
+      - ".telehub-coldstart-trigger"
+
+permissions:
+  contents: write
+
+jobs:
+  patch-main:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Patch cold-start ranking behavior
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          path = Path("main.js")
+          text = path.read_text(encoding="utf-8")
+
+          old_fresh = '''  const freshnessScore = getFreshnessScore(listing)
+
+  // Member count contributes up to 5 points. Log scaling keeps a huge
+  // channel from overwhelming the rest of the ranking signals.
+  // 1,000,000 members reaches the full member-count component.
+  const memberCountScore = normalizeLogScore(
+    listing.member_count || 0,
+    1_000_000
+  )
+'''
+          new_fresh = '''  const rawFreshnessScore = getFreshnessScore(listing)
+
+  // Untouched listings used to cluster at the top because freshness was often
+  // their only non-zero signal. Keep only a tiny cold-start freshness nudge for
+  // listings with no votes, referral activity, or measured member growth.
+  // Once a listing has real activity, it can use the full 5% freshness signal.
+  const hasRankingActivity =
+    Number(listing.votes_count || 0) > 0 ||
+    Number(listing.referral_boost_score || 0) > 0 ||
+    Number(listing.member_growth_24h || 0) > 0
+
+  const freshnessScore = hasRankingActivity
+    ? rawFreshnessScore
+    : rawFreshnessScore * 0.2
+
+  // Member count contributes up to 5 points. Log scaling lets established
+  // untouched listings compete naturally with newly imported untouched ones.
+  const memberCountScore = normalizeLogScore(
+    listing.member_count || 0,
+    1_000_000
+  )
+'''
+
+          fresh_count = text.count(old_fresh)
+          if fresh_count < 1:
+              raise SystemExit(f"freshness/member-count score block not found; found {fresh_count}")
+          text = text.replace(old_fresh, new_fresh)
+
+          helper_anchor = '''function getFreshnessScore(listing) {
+'''
+          helper = '''function stableRankingTieBreak(listing) {
+  const value = String(
+    listing?.id ||
+    listing?.telegram_link ||
+    listing?.telegram_username ||
+    listing?.channel_name ||
+    ""
+  )
+
+  let hash = 2166136261
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index)
+    hash = Math.imul(hash, 16777619)
+  }
+
+  return hash >>> 0
+}
+
+'''
+          if helper not in text:
+              if helper_anchor not in text:
+                  raise SystemExit("getFreshnessScore anchor not found")
+              text = text.replace(helper_anchor, helper + helper_anchor, 1)
+
+          old_sort = '''      .sort((a, b) => {
+        if (b.ranking_score !== a.ranking_score) {
+          return b.ranking_score - a.ranking_score
+        }
+
+        return (
+          new Date(b.created_at).getTime() -
+          new Date(a.created_at).getTime()
+        )
+      })'''
+          new_sort = '''      .sort((a, b) => {
+        if (b.ranking_score !== a.ranking_score) {
+          return b.ranking_score - a.ranking_score
+        }
+
+        // Never break ranking ties by newest-first. That caused batches of newly
+        // imported, untouched listings to stack together. Prefer the stronger
+        // member count, then use a stable age-neutral hash so old and new rows mix.
+        const memberDiff = Number(b.member_count || 0) - Number(a.member_count || 0)
+        if (memberDiff !== 0) return memberDiff
+
+        return stableRankingTieBreak(a) - stableRankingTieBreak(b)
+      })'''
+
+          sort_count = text.count(old_sort)
+          if sort_count < 1:
+              raise SystemExit(f"newest-first ranking tie-break not found; found {sort_count}")
+          text = text.replace(old_sort, new_sort)
+
+          text = text.replace(
+              '"telehub-admin-controlled-ai-style-2026-08-08"',
+              '"telehub-coldstart-ranking-mix-2026-08-09"',
+              1,
+          )
+
+          path.write_text(text, encoding="utf-8")
+          print(f"Patched {fresh_count} ranking score block(s) and {sort_count} ranking sort(s).")
+          PY
+
+      - name: Syntax check
+        run: node --check main.js
+
+      - name: Commit ranking mix patch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add main.js
+          git commit -m "Mix cold-start listings by quality instead of age" || exit 0
+          git push
