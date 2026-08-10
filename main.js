@@ -4703,10 +4703,11 @@ app.get("/api/referrals/track", async (req, res) => {
 // ========================================
 
 const RANKING_WEIGHTS = {
-  votes: 0.35,
+  votes: 0.40,
   referralBoost: 0.25,
   memberGrowth: 0.25,
-  freshness: 0.15,
+  freshness: 0.05,
+  memberCount: 0.05,
 }
 
 function clampNumber(value, min, max) {
@@ -4723,11 +4724,9 @@ function normalizeLogScore(value, maxValue) {
 }
 
 function getFreshnessScore(listing) {
-  const dateValue =
-    listing.updated_at ||
-    listing.last_synced_at ||
-    listing.created_at
-
+  // Freshness is based only on when the listing was actually created.
+  // Routine metadata/member refreshes should not make an old listing "new" again.
+  const dateValue = listing.created_at
   if (!dateValue) return 0
 
   const ageMs = Date.now() - new Date(dateValue).getTime()
@@ -4735,7 +4734,8 @@ function getFreshnessScore(listing) {
 
   if (!Number.isFinite(ageDays)) return 0
 
-  // Full power when very fresh, fades over 30 days
+  // A new listing can contribute at most 5 ranking points via the 5% weight.
+  // The freshness component fades linearly to zero over 30 days.
   return clampNumber(100 - (ageDays / 30) * 100, 0, 100)
 }
 
@@ -4758,11 +4758,20 @@ function calculateRankingScore(listing, maxStats) {
 
   const freshnessScore = getFreshnessScore(listing)
 
+  // Member count contributes up to 5 points. Log scaling keeps a huge
+  // channel from overwhelming the rest of the ranking signals.
+  // 1,000,000 members reaches the full member-count component.
+  const memberCountScore = normalizeLogScore(
+    listing.member_count || 0,
+    1_000_000
+  )
+
   const rankingScore =
     voteScore * RANKING_WEIGHTS.votes +
     referralScore * RANKING_WEIGHTS.referralBoost +
     memberGrowthScore * RANKING_WEIGHTS.memberGrowth +
-    freshnessScore * RANKING_WEIGHTS.freshness
+    freshnessScore * RANKING_WEIGHTS.freshness +
+    memberCountScore * RANKING_WEIGHTS.memberCount
 
   return {
     ranking_score: Math.round(rankingScore * 100) / 100,
@@ -4771,6 +4780,7 @@ function calculateRankingScore(listing, maxStats) {
       referral_score: Math.round(referralScore * 100) / 100,
       member_growth_score: Math.round(memberGrowthScore * 100) / 100,
       freshness_score: Math.round(freshnessScore * 100) / 100,
+      member_count_score: Math.round(memberCountScore * 100) / 100,
     },
   }
 }
