@@ -24,89 +24,46 @@ jobs:
         run: |
           python3 <<'PY'
           from pathlib import Path
+          import re
 
           path = Path("main.js")
           text = path.read_text(encoding="utf-8")
 
-          def replace_once(old, new, label):
+          def sub_once(pattern, replacement, label):
               global text
-              count = text.count(old)
+              text, count = re.subn(pattern, replacement, text, count=1, flags=re.M)
               if count != 1:
                   raise SystemExit(f"{label}: expected 1 match, found {count}")
-              text = text.replace(old, new, 1)
 
-          replace_once(
-          '''  return {
-              seed_limit: Math.max(1, Math.min(Number(raw.seed_limit || 1000), 10000)),
-          ''',
-          '''  return {
-              // Optional one-cycle branch jump. These are consumed after the cycle
-              // completes, then future 24/7 cycles return to automatic seed selection.
-              seed_links: parseTelegramImportLinks(raw.seed_links || ""),
-              seed_limit: Math.max(1, Math.min(Number(raw.seed_limit || 1000), 10000)),
-          ''',
-          "continuous settings seed links")
+          sub_once(
+              r'(function continuousAutomationSettings\(state\) \{[\s\S]*?\n\s*return \{\n)(\s*)(seed_limit:)',
+              r'\1\2// Optional one-cycle branch jump. These are consumed after the cycle\n\2// completes, then future 24/7 cycles return to automatic seed selection.\n\2seed_links: parseTelegramImportLinks(raw.seed_links || ""),\n\2\3',
+              "continuous settings seed links",
+          )
 
-          replace_once(
-          '''    continuous: true,
-              seed_links: [],
-              seed_limit: settings.seed_limit,
-          ''',
-          '''    continuous: true,
-              seed_links: settings.seed_links,
-              seed_limit: settings.seed_limit,
-          ''',
-          "continuous run metadata seed links")
+          sub_once(
+              r'(async function createContinuousAutomationRun\(state\) \{[\s\S]*?continuous: true,\n\s*)seed_links: \[\],',
+              r'\1seed_links: settings.seed_links,',
+              "continuous run metadata seed links",
+          )
 
-          replace_once(
-          '''    const settings = {
-              ...currentSettings,
-              seed_limit: Math.max(
-          ''',
-          '''    const settings = {
-              ...currentSettings,
-              seed_links:
-                req.body?.seed_links === undefined
-                  ? parseTelegramImportLinks(currentSettings.seed_links || "")
-                  : parseTelegramImportLinks(req.body.seed_links || ""),
-              seed_limit: Math.max(
-          ''',
-          "toggle seed links")
+          sub_once(
+              r'(app\.post\("/api/admin/automation/toggle"[\s\S]*?const settings = \{\n\s*\.\.\.currentSettings,\n)(\s*)(seed_limit:)',
+              r'\1\2seed_links:\n\2  req.body?.seed_links === undefined\n\2    ? parseTelegramImportLinks(currentSettings.seed_links || "")\n\2    : parseTelegramImportLinks(req.body.seed_links || ""),\n\2\3',
+              "toggle seed links",
+          )
 
-          replace_once(
-          '''  const { data: latestState } = await supabaseAdmin
-              .from("telehub_automation_state")
-              .select("cycle_count")
-              .eq("id", CONTINUOUS_AUTOMATION_ROW_ID)
-              .single()
+          sub_once(
+              r'(const \{ data: latestState \} = await supabaseAdmin\n\s*\.from\("telehub_automation_state"\)\n\s*)\.select\("cycle_count"\)',
+              r'\1.select("cycle_count, settings")',
+              "latest automation settings select",
+          )
 
-            await supabaseAdmin
-              .from("telehub_automation_state")
-              .update({
-                current_run_id: null,
-                cycle_count: Number(latestState?.cycle_count || 0) + 1,
-          ''',
-          '''  const { data: latestState } = await supabaseAdmin
-              .from("telehub_automation_state")
-              .select("cycle_count, settings")
-              .eq("id", CONTINUOUS_AUTOMATION_ROW_ID)
-              .single()
-
-            await supabaseAdmin
-              .from("telehub_automation_state")
-              .update({
-                current_run_id: null,
-                cycle_count: Number(latestState?.cycle_count || 0) + 1,
-                // Explicit seeds are a branch jump for one cycle only. Clearing them
-                // here makes the following cycle resume normal automatic seed selection.
-                settings: {
-                  ...(latestState?.settings && typeof latestState.settings === "object"
-                    ? latestState.settings
-                    : {}),
-                  seed_links: [],
-                },
-          ''',
-          "consume one-cycle seeds")
+          sub_once(
+              r'(cycle_count: Number\(latestState\?\.cycle_count \|\| 0\) \+ 1,\n)(\s*)(last_cycle_completed_at:)',
+              r'\1\2// Explicit seeds are a branch jump for one cycle only.\n\2settings: {\n\2  ...(latestState?.settings && typeof latestState.settings === "object"\n\2    ? latestState.settings\n\2    : {}),\n\2  seed_links: [],\n\2},\n\2\3',
+              "consume one-cycle seeds",
+          )
 
           for old_build in [
               '"telehub-admin-controlled-ai-style-2026-08-08"',
