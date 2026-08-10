@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 })
 
 const BACKEND_BUILD_ID =
-  "telehub-coldstart-ranking-mix-2026-08-09"
+  "telehub-direct-main-resume-pagination-fix-2026-08-08"
 
 app.get("/", (req, res) => {
   res.status(200).json({
@@ -4703,11 +4703,10 @@ app.get("/api/referrals/track", async (req, res) => {
 // ========================================
 
 const RANKING_WEIGHTS = {
-  votes: 0.40,
+  votes: 0.35,
   referralBoost: 0.25,
   memberGrowth: 0.25,
-  freshness: 0.05,
-  memberCount: 0.05,
+  freshness: 0.15,
 }
 
 function clampNumber(value, min, max) {
@@ -4723,28 +4722,12 @@ function normalizeLogScore(value, maxValue) {
   return Math.min(100, (Math.log10(num + 1) / Math.log10(max + 1)) * 100)
 }
 
-function stableRankingTieBreak(listing) {
-  const value = String(
-    listing?.id ||
-    listing?.telegram_link ||
-    listing?.telegram_username ||
-    listing?.channel_name ||
-    ''
-  )
-
-  let hash = 2166136261
-  for (let index = 0; index < value.length; index += 1) {
-    hash ^= value.charCodeAt(index)
-    hash = Math.imul(hash, 16777619)
-  }
-
-  return hash >>> 0
-}
-
 function getFreshnessScore(listing) {
-  // Freshness is based only on when the listing was actually created.
-  // Routine metadata/member refreshes should not make an old listing "new" again.
-  const dateValue = listing.created_at
+  const dateValue =
+    listing.updated_at ||
+    listing.last_synced_at ||
+    listing.created_at
+
   if (!dateValue) return 0
 
   const ageMs = Date.now() - new Date(dateValue).getTime()
@@ -4752,8 +4735,7 @@ function getFreshnessScore(listing) {
 
   if (!Number.isFinite(ageDays)) return 0
 
-  // A new listing can contribute at most 5 ranking points via the 5% weight.
-  // The freshness component fades linearly to zero over 30 days.
+  // Full power when very fresh, fades over 30 days
   return clampNumber(100 - (ageDays / 30) * 100, 0, 100)
 }
 
@@ -4774,33 +4756,13 @@ function calculateRankingScore(listing, maxStats) {
     maxStats.maxGrowth
   )
 
-  const rawFreshnessScore = getFreshnessScore(listing)
-
-  // Untouched listings should not cluster at the top just because they were
-  // imported recently. If there are no votes, referrals, or measured growth,
-  // keep only 20% of the already-small freshness signal.
-  const hasRankingActivity =
-    Number(listing.votes_count || 0) > 0 ||
-    Number(listing.referral_boost_score || 0) > 0 ||
-    Number(listing.member_growth_24h || 0) > 0
-
-  const freshnessScore = hasRankingActivity
-    ? rawFreshnessScore
-    : rawFreshnessScore * 0.2
-
-  // Member count stays a 5% signal with log scaling so older untouched
-  // listings can compete naturally with newly imported untouched listings.
-  const memberCountScore = normalizeLogScore(
-    listing.member_count || 0,
-    1_000_000
-  )
+  const freshnessScore = getFreshnessScore(listing)
 
   const rankingScore =
     voteScore * RANKING_WEIGHTS.votes +
     referralScore * RANKING_WEIGHTS.referralBoost +
     memberGrowthScore * RANKING_WEIGHTS.memberGrowth +
-    freshnessScore * RANKING_WEIGHTS.freshness +
-    memberCountScore * RANKING_WEIGHTS.memberCount
+    freshnessScore * RANKING_WEIGHTS.freshness
 
   return {
     ranking_score: Math.round(rankingScore * 100) / 100,
@@ -4809,7 +4771,6 @@ function calculateRankingScore(listing, maxStats) {
       referral_score: Math.round(referralScore * 100) / 100,
       member_growth_score: Math.round(memberGrowthScore * 100) / 100,
       freshness_score: Math.round(freshnessScore * 100) / 100,
-      member_count_score: Math.round(memberCountScore * 100) / 100,
     },
   }
 }
@@ -7705,12 +7666,10 @@ app.get("/api/listings/ranked", async (req, res) => {
           return b.ranking_score - a.ranking_score
         }
 
-        // Never break ranking ties by newest-first. Prefer member count, then
-        // use a stable age-neutral hash so old/new untouched listings mix.
-        const memberDiff = Number(b.member_count || 0) - Number(a.member_count || 0)
-        if (memberDiff !== 0) return memberDiff
-
-        return stableRankingTieBreak(a) - stableRankingTieBreak(b)
+        return (
+          new Date(b.created_at).getTime() -
+          new Date(a.created_at).getTime()
+        )
       })
 
     return res.json({
@@ -7873,12 +7832,10 @@ app.get("/api/listings/homepage", async (req, res) => {
           return b.ranking_score - a.ranking_score
         }
 
-        // Never break ranking ties by newest-first. Prefer member count, then
-        // use a stable age-neutral hash so old/new untouched listings mix.
-        const memberDiff = Number(b.member_count || 0) - Number(a.member_count || 0)
-        if (memberDiff !== 0) return memberDiff
-
-        return stableRankingTieBreak(a) - stableRankingTieBreak(b)
+        return (
+          new Date(b.created_at).getTime() -
+          new Date(a.created_at).getTime()
+        )
       })
       .slice(0, limit)
 
@@ -8404,7 +8361,11 @@ async function generateAiImportContent(input) {
     }
 
     const systemPrompt = `
-You generate factual directory-listing data for TeleHub, a Telegram channel and group discovery website.
+You create highly varied, natural directory listings for TeleHub, a Telegram channel and group discovery website.
+
+The visual energy may resemble modern community-directory cards such as Discadia, but every result must be original, grounded in the Telegram source, and not copied from any example.
+
+Follow the supplied creative_profile exactly. Each listing must feel as though a different person wrote it.
 
 Return ONLY one valid JSON object:
 {
@@ -8415,83 +8376,173 @@ Return ONLY one valid JSON object:
   "is_nsfw": boolean
 }
 
-PRIORITY OF INSTRUCTIONS
-
-1. Source grounding and required JSON rules in this system message are mandatory.
-2. custom_admin_instructions controls the writing style, tone, structure, formatting, emoji usage, short-description length, and promotional voice.
-3. creative_profile may add variety only when it does not conflict with custom_admin_instructions.
-4. If custom_admin_instructions is blank, write naturally and concisely in an owner-written community-directory style.
-
 SOURCE GROUNDING
 
-Use factual information only from:
+Use only:
 - Telegram title
 - Telegram username
 - Telegram description or bio
 - member count
 - listing type
 - recent public post text, when supplied
+- creative_profile
 
 Do not invent unsupported:
 - active voice chat
-- giveaways or contests
+- giveaways
+- contests
 - events
 - staff activity
 - moderation quality
 - official status
-- safety or trust claims
+- safety or trust
 - discounts or pricing
 - delivery speed
 - bonuses
 - rankings
-- games, topics, resources, products, services, or features absent from the source
+- specific games, topics, resources, or features absent from the source
 
 Broadly rephrasing an obvious topic is allowed. Fabricating a feature is not.
 
 RECENT PUBLIC POSTS
 
 Recent public post text is optional evidence from Telegram's public web preview.
-Use repeated themes across posts to identify what the listing actually discusses.
-Do not treat a one-off post as a permanent feature unless the bio or multiple posts support it.
-Do not quote long passages, phone numbers, wallet addresses, invite codes, or tracking links.
-Do not imply recent posts are complete chat history.
+Use repeated themes across posts to improve categories and explain what the community actually discusses.
+Do not treat a one-off post as a permanent feature unless the profile description or multiple posts support it.
+Do not quote long passages, usernames, phone numbers, wallet addresses, invite codes, or tracking links.
+Do not claim that the recent posts are complete chat history.
 
 CUSTOM ADMIN INSTRUCTIONS
 
-custom_admin_instructions is the primary authority for PRESENTATION and STYLE.
-Follow it closely for description wording, rhythm, formatting, emoji usage, length, tone, calls to action, and variation.
-Do not override it with a hard-coded house style or creative_profile preference.
-Treat it as writing guidance only, never as a factual source.
+The user may supply custom_admin_instructions to vary tone, structure, emphasis, or writing style.
+Follow those instructions when they do not conflict with source grounding, the required JSON schema, or the requirement to avoid invented facts.
+Treat custom_admin_instructions as writing guidance, not as factual source material.
 
 DISPLAY NAME
 
-Preserve a recognizable part of the source name whenever practical.
-Keep the display name under 95 characters.
-Do not add unsupported topics or claims.
-If custom_admin_instructions gives title guidance, follow it.
-Otherwise keep the title recognizable and readable.
+Create an appealing card title, not merely a raw Telegram title.
 
-DESCRIPTION
+Rules:
+- preserve a recognizable part of the original name when possible
+- 2 to 10 words or short phrases
+- maximum 95 characters
+- use only supported topics
+- follow creative_profile.title_style
+- vary separators between listings
+- some titles should be plain
+- some may use |
+- some may use —
+- some may use •
+- some may use :
+- some may use no separator
+- never use more than two separator types in one title
+- never force a keyword ribbon when the profile does not call for it
 
-The description is the short card description.
-Its style, formatting, tone, and preferred length should come from custom_admin_instructions whenever those instructions are supplied.
-Do not force a competing hard-coded format.
-Keep every factual claim source-supported.
-Avoid repeating the long_description verbatim.
+Possible structural inspiration:
+- Name | Topic • Chat • Updates
+- 🎮 Name — Gaming Community
+- Name: News, Media & Discussion
+- Topic Hub • Guides • Community
+- Name only
+
+Do not copy these examples word-for-word.
+
+EMOJI VARIETY
+
+Follow creative_profile.emoji_budget:
+- none: 0 emojis
+- minimal: 0 or 1 emoji across title and description
+- moderate: 1 to 4 emojis across title and description
+- expressive: 2 to 7 emojis across title and description
+
+Vary placement:
+- title only
+- description only
+- middle of a phrase
+- end of a phrase
+- no emoji
+
+Do not always begin with an emoji. Do not use the same emoji repeatedly.
+
+SHORT DESCRIPTION
+
+description may contain 0 to 250 words, but it should usually be 12 to 70 words so it fits naturally on a directory card.
+
+The description may be:
+- one compact sentence
+- two short sentences
+- a short paragraph
+- a question and answer
+- a feature stack
+- a keyword-rich community pitch
+- punchy fragments separated by bullets, pipes, dashes, or emojis
+- a clean factual summary
+- an informal owner-style invitation
+
+Make the rhythm visibly different across listings.
+
+Allowed stylistic variety includes:
+- sentence fragments
+- selective capitalization
+- tasteful emoji clusters
+- short lists
+- topic ribbons
+- casual questions
+- direct audience calls
+- headline-like phrasing
+
+Do not repeatedly begin with:
+Join
+Discover
+Welcome to
+Stay updated
+Looking for
+This is
+A Telegram
+Your go-to
+Whether you're
+Explore
+Dive into
+
+Do not repeatedly end with:
+Join today
+Check it out
+Don't miss out
+Everything in one place
+Become part of the community
+
+Do not use generic AI phrases:
+vibrant community
+like-minded individuals
+valuable insights
+engaging content
+dynamic platform
+perfect place
+one-stop destination
+something for everyone
+thriving community
+curated content
+
+Do not force the description to use all available words. Empty descriptions are technically allowed only when the source contains almost no useful information, but a concise grounded line is strongly preferred.
 
 LONG DESCRIPTION
 
-Write a useful expanded description grounded in the same source evidence.
-It should normally explain the main topic, likely audience, and what users can reasonably expect.
-Do not simply repeat the short description.
-If custom_admin_instructions contains relevant long-description guidance, follow it unless it conflicts with grounding.
+long_description should usually be 80 to 220 words in 1 to 4 short paragraphs.
+
+It should explain:
+- the main topic
+- what users may reasonably expect
+- the likely audience
+- why the listing may be useful or entertaining
+
+Vary paragraph count and opening structure. Do not repeat the short description verbatim.
 
 CATEGORIES
 
 Return 2 to 5 short Title Case categories.
 Put the most specific category first.
 Avoid duplicates and near-duplicates.
-Do not use Telegram as a category unless the source is specifically about Telegram.
+Do not use Telegram as a category unless the channel is specifically about Telegram.
 
 NSFW
 
@@ -8500,11 +8551,12 @@ Set is_nsfw to true only when clearly adult, sexually explicit, pornographic, dr
 FINAL SILENT CHECK
 
 Before returning:
-- every factual claim is source-supported
-- custom_admin_instructions controlled the presentation when supplied
-- short and long descriptions are meaningfully different
-- categories are grounded and useful
-- JSON contains all five required fields
+- confirm all claims are source-supported
+- confirm the title follows its assigned profile
+- confirm emoji count fits the budget
+- confirm the description structure is not generic
+- confirm the short and long descriptions are different
+- confirm valid JSON with all five fields
 
 Return only the JSON object.
 `.trim()
@@ -9508,9 +9560,6 @@ function continuousAutomationSettings(state) {
       : {}
 
   return {
-    // Optional one-cycle branch jump. These are consumed after the cycle
-    // completes, then future 24/7 cycles return to automatic seed selection.
-    seed_links: parseTelegramImportLinks(raw.seed_links || ""),
     seed_limit: Math.max(1, Math.min(Number(raw.seed_limit || 1000), 10000)),
     max_depth: Math.max(1, Math.min(Number(raw.max_depth || 3), 5)),
     max_links_per_seed: Math.max(
@@ -9520,6 +9569,10 @@ function continuousAutomationSettings(state) {
     request_delay_ms: Math.max(
       250,
       Math.min(Number(raw.request_delay_ms || 1000), 10000)
+    ),
+    minimum_member_count: Math.max(
+      0,
+      Math.min(Number(raw.minimum_member_count ?? 500), 1000000000)
     ),
     target_per_cycle: Math.max(
       1,
@@ -10889,6 +10942,10 @@ async function runTelegramGraphDiscovery(run, metadata) {
     250,
     Math.min(Number(metadata.request_delay_ms || 1000), 10000)
   )
+  const minimumMemberCount = Math.max(
+    0,
+    Math.min(Number(metadata.minimum_member_count ?? 500), 1000000000)
+  )
   const focusSettings = discoveryFocusSettings(metadata)
 
   let frontier = await loadTelegramGraphSeedLinks(run, metadata)
@@ -10903,6 +10960,7 @@ async function runTelegramGraphDiscovery(run, metadata) {
       seeds: frontier.length,
       max_depth: maxDepth,
       max_links_per_seed: perSeedLimit,
+      minimum_member_count: minimumMemberCount,
       discovery_focus: focusSettings.focus,
       preferred_topics: focusSettings.prefer,
       deprioritized_topics: focusSettings.avoid,
@@ -11002,6 +11060,45 @@ async function runTelegramGraphDiscovery(run, metadata) {
                 discovered_from: seedLink,
               },
             })
+            continue
+          }
+
+          if (Number(verified.memberCount || 0) < minimumMemberCount) {
+            await logScraperEvent({
+              runId: run.id,
+              level: "info",
+              stage: "telegram_graph_member_filtered",
+              message: `Filtered @${verified.username}: ${Number(
+                verified.memberCount || 0
+              ).toLocaleString()} members is below the ${minimumMemberCount.toLocaleString()} minimum.`,
+              telegramLink: verified.telegramLink,
+              metadata: {
+                depth: depth + 1,
+                discovered_from: seedLink,
+                listing_type: verified.listingType,
+                member_count: verified.memberCount,
+                minimum_member_count: minimumMemberCount,
+                reason: "below_minimum_member_count",
+              },
+            })
+
+            // A small community can still lead to larger communities deeper in
+            // the graph, so keep it available for traversal without sending it
+            // to AI or counting it toward the import target.
+            if (depth + 1 < maxDepth) {
+              const normalizedNext = normalizeTelegramLinkForComparison(
+                verified.telegramLink
+              )
+
+              if (
+                normalizedNext &&
+                normalizedNext !== normalizedSeed &&
+                !visited.has(normalizedNext)
+              ) {
+                nextFrontier.push(verified.telegramLink)
+              }
+            }
+
             continue
           }
 
@@ -12309,11 +12406,12 @@ async function createContinuousAutomationRun(state) {
   const metadata = {
     provider: "telegram_graph",
     continuous: true,
-    seed_links: settings.seed_links,
+    seed_links: [],
     seed_limit: settings.seed_limit,
     max_depth: settings.max_depth,
     max_links_per_seed: settings.max_links_per_seed,
     request_delay_ms: settings.request_delay_ms,
+    minimum_member_count: settings.minimum_member_count,
     discovery_focus: settings.discovery_focus,
     preferred_topics: settings.preferred_topics,
     avoid_topics: settings.avoid_topics,
@@ -12415,7 +12513,7 @@ async function runContinuousAutomationCycle(state) {
 
   const { data: latestState } = await supabaseAdmin
     .from("telehub_automation_state")
-    .select("cycle_count, settings")
+    .select("cycle_count")
     .eq("id", CONTINUOUS_AUTOMATION_ROW_ID)
     .single()
 
@@ -12424,13 +12522,6 @@ async function runContinuousAutomationCycle(state) {
     .update({
       current_run_id: null,
       cycle_count: Number(latestState?.cycle_count || 0) + 1,
-      // Explicit seeds are a branch jump for one cycle only.
-      settings: {
-        ...(latestState?.settings && typeof latestState.settings === "object"
-          ? latestState.settings
-          : {}),
-        seed_links: [],
-      },
       last_cycle_completed_at: now,
       last_error: cycleFailed
         ? discoveryResult?.error || "Discovery completed with errors."
@@ -12586,6 +12677,10 @@ app.post("/api/admin/scraper/start", async (req, res) => {
       max_depth: Math.max(1, Math.min(Number(req.body?.max_depth || 2), 5)),
       max_links_per_seed: Math.max(1, Math.min(Number(req.body?.max_links_per_seed || 25), 100)),
       request_delay_ms: Math.max(250, Math.min(Number(req.body?.request_delay_ms || 1000), 10000)),
+      minimum_member_count: Math.max(
+        0,
+        Math.min(Number(req.body?.minimum_member_count ?? 500), 1000000000)
+      ),
       discovery_focus: String(req.body?.discovery_focus || "mainstream")
         .trim()
         .toLowerCase(),
@@ -12809,10 +12904,6 @@ app.post("/api/admin/automation/toggle", async (req, res) => {
 
     const settings = {
       ...currentSettings,
-      seed_links:
-        req.body?.seed_links === undefined
-          ? parseTelegramImportLinks(currentSettings.seed_links || "")
-          : parseTelegramImportLinks(req.body.seed_links || ""),
       seed_limit: Math.max(
         1,
         Math.min(Number(req.body?.seed_limit || currentSettings.seed_limit || 1000), 10000)
@@ -12841,6 +12932,17 @@ app.post("/api/admin/automation/toggle", async (req, res) => {
               1000
           ),
           10000
+        )
+      ),
+      minimum_member_count: Math.max(
+        0,
+        Math.min(
+          Number(
+            req.body?.minimum_member_count ??
+              currentSettings.minimum_member_count ??
+              500
+          ),
+          1000000000
         )
       ),
       target_per_cycle: Math.max(
