@@ -108,9 +108,13 @@ jobs:
           ''',
           "consume one-cycle seeds")
 
-          old_build = '"telehub-admin-controlled-ai-style-2026-08-08"'
-          if old_build in text:
-              text = text.replace(old_build, '"telehub-one-cycle-seed-jumps-2026-08-10"', 1)
+          for old_build in [
+              '"telehub-admin-controlled-ai-style-2026-08-08"',
+              '"telehub-direct-main-resume-pagination-fix-2026-08-08"',
+          ]:
+              if old_build in text:
+                  text = text.replace(old_build, '"telehub-one-cycle-seed-jumps-2026-08-10"', 1)
+                  break
 
           path.write_text(text, encoding="utf-8")
           PY
