@@ -1,0 +1,151 @@
+name: Patch TeleHub ranking weights
+
+on:
+  push:
+    paths:
+      - ".telehub-ranking-trigger"
+
+permissions:
+  contents: write
+
+jobs:
+  patch-main:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Patch ranking weights
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          path = Path("main.js")
+          text = path.read_text(encoding="utf-8")
+
+          old_weights = '''const RANKING_WEIGHTS = {
+            votes: 0.35,
+            referralBoost: 0.25,
+            memberGrowth: 0.25,
+            freshness: 0.15,
+          }'''
+          new_weights = '''const RANKING_WEIGHTS = {
+            votes: 0.40,
+            referralBoost: 0.25,
+            memberGrowth: 0.25,
+            freshness: 0.05,
+            memberCount: 0.05,
+          }'''
+
+          count = text.count(old_weights)
+          if count < 1:
+              raise SystemExit("ranking weights block not found")
+          text = text.replace(old_weights, new_weights)
+
+          old_freshness = '''function getFreshnessScore(listing) {
+            const dateValue =
+              listing.updated_at ||
+              listing.last_synced_at ||
+              listing.created_at
+
+            if (!dateValue) return 0
+
+            const ageMs = Date.now() - new Date(dateValue).getTime()
+            const ageDays = ageMs / (1000 * 60 * 60 * 24)
+
+            if (!Number.isFinite(ageDays)) return 0
+
+            // Full power when very fresh, fades over 30 days
+            return clampNumber(100 - (ageDays / 30) * 100, 0, 100)
+          }'''
+          new_freshness = '''function getFreshnessScore(listing) {
+            // Freshness is based only on when the listing was actually created.
+            // Routine metadata/member refreshes should not make an old listing "new" again.
+            const dateValue = listing.created_at
+            if (!dateValue) return 0
+
+            const ageMs = Date.now() - new Date(dateValue).getTime()
+            const ageDays = ageMs / (1000 * 60 * 60 * 24)
+
+            if (!Number.isFinite(ageDays)) return 0
+
+            // A new listing can contribute at most 5 ranking points via the 5% weight.
+            // The freshness component fades linearly to zero over 30 days.
+            return clampNumber(100 - (ageDays / 30) * 100, 0, 100)
+          }'''
+
+          freshness_count = text.count(old_freshness)
+          if freshness_count < 1:
+              raise SystemExit("freshness function not found")
+          text = text.replace(old_freshness, new_freshness)
+
+          old_score = '''  const freshnessScore = getFreshnessScore(listing)
+
+            const rankingScore =
+              voteScore * RANKING_WEIGHTS.votes +
+              referralScore * RANKING_WEIGHTS.referralBoost +
+              memberGrowthScore * RANKING_WEIGHTS.memberGrowth +
+              freshnessScore * RANKING_WEIGHTS.freshness
+
+            return {
+              ranking_score: Math.round(rankingScore * 100) / 100,
+              ranking_breakdown: {
+                vote_score: Math.round(voteScore * 100) / 100,
+                referral_score: Math.round(referralScore * 100) / 100,
+                member_growth_score: Math.round(memberGrowthScore * 100) / 100,
+                freshness_score: Math.round(freshnessScore * 100) / 100,
+              },
+            }'''
+
+          new_score = '''  const freshnessScore = getFreshnessScore(listing)
+
+            // Member count contributes up to 5 points. Log scaling keeps a huge
+            // channel from overwhelming the rest of the ranking signals.
+            // 1,000,000 members reaches the full member-count component.
+            const memberCountScore = normalizeLogScore(
+              listing.member_count || 0,
+              1_000_000
+            )
+
+            const rankingScore =
+              voteScore * RANKING_WEIGHTS.votes +
+              referralScore * RANKING_WEIGHTS.referralBoost +
+              memberGrowthScore * RANKING_WEIGHTS.memberGrowth +
+              freshnessScore * RANKING_WEIGHTS.freshness +
+              memberCountScore * RANKING_WEIGHTS.memberCount
+
+            return {
+              ranking_score: Math.round(rankingScore * 100) / 100,
+              ranking_breakdown: {
+                vote_score: Math.round(voteScore * 100) / 100,
+                referral_score: Math.round(referralScore * 100) / 100,
+                member_growth_score: Math.round(memberGrowthScore * 100) / 100,
+                freshness_score: Math.round(freshnessScore * 100) / 100,
+                member_count_score: Math.round(memberCountScore * 100) / 100,
+              },
+            }'''
+
+          score_count = text.count(old_score)
+          if score_count < 1:
+              raise SystemExit(f"ranking score block not found; found {score_count}")
+          text = text.replace(old_score, new_score)
+
+          path.write_text(text, encoding="utf-8")
+          print(f"Updated {count} weight block(s), {freshness_count} freshness function(s), {score_count} score block(s).")
+          PY
+
+      - name: Syntax check
+        run: node --check main.js
+
+      - name: Commit ranking patch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add main.js
+          git commit -m "Reduce new-listing boost and add member-count signal" || exit 0
+          git push
