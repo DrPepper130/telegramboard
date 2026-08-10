@@ -9508,6 +9508,9 @@ function continuousAutomationSettings(state) {
       : {}
 
   return {
+    // Optional one-cycle branch jump. These are consumed after the cycle
+    // completes, then future 24/7 cycles return to automatic seed selection.
+    seed_links: parseTelegramImportLinks(raw.seed_links || ""),
     seed_limit: Math.max(1, Math.min(Number(raw.seed_limit || 1000), 10000)),
     max_depth: Math.max(1, Math.min(Number(raw.max_depth || 3), 5)),
     max_links_per_seed: Math.max(
@@ -12306,7 +12309,7 @@ async function createContinuousAutomationRun(state) {
   const metadata = {
     provider: "telegram_graph",
     continuous: true,
-    seed_links: [],
+    seed_links: settings.seed_links,
     seed_limit: settings.seed_limit,
     max_depth: settings.max_depth,
     max_links_per_seed: settings.max_links_per_seed,
@@ -12412,7 +12415,7 @@ async function runContinuousAutomationCycle(state) {
 
   const { data: latestState } = await supabaseAdmin
     .from("telehub_automation_state")
-    .select("cycle_count")
+    .select("cycle_count, settings")
     .eq("id", CONTINUOUS_AUTOMATION_ROW_ID)
     .single()
 
@@ -12421,6 +12424,13 @@ async function runContinuousAutomationCycle(state) {
     .update({
       current_run_id: null,
       cycle_count: Number(latestState?.cycle_count || 0) + 1,
+      // Explicit seeds are a branch jump for one cycle only.
+      settings: {
+        ...(latestState?.settings && typeof latestState.settings === "object"
+          ? latestState.settings
+          : {}),
+        seed_links: [],
+      },
       last_cycle_completed_at: now,
       last_error: cycleFailed
         ? discoveryResult?.error || "Discovery completed with errors."
@@ -12799,6 +12809,10 @@ app.post("/api/admin/automation/toggle", async (req, res) => {
 
     const settings = {
       ...currentSettings,
+      seed_links:
+        req.body?.seed_links === undefined
+          ? parseTelegramImportLinks(currentSettings.seed_links || "")
+          : parseTelegramImportLinks(req.body.seed_links || ""),
       seed_limit: Math.max(
         1,
         Math.min(Number(req.body?.seed_limit || currentSettings.seed_limit || 1000), 10000)
