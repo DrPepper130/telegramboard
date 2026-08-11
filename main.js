@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 })
 
 const BACKEND_BUILD_ID =
-  "telehub-supabase-direct-seed-fallback-2026-08-11"
+  "telehub-homepage-precomputed-cache-2026-08-11"
 
 app.get("/", (req, res) => {
   res.status(200).json({
@@ -4475,7 +4475,7 @@ app.get("/api/cron/daily-full-sync", async (req, res) => {
     let homepageCache = null
 
     try {
-      homepageCache = await updateHomepageListingCache()
+      homepageCache = await updateHomepageListingCache({ force: true })
     } catch (cacheErr) {
       console.error(
         "Homepage cache refresh after daily member sync failed:",
@@ -4962,23 +4962,74 @@ async function buildHomepageListings(limit = 18) {
   return homepageListings
 }
 
-async function updateHomepageListingCache() {
+const HOMEPAGE_RANKING_CACHE_ID = "homepage_top_18"
+const HOMEPAGE_RANKING_REFRESH_MS = Math.max(
+  60 * 60 * 1000,
+  Number(process.env.HOMEPAGE_RANKING_REFRESH_MS || 24 * 60 * 60 * 1000)
+)
+
+async function readHomepageListingCache() {
+  const { data, error } = await supabaseAdmin
+    .from("homepage_listing_cache")
+    .select("listings, updated_at")
+    .eq("id", HOMEPAGE_RANKING_CACHE_ID)
+    .maybeSingle()
+
+  if (error) throw error
+
+  return {
+    listings: Array.isArray(data?.listings) ? data.listings : [],
+    updated_at: data?.updated_at || null,
+  }
+}
+
+function isHomepageRankingCacheFresh(updatedAt) {
+  if (!updatedAt) return false
+  const updatedMs = new Date(updatedAt).getTime()
+  if (!Number.isFinite(updatedMs)) return false
+  return Date.now() - updatedMs < HOMEPAGE_RANKING_REFRESH_MS
+}
+
+async function updateHomepageListingCache(options = {}) {
+  const force = options.force === true
+
+  if (!force) {
+    const existing = await readHomepageListingCache()
+
+    if (
+      existing.listings.length > 0 &&
+      isHomepageRankingCacheFresh(existing.updated_at)
+    ) {
+      return {
+        ...existing,
+        reused: true,
+      }
+    }
+  }
+
+  // Expensive ranking work happens here, normally only once every 24 hours.
   const listings = await buildHomepageListings(18)
   const updatedAt = new Date().toISOString()
 
   const { error } = await supabaseAdmin
     .from("homepage_listing_cache")
     .upsert({
-      id: "homepage_top_18",
+      id: HOMEPAGE_RANKING_CACHE_ID,
       listings,
       updated_at: updatedAt,
     })
 
   if (error) throw error
 
+  console.log("[homepage ranking cache rebuilt]", {
+    count: listings.length,
+    updated_at: updatedAt,
+  })
+
   return {
     listings,
     updated_at: updatedAt,
+    reused: false,
   }
 }
 
@@ -7705,21 +7756,106 @@ app.get("/api/listings/ranked", async (req, res) => {
 
 app.get("/api/listings/homepage-static", async (req, res) => {
   try {
-    const { data, error } = await supabaseAdmin
-      .from("homepage_listing_cache")
-      .select("listings, updated_at")
-      .eq("id", "homepage_top_18")
-      .maybeSingle()
+    let cache = await readHomepageListingCache()
 
-    if (error) throw error
+    // First ever request: build the snapshot once so the endpoint has real data.
+    if (!cache.listings.length) {
+      cache = await updateHomepageListingCache({ force: true })
+    } else if (!isHomepageRankingCacheFresh(cache.updated_at)) {
+      // Stale-while-revalidate: serve the old ranking immediately and rebuild
+      // in the background so a visitor never waits on the expensive ranking pass.
+      updateHomepageListingCache({ force: true }).catch((cacheErr) => {
+        console.error(
+          "Background homepage ranking refresh failed:",
+          cacheErr.message
+        )
+      })
+    }
 
-    res.set("Cache-Control", "public, max-age=300, s-maxage=3600")
+    const cachedListings = Array.isArray(cache.listings)
+      ? cache.listings
+      : []
+    const cachedIds = cachedListings
+      .map((item) => item?.id)
+      .filter(Boolean)
+
+    // Fetch only the tiny cached set so bans/rejections and card fields are fresh
+    // without recalculating ranking.
+    const [currentRowsResult, countResult] = await Promise.all([
+      cachedIds.length
+        ? supabaseAdmin
+            .from("channel_listings")
+            .select(`
+              id,
+              slug,
+              short_invite,
+              channel_name,
+              telegram_title,
+              listing_type,
+              telegram_username,
+              telegram_link,
+              description,
+              categories,
+              image_url,
+              icon_url,
+              member_count,
+              votes_count,
+              referral_boost_score,
+              paid_rank,
+              paid_rank_status,
+              is_nsfw,
+              is_banned,
+              status,
+              created_at,
+              updated_at
+            `)
+            .in("id", cachedIds)
+            .eq("status", "approved")
+            .or("is_banned.is.null,is_banned.eq.false")
+        : Promise.resolve({ data: [], error: null }),
+      supabaseAdmin
+        .from("channel_listings")
+        .select("id", { count: "exact", head: true })
+        .eq("status", "approved")
+        .or("is_banned.is.null,is_banned.eq.false"),
+    ])
+
+    if (currentRowsResult.error) throw currentRowsResult.error
+    if (countResult.error) throw countResult.error
+
+    const currentById = new Map(
+      (currentRowsResult.data || []).map((item) => [String(item.id), item])
+    )
+
+    const listings = cachedListings
+      .map((cached) => {
+        const current = currentById.get(String(cached.id))
+        if (!current) return null
+
+        // Keep the daily precomputed ranking values/order, but overlay live card
+        // fields such as member count, votes, title, images, and paid status.
+        return {
+          ...cached,
+          ...current,
+          ranking_score: cached.ranking_score,
+          ranking_breakdown: cached.ranking_breakdown,
+          member_growth_24h: cached.member_growth_24h,
+        }
+      })
+      .filter(Boolean)
+
+    res.set(
+      "Cache-Control",
+      "public, max-age=60, s-maxage=300, stale-while-revalidate=86400"
+    )
 
     return res.json({
       ok: true,
       cached: true,
-      listings: data?.listings || [],
-      updated_at: data?.updated_at || null,
+      listings,
+      total_count: Number(countResult.count || 0),
+      ranked_at: cache.updated_at || null,
+      ranking_refresh_ms: HOMEPAGE_RANKING_REFRESH_MS,
     })
   } catch (err) {
     console.error("Homepage static listings error:", err)
@@ -7728,10 +7864,10 @@ app.get("/api/listings/homepage-static", async (req, res) => {
       ok: false,
       error: err.message,
       listings: [],
+      total_count: 0,
     })
   }
 })
-
 
 app.get("/api/cron/update-homepage-cache", async (req, res) => {
   try {
@@ -7739,7 +7875,7 @@ app.get("/api/cron/update-homepage-cache", async (req, res) => {
       return res.status(401).json({ error: "Unauthorized" })
     }
 
-    const result = await updateHomepageListingCache()
+    const result = await updateHomepageListingCache({ force: true })
 
     return res.json({
       ok: true,
@@ -7764,113 +7900,38 @@ app.get("/api/listings/homepage", async (req, res) => {
       30
     )
 
-    // Reuse your ranked listings logic
-    const { data: listings, error: listingsError } =
-      await supabaseAdmin
-        .from("channel_listings")
-        .select("*")
-        .eq("status", "approved")
-        .eq("is_banned", false)
+    let cache = await readHomepageListingCache()
 
-    if (listingsError) throw listingsError
-
-    const listingIds = (listings || []).map((item) => item.id)
-
-    let snapshots = []
-
-    if (listingIds.length > 0) {
-      const since = new Date(
-        Date.now() - 24 * 60 * 60 * 1000
-      ).toISOString()
-
-      snapshots = await fetchMemberSnapshotsInBatches(listingIds, since)
-    }
-
-    const snapshotsByListing = {}
-
-    snapshots.forEach((snapshot) => {
-      if (!snapshotsByListing[snapshot.listing_id]) {
-        snapshotsByListing[snapshot.listing_id] = []
-      }
-
-      snapshotsByListing[snapshot.listing_id].push(snapshot)
-    })
-
-    const listingsWithGrowth = (listings || []).map((listing) => {
-      const listingSnapshots =
-        snapshotsByListing[listing.id] || []
-
-      const firstSnapshot = listingSnapshots[0]
-      const latestSnapshot =
-        listingSnapshots[listingSnapshots.length - 1]
-
-      const oldMembers = Number(
-        firstSnapshot?.member_count ||
-          listing.member_count ||
-          0
-      )
-
-      const latestMembers = Number(
-        latestSnapshot?.member_count ||
-          listing.member_count ||
-          0
-      )
-
-      const memberGrowth24h = Math.max(
-        0,
-        latestMembers - oldMembers
-      )
-
-      return {
-        ...listing,
-        member_growth_24h: memberGrowth24h,
-      }
-    })
-
-    const maxStats = {
-      maxVotes: Math.max(
-        1,
-        ...listingsWithGrowth.map((item) =>
-          Number(item.votes_count || 0)
-        )
-      ),
-      maxGrowth: Math.max(
-        1,
-        ...listingsWithGrowth.map((item) =>
-          Number(item.member_growth_24h || 0)
-        )
-      ),
-    }
-
-    const homepageListings = listingsWithGrowth
-      .map((listing) => ({
-        ...listing,
-        ...calculateRankingScore(listing, maxStats),
-      }))
-      .sort((a, b) => {
-        if (b.ranking_score !== a.ranking_score) {
-          return b.ranking_score - a.ranking_score
-        }
-
-        return (
-          new Date(b.created_at).getTime() -
-          new Date(a.created_at).getTime()
+    if (!cache.listings.length) {
+      cache = await updateHomepageListingCache({ force: true })
+    } else if (!isHomepageRankingCacheFresh(cache.updated_at)) {
+      updateHomepageListingCache({ force: true }).catch((cacheErr) => {
+        console.error(
+          "Background homepage ranking refresh failed:",
+          cacheErr.message
         )
       })
-      .slice(0, limit)
+    }
+
+    res.set(
+      "Cache-Control",
+      "public, max-age=60, s-maxage=300, stale-while-revalidate=86400"
+    )
 
     return res.json({
       ok: true,
-      listings: homepageListings,
+      cached: true,
+      listings: (cache.listings || []).slice(0, limit),
+      ranked_at: cache.updated_at || null,
     })
   } catch (err) {
     console.error("Homepage listings error:", err)
     return res.status(500).json({
       error: err.message,
+      listings: [],
     })
   }
 })
-
 
 
 app.get("/api/widgets/preview", async (req, res) => {
