@@ -548,6 +548,60 @@ function classifyTelegramPublicPage(html, username) {
   }
 }
 
+function detectTelegramNativeVerification(rawHtml, titleMarkup = "") {
+  const html = String(rawHtml || "")
+  const titleHtml = String(titleMarkup || "")
+
+  // Telegram's public t.me pages render native verification beside the title.
+  // Prefer structural/class markers because a channel owner can put a plain
+  // checkmark character in their display name themselves.
+  const structuralPatterns = [
+    /class=["'][^"']*\b(?:tgme_[a-z0-9_-]*verified|verified[_-]?(?:icon|badge)|icon[_-]?verified)\b[^"']*["']/i,
+    /class=["'][^"']*\bverified\b[^"']*["'][^>]*(?:title|aria-label)=["'][^"']*verified[^"']*["']/i,
+    /(?:title|aria-label)=["'][^"']*verified[^"']*["'][^>]*class=["'][^"']*(?:icon|badge|tgme)[^"']*["']/i,
+  ]
+
+  if (structuralPatterns.some((pattern) => pattern.test(titleHtml))) {
+    return {
+      isVerified: true,
+      source: "tme_title_verified_markup",
+      confidence: "high",
+    }
+  }
+
+  if (structuralPatterns.some((pattern) => pattern.test(html))) {
+    return {
+      isVerified: true,
+      source: "tme_page_verified_markup",
+      confidence: "high",
+    }
+  }
+
+  // Fallback for Telegram page variants where the verified badge is rendered
+  // into the title as a checkmark rather than exposed with a stable class.
+  // This is useful for discovery, but is intentionally marked medium confidence
+  // because a channel title can theoretically contain a checkmark itself.
+  const decodedTitle = decodeHtmlEntities(titleHtml)
+  const titleText = stripHtml(decodedTitle)
+  const hasRenderedCheck =
+    /(?:✔|✓|☑|✅)/u.test(titleText) ||
+    /(?:&#10004;|&#x2714;|&#10003;|&#x2713;)/i.test(titleHtml)
+
+  if (hasRenderedCheck) {
+    return {
+      isVerified: true,
+      source: "tme_title_checkmark",
+      confidence: "medium",
+    }
+  }
+
+  return {
+    isVerified: false,
+    source: "tme_no_verified_marker",
+    confidence: "high",
+  }
+}
+
 async function fetchPublicTelegramPage(listing) {
   const username = publicTelegramUsername(listing)
 
@@ -621,6 +675,10 @@ async function fetchPublicTelegramPage(listing) {
       )
 
     const classification = classifyTelegramPublicPage(html, username)
+    const telegramVerification = detectTelegramNativeVerification(
+      html,
+      titleMatch?.[1] || ""
+    )
 
     if (classification.entityType === "bot") {
       const error = new Error(
@@ -670,6 +728,9 @@ async function fetchPublicTelegramPage(listing) {
       rawDisplay: classification.rawDisplay,
       entityType: classification.entityType,
       classificationReason: classification.reason,
+      telegramVerified: telegramVerification.isVerified === true,
+      telegramVerificationSource: telegramVerification.source,
+      telegramVerificationConfidence: telegramVerification.confidence,
       source: "tme_public_page_structural",
     }
   } finally {
@@ -10906,6 +10967,11 @@ async function verifyTelegramGraphCandidate(candidateLink) {
       memberCount: Number(profile.memberCount || 0),
       title: profile.title || cleanUsernameValue,
       description: profile.description || "",
+      telegramVerified: profile.telegramVerified === true,
+      telegramVerificationSource:
+        profile.telegramVerificationSource || "tme_no_verified_marker",
+      telegramVerificationConfidence:
+        profile.telegramVerificationConfidence || "unknown",
       source: profile.source || "tme_public_page",
     }
   } catch (error) {
@@ -11145,6 +11211,11 @@ async function runTelegramGraphDiscovery(run, metadata) {
               depth: depth + 1,
               verified_type: verified.listingType,
               verification_source: verified.source,
+              telegram_verified: verified.telegramVerified === true,
+              telegram_verification_source:
+                verified.telegramVerificationSource || null,
+              telegram_verification_confidence:
+                verified.telegramVerificationConfidence || null,
               discovery_focus: focusSettings.focus,
               focus_score: focusScore,
             },
@@ -11180,6 +11251,11 @@ async function runTelegramGraphDiscovery(run, metadata) {
               discovered_from: seedLink,
               listing_type: verified.listingType,
               member_count: verified.memberCount,
+              telegram_verified: verified.telegramVerified === true,
+              telegram_verification_source:
+                verified.telegramVerificationSource || null,
+              telegram_verification_confidence:
+                verified.telegramVerificationConfidence || null,
               verified_from_seed: verifiedFromSeed,
               new_from_seed: newFromSeed,
               per_seed_limit: perSeedLimit,
@@ -12617,6 +12693,118 @@ function kickContinuousAutomationWorker() {
 
   return continuousAutomationLoopPromise
 }
+
+// Admin-only verification diagnostic. This lets us compare the cheap public-page
+// detector used by the graph crawler against Telegram's authoritative MTProto
+// `channel.verified` flag when the admin has a linked Telegram account.
+app.get("/api/admin/telegram/verification-check", async (req, res) => {
+  let mtClient = null
+
+  try {
+    const user = await getAdminUserFromRequest(req)
+    if (!user) {
+      return res.status(403).json({ error: "Admin access required." })
+    }
+
+    const raw = String(req.query?.username || req.query?.link || "").trim()
+    const username =
+      extractUsernameFromLink(raw) ||
+      String(raw || "")
+        .replace(/^@/, "")
+        .replace(/^https?:\/\/(?:www\.)?t\.me\//i, "")
+        .split(/[/?#]/)[0]
+        .trim()
+
+    if (!/^[A-Za-z][A-Za-z0-9_]{3,31}$/.test(username)) {
+      return res.status(400).json({
+        error: "Enter a valid public Telegram username or t.me link.",
+      })
+    }
+
+    const profile = await fetchPublicTelegramPage({
+      telegram_username: `@${username}`,
+      telegram_link: `https://t.me/${username}`,
+    })
+
+    const result = {
+      ok: true,
+      username: profile.telegramUsername || `@${username}`,
+      telegram_link: profile.telegramLink || `https://t.me/${username}`,
+      title: profile.title || username,
+      listing_type: profile.listingType || null,
+      member_count: Number(profile.memberCount || 0),
+      public_page: {
+        telegram_verified: profile.telegramVerified === true,
+        source: profile.telegramVerificationSource || null,
+        confidence: profile.telegramVerificationConfidence || null,
+      },
+      mtproto: {
+        available: false,
+        telegram_verified: null,
+        scam: null,
+        fake: null,
+        restricted: null,
+        error: null,
+      },
+    }
+
+    // MTProto is the source of truth: Telegram's channel constructor exposes
+    // verified:flags.7. We only use the admin's own linked Telegram session.
+    const connection = await getTelegramAccountConnection(user.id)
+    if (
+      connection?.auth_status === "connected" &&
+      connection?.encrypted_mtproto_session
+    ) {
+      try {
+        mtClient = await createMtProtoClient(
+          connection.encrypted_mtproto_session
+        )
+        const entity = await mtClient.getEntity(username)
+        const className = String(entity?.className || entity?._ || "")
+        const isChannelLike =
+          /channel/i.test(className) ||
+          entity?.broadcast === true ||
+          entity?.megagroup === true
+
+        result.mtproto = {
+          available: true,
+          entity_class: className || null,
+          telegram_verified:
+            isChannelLike && typeof entity?.verified === "boolean"
+              ? entity.verified
+              : isChannelLike
+                ? Boolean(entity?.verified)
+                : null,
+          scam: isChannelLike ? Boolean(entity?.scam) : null,
+          fake: isChannelLike ? Boolean(entity?.fake) : null,
+          restricted: isChannelLike ? Boolean(entity?.restricted) : null,
+          error: null,
+        }
+      } catch (mtError) {
+        result.mtproto.error =
+          mtError?.message || "Could not resolve this entity over MTProto."
+      }
+    }
+
+    result.telegram_verified =
+      typeof result.mtproto.telegram_verified === "boolean"
+        ? result.mtproto.telegram_verified
+        : result.public_page.telegram_verified
+    result.verification_source =
+      typeof result.mtproto.telegram_verified === "boolean"
+        ? "telegram_mtproto_channel_flag"
+        : result.public_page.source
+
+    return res.json(result)
+  } catch (error) {
+    return res.status(error?.statusCode || error?.status || 500).json({
+      error: error?.message || "Verification check failed.",
+      code: error?.code || null,
+    })
+  } finally {
+    await safelyDisconnectMt(mtClient)
+  }
+})
 
 app.post("/api/admin/scraper/start", async (req, res) => {
   try {
