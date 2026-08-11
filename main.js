@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 })
 
 const BACKEND_BUILD_ID =
-  "telehub-supabase-direct-listings-2026-08-11"
+  "telehub-supabase-direct-seed-fallback-2026-08-11"
 
 app.get("/", (req, res) => {
   res.status(200).json({
@@ -10701,8 +10701,8 @@ async function loadTelegramGraphSeedLinks(run, metadata) {
     ),
   }
 
-  // Pull a much larger pool than the requested frontier because recently
-  // crawled channels will be skipped by persistent crawl history.
+  // Pull a larger pool than the requested frontier because recently crawled
+  // channels are intentionally skipped by persistent crawl history.
   const poolLimit = Math.max(
     seedLimit,
     Math.min(seedLimit * 10, 10000)
@@ -10710,7 +10710,9 @@ async function loadTelegramGraphSeedLinks(run, metadata) {
 
   const { data: approved, error } = await supabaseAdmin
     .from("channel_listings")
-    .select("telegram_link, telegram_username, member_count, channel_name, telegram_title, description, telegram_description, categories")
+    .select(
+      "telegram_link, telegram_username, member_count, channel_name, telegram_title, description, telegram_description, categories"
+    )
     .eq("status", "approved")
     .or("is_banned.is.null,is_banned.eq.false")
     .order("member_count", { ascending: false })
@@ -10758,7 +10760,7 @@ async function loadTelegramGraphSeedLinks(run, metadata) {
     requestedSeeds.map(normalizeTelegramLinkForComparison).filter(Boolean)
   )
 
-  const candidates = Array.from(
+  const primaryCandidates = Array.from(
     new Map(
       [...requestedSeeds, ...existingSeeds]
         .map((link) => [normalizeTelegramLinkForComparison(link), link])
@@ -10766,37 +10768,151 @@ async function loadTelegramGraphSeedLinks(run, metadata) {
     ).values()
   )
 
-  const history = await loadGraphCrawlHistory(
-    candidates.map(normalizeTelegramLinkForComparison)
+  let history = await loadGraphCrawlHistory(
+    primaryCandidates.map(normalizeTelegramLinkForComparison)
   )
 
   const selected = []
+  const selectedNormalized = new Set()
   let skippedByHistory = 0
 
-  for (const link of candidates) {
-    if (selected.length >= seedLimit) break
+  const trySelect = (link, allowExplicit = false) => {
+    if (selected.length >= seedLimit) return false
 
     const normalized = normalizeTelegramLinkForComparison(link)
-    if (!normalized) continue
+    if (!normalized || selectedNormalized.has(normalized)) return false
 
-    // Explicitly pasted seeds are always honored. Automatic seeds respect
-    // persistent crawl history so 24/7 mode keeps moving forward.
+    const isExplicit = explicitNormalized.has(normalized)
+
     if (
-      !explicitNormalized.has(normalized) &&
+      !(allowExplicit && isExplicit) &&
+      !isExplicit &&
       !graphHistoryEligible(history.get(normalized), settings)
     ) {
       skippedByHistory += 1
-      continue
+      return false
     }
 
     selected.push(link)
+    selectedNormalized.add(normalized)
+    return true
+  }
+
+  for (const link of primaryCandidates) {
+    if (selected.length >= seedLimit) break
+    trySelect(link, true)
+  }
+
+  // If the normal approved-listing pool is exhausted by cooldowns, branch
+  // outward from communities discovered in previous crawler runs. These rows
+  // are useful graph nodes even if they were duplicates or their AI import
+  // later failed. This prevents 24/7 mode from repeatedly ending with 0 seeds.
+  let fallbackCandidateCount = 0
+  let fallbackSelectedCount = 0
+
+  if (selected.length < seedLimit) {
+    const fallbackPoolLimit = Math.min(
+      Math.max(seedLimit * 20, 1000),
+      10000
+    )
+
+    const { data: discoveredRows, error: discoveredError } = await supabaseAdmin
+      .from("scraper_queue")
+      .select(
+        "telegram_link, username, title, subscribers, category, status, result, updated_at"
+      )
+      .in("status", ["created", "duplicate", "failed", "completed", "filtered"])
+      .order("updated_at", { ascending: false })
+      .limit(fallbackPoolLimit)
+
+    if (discoveredError) {
+      console.warn(
+        "Could not load previously discovered fallback graph seeds:",
+        discoveredError.message
+      )
+    } else {
+      const fallbackSeeds = Array.from(
+        new Map(
+          (discoveredRows || [])
+            .map((row) => {
+              const link = cleanImportTelegramLink(
+                row.telegram_link ||
+                  (row.username
+                    ? `https://t.me/${String(row.username).replace(/^@/, "")}`
+                    : "")
+              )
+
+              const score = scoreTelegramDiscoveryCandidate(
+                {
+                  title: row.title,
+                  description:
+                    row?.result?.description ||
+                    row?.result?.telegram_description ||
+                    "",
+                  username: row.username,
+                  categories: row.category ? [row.category] : [],
+                },
+                focusSettings
+              )
+
+              return {
+                link,
+                score,
+                updatedAt: row.updated_at || "",
+              }
+            })
+            .filter((entry) => {
+              const normalized = normalizeTelegramLinkForComparison(entry.link)
+              return (
+                Boolean(normalized) &&
+                !selectedNormalized.has(normalized) &&
+                !primaryCandidates.some(
+                  (candidate) =>
+                    normalizeTelegramLinkForComparison(candidate) === normalized
+                )
+              )
+            })
+            .sort(
+              (a, b) =>
+                b.score - a.score ||
+                String(b.updatedAt).localeCompare(String(a.updatedAt))
+            )
+            .map((entry) => [
+              normalizeTelegramLinkForComparison(entry.link),
+              entry.link,
+            ])
+        ).values()
+      )
+
+      fallbackCandidateCount = fallbackSeeds.length
+
+      const fallbackNormalized = fallbackSeeds
+        .map(normalizeTelegramLinkForComparison)
+        .filter(Boolean)
+
+      const fallbackHistory = await loadGraphCrawlHistory(fallbackNormalized)
+
+      for (const [key, value] of fallbackHistory.entries()) {
+        if (!history.has(key)) history.set(key, value)
+      }
+
+      for (const link of fallbackSeeds) {
+        if (selected.length >= seedLimit) break
+
+        const before = selected.length
+        trySelect(link, false)
+        if (selected.length > before) fallbackSelectedCount += 1
+      }
+    }
   }
 
   if (skippedByHistory > 0) {
     await logScraperEvent({
       runId: run.id,
       stage: "telegram_graph_history_skip",
-      message: `Crawl history skipped ${skippedByHistory} recently scanned seed(s); ${selected.length} eligible seed(s) selected.`,
+      message:
+        `Crawl history skipped ${skippedByHistory} recently scanned seed(s); ` +
+        `${selected.length} eligible seed(s) selected.`,
       metadata: {
         skipped_by_history: skippedByHistory,
         selected: selected.length,
@@ -10807,13 +10923,61 @@ async function loadTelegramGraphSeedLinks(run, metadata) {
         deprioritized_topic_count: settings.avoid.length,
         crawl_cooldown_hours: settings.crawl_cooldown_hours,
         empty_crawl_cooldown_hours: settings.empty_crawl_cooldown_hours,
+        fallback_candidates: fallbackCandidateCount,
+        fallback_selected: fallbackSelectedCount,
+      },
+    })
+  }
+
+  if (fallbackSelectedCount > 0) {
+    const message =
+      `Normal seed pool was cooldown-limited, so 24/7 discovery branched from ` +
+      `${fallbackSelectedCount} previously discovered community seed(s).`
+
+    console.log("[24/7 seed fallback]", {
+      run_id: run.id,
+      fallback_candidates: fallbackCandidateCount,
+      fallback_selected: fallbackSelectedCount,
+      total_selected: selected.length,
+    })
+
+    await logScraperEvent({
+      runId: run.id,
+      level: "success",
+      stage: "telegram_graph_seed_fallback",
+      message,
+      metadata: {
+        fallback_candidates: fallbackCandidateCount,
+        fallback_selected: fallbackSelectedCount,
+        total_selected: selected.length,
+      },
+    })
+  }
+
+  if (!selected.length) {
+    console.warn("[24/7 seed exhaustion]", {
+      run_id: run.id,
+      primary_candidates: primaryCandidates.length,
+      fallback_candidates: fallbackCandidateCount,
+      skipped_by_history: skippedByHistory,
+    })
+
+    await logScraperEvent({
+      runId: run.id,
+      level: "warning",
+      stage: "telegram_graph_seed_exhausted",
+      message:
+        "No eligible graph seeds remain after checking approved listings and previously discovered communities. The next cycle will retry after cooldowns expire or new communities enter the graph.",
+      metadata: {
+        primary_candidates: primaryCandidates.length,
+        fallback_candidates: fallbackCandidateCount,
+        skipped_by_history: skippedByHistory,
       },
     })
   }
 
   return selected
 }
-
 
 function isObviousTelegramBotUsername(username) {
   const clean = String(username || "")
@@ -10926,6 +11090,13 @@ async function runTelegramGraphDiscovery(run, metadata) {
   let frontier = await loadTelegramGraphSeedLinks(run, metadata)
   const visited = new Set()
   let accepted = 0
+
+  console.log("[24/7 graph seeded]", {
+    run_id: run.id,
+    eligible_seeds: frontier.length,
+    target,
+    max_depth: maxDepth,
+  })
 
   await logScraperEvent({
     runId: run.id,
@@ -12448,6 +12619,11 @@ async function runContinuousAutomationCycle(state) {
     discoveryResult: null,
   }
 
+  console.log("[24/7 cycle started]", {
+    run_id: run.id,
+    settings: continuousAutomationSettings(state),
+  })
+
   await logScraperEvent({
     runId: run.id,
     stage: "continuous_cycle_started",
@@ -12516,18 +12692,30 @@ async function runContinuousAutomationCycle(state) {
     })
     .eq("id", CONTINUOUS_AUTOMATION_ROW_ID)
 
+  const completionMessage =
+    `24/7 concurrent cycle complete: ${importResult.created} listing(s) AI-created and ` +
+    `available directly from Supabase, ${counts.duplicate || 0} duplicate(s), ` +
+    `${importResult.failed} AI/import failure(s).`
+
+  console.log("[24/7 cycle completed]", {
+    run_id: run.id,
+    created: importResult.created,
+    duplicates: counts.duplicate || 0,
+    failed: importResult.failed,
+    discovery_accepted: discoveryResult?.accepted || 0,
+    direct_from_supabase: true,
+  })
+
   await logScraperEvent({
     runId: run.id,
     level: cycleFailed ? "warning" : "success",
     stage: "continuous_cycle_completed",
-    message:
-      `24/7 concurrent cycle complete: ${importResult.created} listing(s) AI-created, ` +
-      `${importResult.framer_synced || 0} synced to Framer CMS in batches, ` +
-      `${counts.duplicate || 0} duplicate(s), ${importResult.failed} AI/import failure(s).`,
+    message: completionMessage,
     metadata: {
       discovery: discoveryResult,
       import: importResult,
       counters: counts,
+      direct_from_supabase: true,
     },
   })
 
