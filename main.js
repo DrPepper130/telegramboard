@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 })
 
 const BACKEND_BUILD_ID =
-  "telehub-direct-main-resume-pagination-fix-2026-08-08"
+  "telehub-supabase-direct-listings-2026-08-11"
 
 app.get("/", (req, res) => {
   res.status(200).json({
@@ -4040,15 +4040,18 @@ app.get("/api/admin/listings/review-batch-status", async (req, res) => {
       return res.status(403).json({ error: "Admin access required." })
     }
 
+    // Compatibility endpoint for the existing Framer admin UI.
+    // Public pages now render directly from Supabase, so there is no CMS batch.
     return res.json({
       ok: true,
-      pending: await getPendingAdminReviewFramerCount(),
-      batch_size: ADMIN_REVIEW_FRAMER_BATCH_SIZE,
-      running: adminReviewFramerBatchRunning,
+      pending: 0,
+      batch_size: 0,
+      running: false,
+      direct_from_supabase: true,
     })
   } catch (error) {
     return res.status(500).json({
-      error: error.message || "Could not load review batch status.",
+      error: error.message || "Could not load review status.",
     })
   }
 })
@@ -4129,7 +4132,7 @@ app.post("/api/admin/listings/review-approve", async (req, res) => {
           : cleanString(updates.image_url) || null,
       status: "approved",
       admin_reviewed: true,
-      framer_sync_status: "pending_review_batch",
+      framer_sync_status: null,
       framer_sync_error: null,
       updated_at: new Date().toISOString(),
     }
@@ -4138,27 +4141,20 @@ app.post("/api/admin/listings/review-approve", async (req, res) => {
       .from("channel_listings")
       .update(updatePayload)
       .eq("id", listingId)
-      .select("id, channel_name, short_invite, framer_sync_status")
+      .select("id, channel_name, short_invite")
       .single()
 
     if (updateError) throw updateError
 
-    const pending = await getPendingAdminReviewFramerCount()
-    const batchStarted = pending >= ADMIN_REVIEW_FRAMER_BATCH_SIZE
-
-    if (batchStarted) {
-      kickAdminReviewFramerBatchIfReady()
-    }
-
     return res.json({
       ok: true,
       listing: updated,
-      pending,
-      batch_size: ADMIN_REVIEW_FRAMER_BATCH_SIZE,
-      batch_started: batchStarted,
-      message: batchStarted
-        ? "Approved. A 20-listing Framer batch is starting."
-        : `Approved. ${pending}/${ADMIN_REVIEW_FRAMER_BATCH_SIZE} waiting for the next Framer batch.`,
+      pending: 0,
+      batch_size: 0,
+      batch_started: false,
+      direct_from_supabase: true,
+      url: `https://telehub.to/channel/${updated.short_invite}`,
+      message: "Approved. The listing is live directly from Supabase.",
     })
   } catch (error) {
     console.error("Rapid admin approval failed:", error)
@@ -4175,38 +4171,16 @@ app.post("/api/admin/listings/review-batch-flush", async (req, res) => {
       return res.status(403).json({ error: "Admin access required." })
     }
 
-    const pendingBefore = await getPendingAdminReviewFramerCount()
-    if (!pendingBefore) {
-      return res.json({
-        ok: true,
-        pending: 0,
-        synced: 0,
-        message: "No reviewed listings are waiting for Framer.",
-      })
-    }
-
-    if (adminReviewFramerBatchRunning) {
-      return res.status(409).json({
-        error: "A review Framer batch is already running.",
-        pending: pendingBefore,
-      })
-    }
-
-    // Run in the request for an explicit manual flush so the admin gets
-    // a concrete success/failure result.
-    const result = await flushAdminReviewFramerBatches({ force: true })
-
     return res.json({
       ok: true,
-      ...result,
-      message: `Published ${result.synced || 0} reviewed listing(s) in ${
-        result.batches || 0
-      } Framer batch(es).`,
+      pending: 0,
+      synced: 0,
+      direct_from_supabase: true,
+      message: "Nothing to publish. Public listing pages now read directly from Supabase.",
     })
   } catch (error) {
-    console.error("Manual review batch flush failed:", error)
     return res.status(500).json({
-      error: error.message || "Could not publish reviewed listings.",
+      error: error.message || "Could not finish review publishing.",
     })
   }
 })
@@ -4241,7 +4215,7 @@ app.post("/api/admin/listings/lifecycle", async (req, res) => {
 
     const { data: listing, error: listingError } = await supabaseAdmin
       .from("channel_listings")
-      .select("*")
+      .select("id, status, is_banned, short_invite")
       .eq("id", listing_id)
       .single()
 
@@ -4249,71 +4223,56 @@ app.post("/api/admin/listings/lifecycle", async (req, res) => {
       return res.status(404).json({ error: "Listing not found." })
     }
 
-    if (cleanAction === "reject" || cleanAction === "ban") {
-      const framer = await queueFramerSync(() =>
-        deleteListingFromFramerCMS(listing, { publish: true })
-      )
+    const now = new Date().toISOString()
+    let updatePayload
 
-      const updatePayload = cleanAction === "reject"
-        ? {
-            status: "rejected",
-            admin_reviewed: true,
-            framer_cms_item_id: null,
-            framer_sync_status: "not_synced",
-            framer_sync_error: null,
-            updated_at: new Date().toISOString(),
-          }
-        : {
-            is_banned: true,
-            admin_reviewed: true,
-            ban_reason: String(reason || "Temporarily banned by admin."),
-            framer_cms_item_id: null,
-            framer_sync_status: "not_synced",
-            framer_sync_error: null,
-            updated_at: new Date().toISOString(),
-          }
-
-      const { error: updateError } = await supabaseAdmin
-        .from("channel_listings")
-        .update(updatePayload)
-        .eq("id", listing_id)
-
-      if (updateError) throw updateError
-
-      return res.json({
-        ok: true,
-        action: cleanAction,
-        listing_id,
-        framer,
-      })
-    }
-
-    const { error: unbanError } = await supabaseAdmin
-      .from("channel_listings")
-      .update({
+    if (cleanAction === "reject") {
+      updatePayload = {
+        status: "rejected",
+        admin_reviewed: true,
+        framer_sync_status: null,
+        framer_sync_error: null,
+        updated_at: now,
+      }
+    } else if (cleanAction === "ban") {
+      updatePayload = {
+        is_banned: true,
+        admin_reviewed: true,
+        ban_reason: String(reason || "Temporarily banned by admin."),
+        framer_sync_status: null,
+        framer_sync_error: null,
+        updated_at: now,
+      }
+    } else {
+      updatePayload = {
         is_banned: false,
         ban_reason: null,
         status: "approved",
-        framer_sync_status: "not_synced",
+        framer_sync_status: null,
         framer_sync_error: null,
-        updated_at: new Date().toISOString(),
-      })
+        updated_at: now,
+      }
+    }
+
+    const { data: updated, error: updateError } = await supabaseAdmin
+      .from("channel_listings")
+      .update(updatePayload)
       .eq("id", listing_id)
+      .select("id, status, is_banned, short_invite")
+      .single()
 
-    if (unbanError) throw unbanError
-
-    const framer = await queueFramerSync(() =>
-      syncListingToFramerCMS(listing_id, {
-        skipTelegramSync: true,
-        publish: true,
-      })
-    )
+    if (updateError) throw updateError
 
     return res.json({
       ok: true,
       action: cleanAction,
       listing_id,
-      framer,
+      direct_from_supabase: true,
+      listing: updated,
+      url:
+        updated.status === "approved" && !updated.is_banned && updated.short_invite
+          ? `https://telehub.to/channel/${updated.short_invite}`
+          : null,
     })
   } catch (err) {
     console.error("Admin listing lifecycle error:", err)
@@ -9086,12 +9045,7 @@ async function importSingleTelegramListing(
     last_metadata_scraped_at: now,
     scrape_source: profileSource,
     scrape_failure_count: 0,
-    framer_sync_status:
-      options.deferFramerBatch === true
-        ? "pending_batch"
-        : options.syncToFramer
-          ? "not_synced"
-          : null,
+    framer_sync_status: null,
   }
 
   const { data: inserted, error: insertError } = await supabaseAdmin
@@ -9190,44 +9144,16 @@ async function importSingleTelegramListing(
     if (imageUpdateError) throw imageUpdateError
   }
 
-  let framerResult = null
-  let framerError = null
+  // No CMS publication is required. Next.js reads the approved Supabase row.
+  const framerResult = null
+  const framerError = null
 
-  if (options.syncToFramer) {
-    await onStage("framer_sync_started", {
-      listing_id: inserted.id,
-      short_invite: inserted.short_invite,
-    })
-
-    try {
-      framerResult = await queueFramerSync(() =>
-        syncListingToFramerCMS(inserted.id, {
-          publish: false,
-          skipTelegramSync: true,
-        })
-      )
-
-      await onStage("framer_synced", {
-        listing_id: inserted.id,
-        short_invite: inserted.short_invite,
-        framer_synced: Boolean(framerResult?.ok),
-        public_url: `https://telehub.to/channel/${inserted.short_invite}`,
-        icon_applied: Boolean(iconUrl),
-        background_applied: Boolean(backgroundResult.imageUrl),
-        background_source: backgroundResult.source,
-        background_error: backgroundResult.error || null,
-      })
-    } catch (err) {
-      framerError = err.message
-      console.error("Auto import Framer sync failed:", err.message)
-
-      await onStage("framer_sync_failed", {
-        listing_id: inserted.id,
-        short_invite: inserted.short_invite,
-        error: framerError,
-      })
-    }
-  }
+  await onStage("public_page_ready", {
+    listing_id: inserted.id,
+    short_invite: inserted.short_invite,
+    public_url: `https://telehub.to/channel/${inserted.short_invite}`,
+    direct_from_supabase: true,
+  })
 
   return {
     ok: true,
@@ -9366,7 +9292,7 @@ app.post("/api/admin/import-telegram-listings", async (req, res) => {
     ])
 
     const options = {
-      syncToFramer: req.body?.sync_to_framer !== false,
+      syncToFramer: false,
       backgroundMode: allowedBackgroundModes.has(requestedBackgroundMode)
         ? requestedBackgroundMode
         : "none",
@@ -9425,26 +9351,8 @@ app.post("/api/admin/import-telegram-listings", async (req, res) => {
       }
     }
 
-    // Each item was synced with publish:false. Publish/deploy exactly once
-    // after the entire import batch finishes.
-    let deployed = false
-
-    if (options.syncToFramer && process.env.FRAMER_AUTO_DEPLOY !== "false") {
-      const createdNeedingDeploy = results.some((item) => item.created && item.framer_synced)
-
-      if (createdNeedingDeploy) {
-        const { connect } = await import("framer-api")
-        const framer = await connect(process.env.FRAMER_PROJECT_URL, process.env.FRAMER_API_KEY)
-
-        try {
-          const publication = await framer.publish()
-          await framer.deploy(publication.deployment.id)
-          deployed = true
-        } finally {
-          await framer.disconnect()
-        }
-      }
-    }
+    // Public listing pages are already live from Supabase.
+    const deployed = false
 
     let homepageCache = null
 
@@ -9473,8 +9381,9 @@ app.post("/api/admin/import-telegram-listings", async (req, res) => {
       created: results.filter((item) => item.created).length,
       duplicates: results.filter((item) => item.skipped).length,
       failed: results.filter((item) => item.ok === false).length,
-      framer_synced: results.filter((item) => item.framer_synced).length,
-      deployed,
+      framer_synced: 0,
+      deployed: false,
+      direct_from_supabase: true,
     }
 
     const responsePayload = {
@@ -9648,7 +9557,7 @@ function continuousAutomationSettings(state) {
     )
       ? String(raw.background_mode || "related")
       : "related",
-    sync_to_framer: raw.sync_to_framer !== false,
+    sync_to_framer: false,
     analyze_recent_posts: raw.analyze_recent_posts !== false,
     recent_post_limit: Math.max(
       1,
@@ -12332,12 +12241,12 @@ async function processContinuousAutomationQueue(
 
       try {
         // AI + Telegram enrichment + Supabase happen immediately.
-        // Framer is deliberately deferred until the 20-listing batch is ready.
+        // The Next.js public page reads the approved row directly.
         const result = await importSingleTelegramListing(
           item.telegram_link,
           {
             syncToFramer: false,
-            deferFramerBatch: true,
+            deferFramerBatch: false,
             backgroundMode: settings.background_mode,
             analyzeRecentPosts: settings.analyze_recent_posts,
             recentPostLimit: settings.recent_post_limit,
@@ -12367,14 +12276,15 @@ async function processContinuousAutomationQueue(
         totalProcessed += 1
         if (result?.created) totalCreated += 1
 
-        // The listing is already persisted in Supabase. Keep its queue record
-        // complete, but make clear that Framer is waiting for the batch.
+        // The listing is already persisted in Supabase and its public page is ready.
         const resultForQueue = result?.created
           ? {
               ...result,
               framer_synced: false,
               framer_error: null,
-              framer_batch_pending: settings.sync_to_framer,
+              framer_batch_pending: false,
+              direct_from_supabase: true,
+              public_page_ready: true,
             }
           : result
 
@@ -12503,7 +12413,7 @@ async function createContinuousAutomationRun(state) {
       requested_target: settings.target_per_cycle,
       country_id: "global",
       sort: "graph",
-      sync_to_framer: settings.sync_to_framer,
+      sync_to_framer: false,
       use_icon_as_background: settings.background_mode === "icon",
       created_by: state.created_by,
       discovery_stop_requested: false,
