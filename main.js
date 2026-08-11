@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 })
 
 const BACKEND_BUILD_ID =
-  "telehub-homepage-precomputed-cache-2026-08-11"
+  "telehub-server-directory-pagination-2026-08-11"
 
 app.get("/", (req, res) => {
   res.status(200).json({
@@ -4472,6 +4472,17 @@ app.get("/api/cron/daily-full-sync", async (req, res) => {
       (item) => item.full_sync
     )
 
+    let directoryRanking = null
+
+    try {
+      directoryRanking = await rebuildDirectoryRankings()
+    } catch (rankingErr) {
+      console.error(
+        "Directory ranking rebuild after daily member sync failed:",
+        rankingErr
+      )
+    }
+
     let homepageCache = null
 
     try {
@@ -4500,6 +4511,7 @@ app.get("/api/cron/daily-full-sync", async (req, res) => {
       },
       framer: framerResult,
       duration_ms: Date.now() - startedAt,
+      directory_ranking: directoryRanking,
       homepage_cache: homepageCache
         ? {
             updated_at: homepageCache.updated_at,
@@ -4721,6 +4733,66 @@ app.get("/api/referrals/track", async (req, res) => {
 // ========================================
 // RANKING ALGORITHM
 // ========================================
+
+const DIRECTORY_PAGE_MAX_SIZE = 36
+
+async function rebuildDirectoryRankings() {
+  const startedAt = Date.now()
+
+  const { data: rankedCount, error: rankingError } = await supabaseAdmin.rpc(
+    "telehub_rebuild_directory_rankings"
+  )
+
+  if (rankingError) {
+    const error = new Error(
+      `Directory ranking rebuild failed. Run 01-Supabase-Directory-Speed-Migration.sql first if the RPC is missing. ${rankingError.message}`
+    )
+    error.cause = rankingError
+    throw error
+  }
+
+  const { data: metadataCount, error: metadataError } = await supabaseAdmin.rpc(
+    "telehub_rebuild_directory_metadata"
+  )
+
+  if (metadataError) {
+    const error = new Error(
+      `Directory metadata rebuild failed. ${metadataError.message}`
+    )
+    error.cause = metadataError
+    throw error
+  }
+
+  const result = {
+    ranked_listings: Number(rankedCount || 0),
+    metadata_rows: Number(metadataCount || 0),
+    completed_at: new Date().toISOString(),
+    duration_ms: Date.now() - startedAt,
+  }
+
+  console.log("[directory ranking rebuilt]", result)
+  return result
+}
+
+function normalizeDirectoryType(value) {
+  const clean = String(value || "all").toLowerCase()
+  return clean === "channel" || clean === "group" ? clean : "all"
+}
+
+function normalizeDirectorySort(value) {
+  const clean = String(value || "Top").toLowerCase()
+  if (clean === "members") return "Members"
+  if (clean === "active") return "Active"
+  return "Top"
+}
+
+function cleanDirectorySearch(value) {
+  return String(value || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 120)
+}
+
 
 const RANKING_WEIGHTS = {
   votes: 0.35,
@@ -7649,6 +7721,174 @@ async function fetchMemberSnapshotsInBatches(listingIds, since) {
 
   return allSnapshots
 }
+
+app.get("/api/directory", async (req, res) => {
+  try {
+    const type = normalizeDirectoryType(req.query.type)
+    const query = cleanDirectorySearch(req.query.q)
+    const category = String(req.query.category || "All").trim().slice(0, 80) || "All"
+    const sort = normalizeDirectorySort(req.query.sort)
+    const showNsfw =
+      String(req.query.nsfw || "") === "1" ||
+      String(req.query.nsfw || "").toLowerCase() === "true"
+
+    const pageSize = Math.max(
+      1,
+      Math.min(
+        Number.parseInt(req.query.page_size, 10) || 18,
+        DIRECTORY_PAGE_MAX_SIZE
+      )
+    )
+
+    const page = Math.max(
+      1,
+      Number.parseInt(req.query.page, 10) || 1
+    )
+
+    // The TeleHub sponsor CTA occupies the first slot on page 1.
+    // This preserves the component's current pagination exactly:
+    // desktop page 1 = sponsor + 17 listings, page 2+ = 18 listings.
+    const sponsorSlots = 1
+    const listingLimit =
+      page === 1 ? Math.max(1, pageSize - sponsorSlots) : pageSize
+    const listingOffset =
+      page === 1
+        ? 0
+        : Math.max(0, (page - 1) * pageSize - sponsorSlots)
+
+    const [pageResult, metadataResult] = await Promise.all([
+      supabaseAdmin.rpc("telehub_directory_page", {
+        p_type: type,
+        p_query: query,
+        p_category: category,
+        p_sort: sort,
+        p_show_nsfw: showNsfw,
+        p_limit: listingLimit,
+        p_offset: listingOffset,
+      }),
+      supabaseAdmin
+        .from("directory_metadata_cache")
+        .select("categories, total_count, updated_at")
+        .eq("id", type)
+        .maybeSingle(),
+    ])
+
+    if (pageResult.error) {
+      throw new Error(
+        `Directory query failed. Make sure 01-Supabase-Directory-Speed-Migration.sql has been run. ${pageResult.error.message}`
+      )
+    }
+
+    if (metadataResult.error) {
+      console.warn("Directory metadata cache read failed:", metadataResult.error.message)
+    }
+
+    const payload =
+      pageResult.data && typeof pageResult.data === "object"
+        ? pageResult.data
+        : {}
+
+    const listings = Array.isArray(payload.listings)
+      ? payload.listings
+      : []
+
+    const totalCount = Math.max(
+      0,
+      Number(payload.total_count || 0)
+    )
+
+    const totalPages = Math.max(
+      1,
+      Math.ceil((totalCount + sponsorSlots) / pageSize)
+    )
+
+    const categoryRows = Array.isArray(metadataResult.data?.categories)
+      ? metadataResult.data.categories
+      : []
+
+    const categories = categoryRows
+      .map((item) => String(item?.name || "").trim())
+      .filter(Boolean)
+
+    res.set(
+      "Cache-Control",
+      query
+        ? "public, max-age=15, s-maxage=60, stale-while-revalidate=300"
+        : "public, max-age=30, s-maxage=120, stale-while-revalidate=600"
+    )
+
+    return res.json({
+      ok: true,
+      listings,
+      total_count: totalCount,
+      total_pages: totalPages,
+      page,
+      page_size: pageSize,
+      listing_limit: listingLimit,
+      listing_offset: listingOffset,
+      has_next_page: page < totalPages,
+      has_previous_page: page > 1,
+      categories,
+      category_counts: categoryRows,
+      metadata_updated_at: metadataResult.data?.updated_at || null,
+      filters: {
+        type,
+        q: query,
+        category,
+        sort,
+        nsfw: showNsfw,
+      },
+    })
+  } catch (err) {
+    console.error("Directory endpoint error:", err)
+    return res.status(500).json({
+      ok: false,
+      error: err.message,
+      listings: [],
+      total_count: 0,
+      total_pages: 1,
+    })
+  }
+})
+
+app.get("/api/cron/rebuild-directory-rankings", async (req, res) => {
+  try {
+    if (req.query.secret !== process.env.CRON_SECRET) {
+      return res.status(401).json({ error: "Unauthorized" })
+    }
+
+    const result = await rebuildDirectoryRankings()
+
+    // Homepage top cards depend on the same underlying ranking inputs.
+    let homepageCache = null
+    try {
+      homepageCache = await updateHomepageListingCache({ force: true })
+    } catch (cacheError) {
+      console.warn(
+        "Homepage cache refresh after directory ranking rebuild failed:",
+        cacheError.message
+      )
+    }
+
+    return res.json({
+      ok: true,
+      ...result,
+      homepage_cache: homepageCache
+        ? {
+            updated_at: homepageCache.updated_at,
+            count: homepageCache.listings.length,
+          }
+        : null,
+    })
+  } catch (err) {
+    console.error("Directory ranking cron error:", err)
+    return res.status(500).json({
+      ok: false,
+      error: err.message,
+    })
+  }
+})
+
 
 app.get("/api/listings/ranked", async (req, res) => {
   try {
