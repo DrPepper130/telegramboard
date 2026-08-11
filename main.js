@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 })
 
 const BACKEND_BUILD_ID =
-  "telehub-server-directory-pagination-2026-08-11"
+  "telehub-admin-table-auth-2026-08-11"
 
 app.get("/", (req, res) => {
   res.status(200).json({
@@ -39,6 +39,33 @@ const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || "")
   .split(",")
   .map((email) => email.trim().toLowerCase())
   .filter(Boolean)
+
+
+async function isUserAdmin(user) {
+  if (!user?.id) return false
+
+  const email = String(user.email || "").toLowerCase()
+
+  // Preserve environment-variable admins for backward compatibility.
+  if (email && ADMIN_EMAILS.includes(email)) return true
+
+  // Primary source of truth: public.admins table keyed by Supabase auth user_id.
+  const { data, error } = await supabaseAdmin
+    .from("admins")
+    .select("user_id")
+    .eq("user_id", user.id)
+    .maybeSingle()
+
+  if (error) {
+    console.error("Admin table lookup failed:", {
+      user_id: user.id,
+      error: error.message,
+    })
+    return false
+  }
+
+  return Boolean(data?.user_id)
+}
 
 
 // ========================================
@@ -2239,8 +2266,7 @@ app.post("/api/auth/is-admin", async (req, res) => {
       return res.status(401).json({ isAdmin: false })
     }
 
-    const email = (user.email || "").toLowerCase()
-    const isAdmin = ADMIN_EMAILS.includes(email)
+    const isAdmin = await isUserAdmin(user)
 
     return res.json({ isAdmin })
   } catch (err) {
@@ -2293,8 +2319,7 @@ app.post("/api/listings/vote", async (req, res) => {
       return res.status(404).json({ error: "Listing not found or unavailable." })
     }
 
-    const email = String(user.email || "").toLowerCase()
-    const isAdmin = ADMIN_EMAILS.includes(email)
+    const isAdmin = await isUserAdmin(user)
 
     if (!isAdmin) {
       const cutoff = new Date(
@@ -3929,8 +3954,7 @@ app.post("/api/framer/sync-listing", async (req, res) => {
       return res.status(404).json({ error: "Listing not found." })
     }
 
-    const email = (user.email || "").toLowerCase()
-    const isAdmin = ADMIN_EMAILS.includes(email)
+    const isAdmin = await isUserAdmin(user)
 
     if (listing.user_id !== user.id && !isAdmin) {
       return res.status(403).json({ error: "You do not own this listing." })
@@ -3989,8 +4013,7 @@ app.post("/api/framer/sync-content-change", async (req, res) => {
       return res.status(404).json({ error: "Listing not found." })
     }
 
-    const email = (user.email || "").toLowerCase()
-    const isAdmin = ADMIN_EMAILS.includes(email)
+    const isAdmin = await isUserAdmin(user)
 
     if (listing.user_id !== user.id && !isAdmin) {
       return res.status(403).json({ error: "You do not own this listing." })
@@ -4208,8 +4231,8 @@ app.post("/api/admin/listings/lifecycle", async (req, res) => {
       return res.status(401).json({ error: "Invalid auth token." })
     }
 
-    const email = (user.email || "").toLowerCase()
-    if (!ADMIN_EMAILS.includes(email)) {
+    const isAdmin = await isUserAdmin(user)
+    if (!isAdmin) {
       return res.status(403).json({ error: "Admin access required." })
     }
 
@@ -4313,8 +4336,7 @@ app.post("/api/listings/delete", async (req, res) => {
       return res.status(404).json({ error: "Listing not found." })
     }
 
-    const email = (user.email || "").toLowerCase()
-    const isAdmin = ADMIN_EMAILS.includes(email)
+    const isAdmin = await isUserAdmin(user)
 
     if (listing.user_id !== user.id && !isAdmin) {
       return res.status(403).json({ error: "You do not own this listing." })
@@ -4363,8 +4385,7 @@ app.post("/api/framer/delete-listing", async (req, res) => {
       return res.status(404).json({ error: "Listing not found." })
     }
 
-    const email = (user.email || "").toLowerCase()
-    const isAdmin = ADMIN_EMAILS.includes(email)
+    const isAdmin = await isUserAdmin(user)
 
     if (listing.user_id !== user.id && !isAdmin) {
       return res.status(403).json({ error: "You do not own this listing." })
@@ -7475,8 +7496,7 @@ app.post("/api/admin/test-telegram-scrape", async (req, res) => {
         data: { user },
       } = await supabaseAdmin.auth.getUser(bearerToken)
 
-      const email = String(user?.email || "").toLowerCase()
-      authorized = Boolean(user && ADMIN_EMAILS.includes(email))
+      authorized = Boolean(user && (await isUserAdmin(user)))
     }
 
     if (!authorized) {
@@ -7584,8 +7604,7 @@ app.post("/api/listings/refresh-telegram-info", async (req, res) => {
       return res.status(404).json({ error: "Listing not found." })
     }
 
-    const email = String(user.email || "").toLowerCase()
-    const isAdmin = ADMIN_EMAILS.includes(email)
+    const isAdmin = await isUserAdmin(user)
 
     if (listing.user_id !== user.id && !isAdmin) {
       return res.status(403).json({ error: "You do not own this listing." })
