@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 })
 
 const BACKEND_BUILD_ID =
-  "telehub-admin-table-auth-2026-08-11"
+  "telehub-structured-growth-feedback-2026-08-12"
 
 app.get("/", (req, res) => {
   res.status(200).json({
@@ -13840,6 +13840,8 @@ function feedbackClientIp(req) {
 app.post("/api/feedback/growth-challenge", async (req, res) => {
   try {
     const responseText = cleanFeedbackText(req.body?.response, 2000)
+    const choice = cleanFeedbackText(req.body?.choice, 120)
+    const explanation = cleanFeedbackText(req.body?.explanation, 2000)
     const prompt = cleanFeedbackText(req.body?.prompt, 500)
     const source = cleanFeedbackText(
       req.body?.source || "growth-challenge-popup",
@@ -13871,6 +13873,8 @@ app.post("/api/feedback/growth-challenge", async (req, res) => {
       .from("growth_challenge_responses")
       .insert({
         response: responseText,
+        choice: choice || null,
+        explanation: explanation || null,
         prompt: prompt || null,
         source,
         page_url: pageUrl || null,
@@ -13913,7 +13917,7 @@ app.get("/api/admin/feedback/growth-challenges", async (req, res) => {
     const { data, error } = await supabaseAdmin
       .from("growth_challenge_responses")
       .select(
-        "id, response, prompt, source, page_url, referrer, visitor_id, created_at"
+        "id, response, choice, explanation, prompt, source, page_url, referrer, visitor_id, created_at"
       )
       .order("created_at", { ascending: false })
       .limit(limit)
