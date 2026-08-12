@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 })
 
 const BACKEND_BUILD_ID =
-  "telehub-structured-growth-feedback-2026-08-12"
+  "telehub-duplicate-listing-owner-claim-2026-08-12"
 
 app.get("/", (req, res) => {
   res.status(200).json({
@@ -6498,6 +6498,312 @@ async function inspectDestinationChat(chatId) {
     bot_permissions: serializeBotPermissions(botMember),
   }
 }
+
+
+function normalizeClaimTelegramUsername(value) {
+  const username = extractUsernameFromLink(String(value || "").trim())
+  const clean = String(username || "").replace(/^@/, "").trim().toLowerCase()
+  return /^[a-z0-9_]{3,}$/.test(clean) ? clean : ""
+}
+
+async function findExistingClaimListing(telegramLink) {
+  const cleanUsername = normalizeClaimTelegramUsername(telegramLink)
+  if (!cleanUsername) return null
+
+  const atUsername = `@${cleanUsername}`
+  const canonicalLink = `https://t.me/${cleanUsername}`
+
+  const { data, error } = await supabaseAdmin
+    .from("channel_listings")
+    .select(
+      "id, user_id, listing_type, channel_name, telegram_link, telegram_username, telegram_chat_id, short_invite, status, is_banned, categories, image_url, description, long_description, is_nsfw"
+    )
+    .or(
+      `telegram_username.ilike.${atUsername},telegram_username.ilike.${cleanUsername},telegram_link.ilike.${canonicalLink}`
+    )
+    .order("created_at", { ascending: true })
+    .limit(1)
+    .maybeSingle()
+
+  if (error) throw error
+  return data || null
+}
+
+function publicClaimListing(listing) {
+  return {
+    id: listing.id,
+    channel_name: listing.channel_name || "Telegram listing",
+    listing_type: listing.listing_type || "channel",
+    short_invite: listing.short_invite || "",
+    public_url: listing.short_invite
+      ? `/channel/${encodeURIComponent(listing.short_invite)}`
+      : "",
+  }
+}
+
+function optionalBotPermissionsStillEnabled(permissions) {
+  if (!permissions || typeof permissions !== "object") return []
+  return Object.entries(permissions)
+    .filter(([key, value]) => key !== "can_manage_chat" && value === true)
+    .map(([key]) => key)
+}
+
+app.post("/api/listings/claim/check", async (req, res) => {
+  try {
+    const user = await requireTelehubUser(req)
+    const telegramLink = String(req.body?.telegram_link || "").trim()
+
+    if (!normalizeClaimTelegramUsername(telegramLink)) {
+      return res.status(400).json({
+        error: "Enter a valid public Telegram @username or t.me link.",
+      })
+    }
+
+    const listing = await findExistingClaimListing(telegramLink)
+
+    // No duplicate = never reveal or mention the ownership bot.
+    if (!listing) {
+      return res.json({ ok: true, existing: false })
+    }
+
+    if (listing.is_banned) {
+      return res.status(409).json({
+        ok: false,
+        existing: true,
+        claimable: false,
+        error: "This Telegram listing is currently unavailable on TeleHub.",
+      })
+    }
+
+    if (listing.user_id && listing.user_id !== user.id) {
+      return res.status(409).json({
+        ok: false,
+        existing: true,
+        claimable: false,
+        error: "This Telegram listing has already been claimed by another TeleHub account.",
+      })
+    }
+
+    if (listing.user_id === user.id) {
+      return res.json({
+        ok: true,
+        existing: true,
+        already_owned: true,
+        claimable: false,
+        listing: publicClaimListing(listing),
+      })
+    }
+
+    const bot = await getTelegramBotIdentity()
+
+    return res.json({
+      ok: true,
+      existing: true,
+      claimable: true,
+      ownership_verification_required: true,
+      listing: publicClaimListing(listing),
+      bot: {
+        username: bot?.username || "teleg_sync_bot",
+        display_name: bot?.first_name || "TeleHub bot",
+      },
+    })
+  } catch (err) {
+    console.error("Listing claim check error:", err)
+    return res.status(err.statusCode || 500).json({
+      ok: false,
+      error: err.message || "Could not check listing ownership.",
+    })
+  }
+})
+
+app.post("/api/listings/claim/verify", async (req, res) => {
+  try {
+    const user = await requireTelehubUser(req)
+    const listingId = String(req.body?.listing_id || "").trim()
+    const telegramLink = String(req.body?.telegram_link || "").trim()
+    const updates =
+      req.body?.updates && typeof req.body.updates === "object"
+        ? req.body.updates
+        : {}
+
+    if (!listingId) return res.status(400).json({ error: "Missing listing ID." })
+
+    const expectedUsername = normalizeClaimTelegramUsername(telegramLink)
+    if (!expectedUsername) {
+      return res.status(400).json({
+        error: "Enter a valid public Telegram @username or t.me link.",
+      })
+    }
+
+    const { data: listing, error: listingError } = await supabaseAdmin
+      .from("channel_listings")
+      .select("*")
+      .eq("id", listingId)
+      .single()
+
+    if (listingError || !listing) {
+      return res.status(404).json({
+        error: "The existing TeleHub listing could not be found.",
+      })
+    }
+
+    const storedUsername = normalizeClaimTelegramUsername(
+      listing.telegram_link || listing.telegram_username || ""
+    )
+
+    if (!storedUsername || storedUsername !== expectedUsername) {
+      return res.status(409).json({
+        error: "The Telegram link no longer matches the existing TeleHub listing.",
+      })
+    }
+
+    if (listing.user_id && listing.user_id !== user.id) {
+      return res.status(409).json({
+        error: "This Telegram listing has already been claimed by another TeleHub account.",
+      })
+    }
+
+    const verificationTarget =
+      listing.telegram_chat_id ||
+      listing.telegram_username ||
+      `@${expectedUsername}`
+
+    let inspection
+    try {
+      inspection = await inspectDestinationChat(verificationTarget)
+    } catch (verificationError) {
+      const bot = await getTelegramBotIdentity().catch(() => null)
+      const botUsername = bot?.username || "teleg_sync_bot"
+      return res.status(409).json({
+        ok: false,
+        verified: false,
+        code: "BOT_NOT_ADDED",
+        error:
+          `We could not verify ownership yet. Add @${botUsername} as an administrator ` +
+          "of this Telegram channel/group, turn off every optional permission, then try Verify again.",
+      })
+    }
+
+    const inspectedUsername = String(inspection.chat?.username || "")
+      .replace(/^@/, "")
+      .trim()
+      .toLowerCase()
+
+    if (!inspectedUsername || inspectedUsername !== expectedUsername) {
+      return res.status(409).json({
+        ok: false,
+        verified: false,
+        error: "The bot was added to a different Telegram community than the listing you are claiming.",
+      })
+    }
+
+    const enabledPermissions = optionalBotPermissionsStillEnabled(
+      inspection.bot_permissions
+    )
+
+    if (enabledPermissions.length) {
+      return res.status(409).json({
+        ok: false,
+        verified: false,
+        code: "BOT_PERMISSIONS_ENABLED",
+        enabled_permissions: enabledPermissions,
+        error:
+          "The TeleHub bot is present, but optional admin permissions are still enabled. " +
+          "Turn every optional permission off in Telegram, then verify again.",
+      })
+    }
+
+    const detectedType =
+      inspection.chat_type === "supergroup" ? "group" : "channel"
+
+    const cleanCategories = Array.isArray(updates.categories)
+      ? updates.categories
+          .map((value) => String(value || "").trim())
+          .filter(Boolean)
+          .slice(0, 5)
+      : listing.categories || []
+
+    const updatePayload = {
+      user_id: user.id,
+      listing_type: detectedType,
+      channel_name:
+        String(updates.channel_name || listing.channel_name || "")
+          .trim()
+          .slice(0, 180) || listing.channel_name,
+      telegram_link: `https://t.me/${expectedUsername}`,
+      telegram_username: `@${expectedUsername}`,
+      telegram_chat_id: String(inspection.chat.id),
+      description: String(
+        updates.description || listing.description || ""
+      )
+        .trim()
+        .slice(0, 2000),
+      long_description: String(
+        updates.long_description || listing.long_description || ""
+      )
+        .trim()
+        .slice(0, 12000),
+      categories: cleanCategories,
+      is_nsfw:
+        typeof updates.is_nsfw === "boolean"
+          ? updates.is_nsfw
+          : Boolean(listing.is_nsfw),
+      image_url:
+        String(updates.image_url || "").trim() || listing.image_url || null,
+      status: "approved",
+      admin_reviewed: false,
+      updated_at: new Date().toISOString(),
+      last_synced_at: new Date().toISOString(),
+    }
+
+    const { data: claimedListing, error: updateError } = await supabaseAdmin
+      .from("channel_listings")
+      .update(updatePayload)
+      .eq("id", listing.id)
+      .is("user_id", null)
+      .select("id, short_invite, channel_name, listing_type, user_id")
+      .maybeSingle()
+
+    if (updateError) throw updateError
+
+    let finalListing = claimedListing
+    if (!finalListing) {
+      const { data: latest } = await supabaseAdmin
+        .from("channel_listings")
+        .select("id, short_invite, channel_name, listing_type, user_id")
+        .eq("id", listing.id)
+        .maybeSingle()
+
+      if (!latest || latest.user_id !== user.id) {
+        return res.status(409).json({
+          error: "This listing was claimed by another account before verification completed.",
+        })
+      }
+      finalListing = latest
+    }
+
+    console.log("[listing ownership claimed]", {
+      listing_id: finalListing.id,
+      user_id: user.id,
+      telegram_username: expectedUsername,
+    })
+
+    return res.json({
+      ok: true,
+      verified: true,
+      claimed: true,
+      listing: publicClaimListing(finalListing),
+      message:
+        "Ownership verified. Your customization is now applied to the existing TeleHub listing.",
+    })
+  } catch (err) {
+    console.error("Listing claim verification error:", err)
+    return res.status(err.statusCode || 500).json({
+      ok: false,
+      error: err.message || "Could not verify listing ownership.",
+    })
+  }
+})
 
 function buildMtTemplatePreview(source, destinationInspection) {
   const destination = destinationInspection.chat
