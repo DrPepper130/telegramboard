@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 })
 
 const BACKEND_BUILD_ID =
-  "telehub-duplicate-listing-owner-claim-2026-08-12"
+  "telehub-duplicate-listing-owner-claim-relaxed-2026-08-12"
 
 app.get("/", (req, res) => {
   res.status(200).json({
@@ -6701,17 +6701,9 @@ app.post("/api/listings/claim/verify", async (req, res) => {
       inspection.bot_permissions
     )
 
-    if (enabledPermissions.length) {
-      return res.status(409).json({
-        ok: false,
-        verified: false,
-        code: "BOT_PERMISSIONS_ENABLED",
-        enabled_permissions: enabledPermissions,
-        error:
-          "The TeleHub bot is present, but optional admin permissions are still enabled. " +
-          "Turn every optional permission off in Telegram, then verify again.",
-      })
-    }
+    const permissionWarning = enabledPermissions.length
+      ? "Ownership verified. For security, you can now turn off all optional bot permissions or remove the bot entirely."
+      : ""
 
     const detectedType =
       inspection.chat_type === "supergroup" ? "group" : "channel"
@@ -6793,7 +6785,10 @@ app.post("/api/listings/claim/verify", async (req, res) => {
       verified: true,
       claimed: true,
       listing: publicClaimListing(finalListing),
+      warning: permissionWarning || null,
+      enabled_permissions: enabledPermissions,
       message:
+        permissionWarning ||
         "Ownership verified. Your customization is now applied to the existing TeleHub listing.",
     })
   } catch (err) {
