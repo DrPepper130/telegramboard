@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 })
 
 const BACKEND_BUILD_ID =
-  "telehub-user-ai-listing-draft-2026-08-12"
+  "telehub-ai-formatted-long-desc-everywhere-2026-08-12"
 
 app.get("/", (req, res) => {
   res.status(200).json({
@@ -9168,15 +9168,31 @@ Do not force the description to use all available words. Empty descriptions are 
 
 LONG DESCRIPTION
 
-long_description should usually be 80 to 220 words in 1 to 4 short paragraphs.
+The long_description is the richer listing-page copy. It must be between 400 and 2000 CHARACTERS, not words. Aim for about 650-1200 characters when the source contains enough useful detail.
 
-It should explain:
-- the main topic
-- what users may reasonably expect
-- the likely audience
-- why the listing may be useful or entertaining
+Make it visually interesting and easy to scan, closer to a well-written Telegram/Discord directory description than a polished essay. Do not default to 3-4 formal paragraphs.
 
-Vary paragraph count and opening structure. Do not repeat the short description verbatim.
+Use varied combinations of:
+- a short opening hook or 1-2 sentence intro
+- blank lines between sections
+- feature lines beginning with symbols such as ➜, >, •, ✦, ★, ♡, or relevant emojis
+- short mini-sections such as "What you'll find:", "Why join:", "Inside:", "Highlights:", or "Other stuff:" when natural
+- compact lists of supported games, topics, activities, content, tools, or benefits
+- a short closing invitation when natural
+
+Formatting rules:
+- Preserve real line breaks in the JSON string.
+- Use 2-6 visually distinct blocks or groups when enough source material exists.
+- Lists should usually contain 3-8 supported items.
+- Do not use markdown headings with #. Plain-text labels are better.
+- Do not use the exact same arrows, section labels, or emoji pattern across every listing.
+- Keep it natural, slightly promotional, and owner-written.
+- Avoid corporate prose, SEO filler, generic summaries, and repetitive sentence structures.
+- Do not repeat the short description verbatim.
+
+Every specific feature in the long description must be source-supported. Never invent giveaways, discounts, staff, voice chat, events, prizes, official status, products, services, games, topics, or features.
+
+Before returning JSON, make sure long_description is at least 400 characters and no more than 2000 characters. If the source has limited detail, expand only with grounded explanation and organization rather than invented claims.
 
 CATEGORIES
 
@@ -9588,18 +9604,20 @@ async function importSingleTelegramListing(
     custom_prompt_characters: String(options?.customAiPrompt || "").trim().length,
   })
 
-  const aiContent = await generateAiImportContent({
-    title: telegramTitle,
-    username: telegramUsername,
-    telegramDescription,
-    memberCount,
-    listingType,
-    recentPosts: postContext.posts,
-    postContextSource: postContext.source,
-    analyzeRecentPosts,
-    recentPostLimit,
-    customAiPrompt: options?.customAiPrompt || "",
-  })
+  const aiContent = await generateUserAiDraftContent(
+    {
+      title: telegramTitle,
+      username: telegramUsername,
+      telegramDescription,
+      memberCount,
+      listingType,
+      recentPosts: postContext.posts,
+      postContextSource: postContext.source,
+      analyzeRecentPosts,
+      recentPostLimit,
+    },
+    options?.customAiPrompt || ""
+  )
 
   await onStage("ai_generated", {
     generated_name:
@@ -9822,10 +9840,11 @@ async function importSingleTelegramListing(
 // ========================================
 // USER AI LISTING DRAFT GENERATOR
 // ========================================
-// Lets a signed-in TeleHub user paste a public Telegram channel/group link and
-// reuse the same Telegram + recent-post + OpenAI enrichment pipeline as the
-// admin auto-adder. This endpoint ONLY returns a draft. It never inserts or
-// updates a listing in Supabase.
+// Lets a TeleHub visitor paste a public Telegram channel/group link and reuse
+// the same Telegram + recent-post + OpenAI enrichment pipeline as the admin
+// auto-adder. Authentication is optional so /welcome can generate the draft
+// before account creation. This endpoint ONLY returns a draft and never inserts
+// or updates a listing in Supabase.
 const USER_AI_DRAFT_MIN_INTERVAL_MS = Math.max(
   3000,
   Number(process.env.USER_AI_DRAFT_MIN_INTERVAL_MS || 8000)
@@ -9934,8 +9953,11 @@ Before returning JSON, count approximately by characters and ensure long_descrip
 `.trim()
 
 function buildUserAiDraftPrompt(basePrompt = "") {
-  const existing = String(basePrompt || "").trim()
-  if (!existing) return USER_AI_DRAFT_WRITING_PROMPT
+  const existing = String(basePrompt || "").trim().slice(0, 4200)
+  if (!existing) return USER_AI_DRAFT_WRITING_PROMPT.slice(0, 8000)
+
+  // Keep room for TeleHub's required long-description formatting rules so a
+  // large admin custom prompt cannot accidentally truncate them.
   return `${existing}\n\n${USER_AI_DRAFT_WRITING_PROMPT}`.slice(0, 8000)
 }
 
@@ -10006,22 +10028,38 @@ app.post("/api/listings/ai-draft", async (req, res) => {
     const authHeader = req.headers.authorization || ""
     const token = authHeader.replace("Bearer ", "").trim()
 
-    if (!token) {
-      return res.status(401).json({ error: "Log in before generating a listing." })
+    let user = null
+
+    if (token) {
+      const {
+        data: { user: authenticatedUser },
+        error: userError,
+      } = await supabaseAdmin.auth.getUser(token)
+
+      if (userError || !authenticatedUser) {
+        return res.status(401).json({
+          error: "Your session expired. Refresh the page and try again.",
+        })
+      }
+
+      user = authenticatedUser
     }
 
-    const {
-      data: { user },
-      error: userError,
-    } = await supabaseAdmin.auth.getUser(token)
-
-    if (userError || !user) {
-      return res.status(401).json({ error: "Your session expired. Log in again." })
-    }
+    // Anonymous generation is intentionally allowed for the /welcome funnel so
+    // visitors can see the completed listing before being asked to create an
+    // account. Use a stricter IP cooldown for anonymous requests to limit abuse.
+    const forwardedFor = String(req.headers["x-forwarded-for"] || "")
+      .split(",")[0]
+      .trim()
+    const clientIp = forwardedFor || req.ip || req.socket?.remoteAddress || "unknown"
+    const rateLimitKey = user?.id ? `user:${user.id}` : `ip:${clientIp}`
+    const minIntervalMs = user
+      ? USER_AI_DRAFT_MIN_INTERVAL_MS
+      : Math.max(USER_AI_DRAFT_MIN_INTERVAL_MS, 15000)
 
     const now = Date.now()
-    const previousRun = Number(userAiDraftLastRunAt.get(user.id) || 0)
-    const waitMs = USER_AI_DRAFT_MIN_INTERVAL_MS - (now - previousRun)
+    const previousRun = Number(userAiDraftLastRunAt.get(rateLimitKey) || 0)
+    const waitMs = minIntervalMs - (now - previousRun)
 
     if (waitMs > 0) {
       return res.status(429).json({
@@ -10039,7 +10077,7 @@ app.post("/api/listings/ai-draft", async (req, res) => {
       })
     }
 
-    userAiDraftLastRunAt.set(user.id, now)
+    userAiDraftLastRunAt.set(rateLimitKey, now)
 
     const publicListingInput = {
       telegram_username: username,
@@ -10183,6 +10221,7 @@ app.post("/api/listings/ai-draft", async (req, res) => {
         metadata_source: profileSource,
         profile_scrape_error: scrapeError?.message || null,
         used_current_auto_adder_settings: true,
+        authenticated: Boolean(user),
       },
     })
   } catch (error) {
