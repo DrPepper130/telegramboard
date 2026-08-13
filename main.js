@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 })
 
 const BACKEND_BUILD_ID =
-  "telehub-duplicate-listing-owner-claim-relaxed-2026-08-12"
+  "telehub-user-ai-listing-draft-2026-08-12"
 
 app.get("/", (req, res) => {
   res.status(200).json({
@@ -9816,6 +9816,254 @@ async function importSingleTelegramListing(
     framer_error: framerError,
   }
 }
+
+
+
+// ========================================
+// USER AI LISTING DRAFT GENERATOR
+// ========================================
+// Lets a signed-in TeleHub user paste a public Telegram channel/group link and
+// reuse the same Telegram + recent-post + OpenAI enrichment pipeline as the
+// admin auto-adder. This endpoint ONLY returns a draft. It never inserts or
+// updates a listing in Supabase.
+const USER_AI_DRAFT_MIN_INTERVAL_MS = Math.max(
+  3000,
+  Number(process.env.USER_AI_DRAFT_MIN_INTERVAL_MS || 8000)
+)
+const userAiDraftLastRunAt = new Map()
+
+async function getUserAiDraftSettings() {
+  try {
+    const state = await getContinuousAutomationState()
+    const settings = continuousAutomationSettings(state)
+
+    return {
+      analyzeRecentPosts: settings.analyze_recent_posts !== false,
+      recentPostLimit: Math.max(
+        1,
+        Math.min(Number(settings.recent_post_limit || 8), 20)
+      ),
+      postContextMaxCharacters: Math.max(
+        500,
+        Math.min(Number(settings.post_context_max_characters || 5000), 15000)
+      ),
+      customAiPrompt: String(settings.custom_ai_prompt || "")
+        .trim()
+        .slice(0, 8000),
+    }
+  } catch (error) {
+    console.warn(
+      "Could not load current auto-adder AI settings for user draft; using defaults:",
+      error.message
+    )
+
+    return {
+      analyzeRecentPosts: true,
+      recentPostLimit: 8,
+      postContextMaxCharacters: 5000,
+      customAiPrompt: "",
+    }
+  }
+}
+
+app.post("/api/listings/ai-draft", async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || ""
+    const token = authHeader.replace("Bearer ", "").trim()
+
+    if (!token) {
+      return res.status(401).json({ error: "Log in before generating a listing." })
+    }
+
+    const {
+      data: { user },
+      error: userError,
+    } = await supabaseAdmin.auth.getUser(token)
+
+    if (userError || !user) {
+      return res.status(401).json({ error: "Your session expired. Log in again." })
+    }
+
+    const now = Date.now()
+    const previousRun = Number(userAiDraftLastRunAt.get(user.id) || 0)
+    const waitMs = USER_AI_DRAFT_MIN_INTERVAL_MS - (now - previousRun)
+
+    if (waitMs > 0) {
+      return res.status(429).json({
+        error: `Please wait ${Math.ceil(waitMs / 1000)} seconds before generating again.`,
+        retry_after_seconds: Math.ceil(waitMs / 1000),
+      })
+    }
+
+    const telegramLink = cleanImportTelegramLink(req.body?.telegram_link || "")
+    const username = extractUsernameFromLink(telegramLink)
+
+    if (!telegramLink || !username) {
+      return res.status(400).json({
+        error: "Enter a public Telegram @username or t.me channel/group link.",
+      })
+    }
+
+    userAiDraftLastRunAt.set(user.id, now)
+
+    const publicListingInput = {
+      telegram_username: username,
+      telegram_link: telegramLink,
+    }
+
+    let scraped = null
+    let chat = null
+    let profileSource = null
+    let scrapeError = null
+
+    try {
+      scraped = await fetchPublicTelegramPage(publicListingInput)
+      profileSource = scraped.source
+    } catch (error) {
+      scrapeError = error
+      console.warn("User AI draft public profile scrape failed; trying Bot API:", {
+        link: telegramLink,
+        code: error.code,
+        error: error.message,
+      })
+
+      chat = await tg("getChat", { chat_id: username })
+      profileSource = "telegram_bot_api_fallback"
+    }
+
+    const listingType = scraped
+      ? scraped.listingType
+      : normalizeTelegramType(chat?.type)
+
+    if (!listingType) {
+      return res.status(400).json({
+        error: "We could not detect whether this Telegram link is a group or channel.",
+      })
+    }
+
+    const telegramUsername = scraped
+      ? scraped.telegramUsername
+      : cleanUsername(chat?.username) || username
+
+    const normalizedTelegramLink = scraped
+      ? scraped.telegramLink
+      : chat?.username
+        ? `https://t.me/${chat.username}`
+        : telegramLink
+
+    const telegramTitle =
+      scraped?.title ||
+      chat?.title ||
+      stripTelegramHandle(telegramUsername) ||
+      "Telegram Listing"
+
+    const telegramDescription =
+      scraped?.description || chat?.description || chat?.bio || ""
+
+    const memberCount = scraped
+      ? Number(scraped.memberCount || 0)
+      : await tg("getChatMemberCount", { chat_id: chat.id })
+
+    const settings = await getUserAiDraftSettings()
+
+    let postContext = {
+      posts: [],
+      postCount: 0,
+      contextText: "",
+      imageUrls: [],
+      imageCount: 0,
+      source: null,
+    }
+    let postContextError = null
+
+    if (settings.analyzeRecentPosts) {
+      try {
+        postContext = await fetchPublicTelegramPostContext(publicListingInput, {
+          maxPosts: settings.recentPostLimit,
+          maxCharacters: settings.postContextMaxCharacters,
+        })
+      } catch (error) {
+        postContextError = error
+        console.warn("User AI draft recent-post scrape failed:", {
+          link: normalizedTelegramLink,
+          code: error.code,
+          error: error.message,
+        })
+      }
+    }
+
+    const aiContent = await generateAiImportContent({
+      title: telegramTitle,
+      username: telegramUsername,
+      telegramDescription,
+      memberCount,
+      listingType,
+      recentPosts: postContext.posts,
+      postContextSource: postContext.source,
+      analyzeRecentPosts: settings.analyzeRecentPosts,
+      recentPostLimit: settings.recentPostLimit,
+      customAiPrompt: settings.customAiPrompt,
+    })
+
+    const shortInviteBase =
+      stripTelegramHandle(telegramUsername) || telegramTitle || "telegram-listing"
+    const suggestedShortInvite = slugifyImportValue(shortInviteBase).slice(0, 24)
+
+    // Return a draft only. The normal Add Channel submit/claim flow remains the
+    // only code path that can create or claim a user-owned listing.
+    return res.json({
+      ok: true,
+      draft: {
+        channel_name:
+          aiContent.display_name ||
+          telegramTitle ||
+          stripTelegramHandle(telegramUsername) ||
+          "Telegram Listing",
+        description: aiContent.description || "",
+        long_description: aiContent.long_description || "",
+        categories: Array.isArray(aiContent.categories)
+          ? aiContent.categories.slice(0, 5)
+          : [],
+        is_nsfw: aiContent.is_nsfw === true,
+      },
+      suggested_short_invite: suggestedShortInvite,
+      telegram: {
+        title: telegramTitle,
+        username: telegramUsername,
+        description: telegramDescription,
+        member_count: memberCount,
+        listing_type: listingType,
+        telegram_link: normalizedTelegramLink,
+        icon_url: scraped?.iconUrl || null,
+      },
+      generation: {
+        ai_used: aiContent.ai_used === true,
+        ai_error: aiContent.ai_error || null,
+        creative_profile: aiContent.creative_profile || null,
+        public_posts_found: Number(postContext.postCount || 0),
+        post_context_source: postContext.source || null,
+        post_context_error: postContextError?.message || null,
+        metadata_source: profileSource,
+        profile_scrape_error: scrapeError?.message || null,
+        used_current_auto_adder_settings: true,
+      },
+    })
+  } catch (error) {
+    console.error("User AI listing draft error:", error)
+
+    if (error?.code === "TELEGRAM_RATE_LIMITED") {
+      return res.status(429).json({
+        error: error.message || "Telegram is temporarily rate-limiting requests.",
+        code: "TELEGRAM_RATE_LIMITED",
+        retry_after_seconds: Number(error.retry_after_seconds || 0),
+      })
+    }
+
+    return res.status(500).json({
+      error: error.message || "Could not generate the listing draft.",
+    })
+  }
+})
 
 async function markManualImportQueueItemComplete(originalLink, result) {
   const cleanedOriginal = cleanImportTelegramLink(originalLink)
