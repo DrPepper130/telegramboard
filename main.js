@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 })
 
 const BACKEND_BUILD_ID =
-  "telehub-admin-language-filter-toggle-2026-08-13"
+  "telehub-paid-rank-instant-homepage-refresh-2026-08-13"
 
 app.get("/", (req, res) => {
   res.status(200).json({
@@ -106,6 +106,27 @@ app.get("/api/stats/online", async (req, res) => {
 
 
 
+function refreshHomepageAfterPaidRankChange(context = {}) {
+  // Paid placement should become visible on the homepage immediately instead
+  // of waiting for the normal 24-hour ranking snapshot refresh.
+  updateHomepageListingCache({ force: true })
+    .then((result) => {
+      console.log("Homepage cache refreshed after paid-rank change:", {
+        ...context,
+        count: Array.isArray(result?.listings) ? result.listings.length : null,
+        updated_at: result?.updated_at || null,
+      })
+    })
+    .catch((error) => {
+      // Never fail a valid Stripe webhook just because the homepage cache
+      // refresh had a separate problem.
+      console.error("Homepage cache refresh after paid-rank change failed:", {
+        ...context,
+        error: error?.message || String(error),
+      })
+    })
+}
+
 app.post(
   "/api/stripe/webhook",
   express.raw({ type: "application/json" }),
@@ -156,6 +177,14 @@ app.post(
             })
             .eq("id", listingId)
             .eq("user_id", userId)
+
+          refreshHomepageAfterPaidRankChange({
+            event: event.type,
+            listing_id: listingId,
+            user_id: userId,
+            rank,
+            subscription_status: subscription.status,
+          })
         }
       }
 
@@ -189,6 +218,14 @@ app.post(
             })
             .eq("id", listingId)
             .eq("user_id", userId)
+
+          refreshHomepageAfterPaidRankChange({
+            event: event.type,
+            listing_id: listingId,
+            user_id: userId,
+            rank: isActive ? rank : "free",
+            subscription_status: subscription.status,
+          })
         }
       }
 
@@ -204,6 +241,12 @@ app.post(
               updated_at: new Date().toISOString(),
             })
             .eq("stripe_subscription_id", subscriptionId)
+
+          refreshHomepageAfterPaidRankChange({
+            event: event.type,
+            subscription_id: subscriptionId,
+            subscription_status: "payment_failed",
+          })
         }
       }
 
@@ -8425,6 +8468,31 @@ app.get("/api/listings/homepage-static", async (req, res) => {
       error: err.message,
       listings: [],
       total_count: 0,
+    })
+  }
+})
+
+app.post("/api/admin/homepage-cache/refresh", async (req, res) => {
+  try {
+    const user = await getAdminUserFromRequest(req)
+
+    if (!user) {
+      return res.status(403).json({ error: "Admin access required." })
+    }
+
+    const result = await updateHomepageListingCache({ force: true })
+
+    return res.json({
+      ok: true,
+      count: Array.isArray(result?.listings) ? result.listings.length : 0,
+      updated_at: result?.updated_at || null,
+    })
+  } catch (err) {
+    console.error("Manual homepage cache refresh error:", err)
+
+    return res.status(500).json({
+      ok: false,
+      error: err?.message || "Could not refresh homepage cache.",
     })
   }
 })
