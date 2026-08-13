@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 })
 
 const BACKEND_BUILD_ID =
-  "telehub-homepage-full-pagination-paid-ranks-2026-08-13"
+  "telehub-short-invite-trailing-hyphen-fix-2026-08-13"
 
 app.get("/", (req, res) => {
   res.status(200).json({
@@ -8771,8 +8771,20 @@ function slugifyImportValue(value) {
   return cleanCmsSlug(value || "telegram-listing") || "telegram-listing"
 }
 
+// Keep short_invite generation consistent with the public URL cleaner.
+// Important: clean again AFTER truncating because slicing can create a
+// trailing dash. Example:
+// artificial-intelligence-in -> artificial-intelligence-
+function normalizeShortInviteBase(value, maxLength = 24) {
+  const cleanMaxLength = Math.max(1, Number(maxLength) || 24)
+  const initiallyClean = slugifyImportValue(value)
+  const truncated = initiallyClean.slice(0, cleanMaxLength)
+
+  return cleanCmsSlug(truncated) || "telegram-listing"
+}
+
 async function generateUniqueShortInviteFromBase(baseValue) {
-  const base = slugifyImportValue(baseValue).slice(0, 24) || "telegram-listing"
+  const base = normalizeShortInviteBase(baseValue, 24)
   let candidate = base
   let counter = 2
 
@@ -8787,7 +8799,11 @@ async function generateUniqueShortInviteFromBase(baseValue) {
     if (!data) return candidate
 
     const suffix = `-${counter}`
-    candidate = `${base.slice(0, 24 - suffix.length)}${suffix}`
+    const prefix = normalizeShortInviteBase(
+      base,
+      Math.max(1, 24 - suffix.length)
+    )
+    candidate = `${prefix}${suffix}`
     counter += 1
   }
 }
@@ -10296,7 +10312,7 @@ app.post("/api/listings/ai-draft", async (req, res) => {
 
     const shortInviteBase =
       stripTelegramHandle(telegramUsername) || telegramTitle || "telegram-listing"
-    const suggestedShortInvite = slugifyImportValue(shortInviteBase).slice(0, 24)
+    const suggestedShortInvite = normalizeShortInviteBase(shortInviteBase, 24)
 
     // Return a draft only. The normal Add Channel submit/claim flow remains the
     // only code path that can create or claim a user-owned listing.
