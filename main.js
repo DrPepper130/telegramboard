@@ -9832,6 +9832,141 @@ const USER_AI_DRAFT_MIN_INTERVAL_MS = Math.max(
 )
 const userAiDraftLastRunAt = new Map()
 
+const USER_AI_DRAFT_WRITING_PROMPT = `
+USER-FACING TELEHUB LISTING DRAFT RULES
+
+You are writing a listing draft that the real Telegram owner will review and edit. It should feel like a strong human-written community directory listing, not generic AI copy.
+
+SHORT DESCRIPTION
+
+Write the SHORT DESCRIPTION like a real Telegram/Discord directory card written by the community owner.
+
+The goal is a dense, casual, slightly messy promotional blurb that immediately tells someone what the community is about.
+
+STYLE
+- Aim for roughly 150-250 characters most of the time.
+- Usually use 1 compact paragraph.
+- Make it feel human-written, not polished copywriting.
+- Preserve useful wording from the source when it already sounds natural.
+- Use short clauses and compressed phrases instead of formal explanations.
+- It is okay for the description to feel packed with information.
+- Prefer concrete topics, activities, products, fandoms, games, or interests over abstract descriptions.
+- Calls to action are allowed when natural, such as "Come chat", "Check it out", "Find teammates", or "Join us".
+- Natural promotional language is good when supported by the source.
+
+FORMAT VARIETY
+Frequently use combinations like:
+Topic or hook ✨ • feature • feature • feature
+🔥 Short opening sentence! ➜ More details • More details
+⭐ Main topic — specific interests, discussion, content & more
+Short sentence. 🎮 Another short sentence with supported topics.
+Topic | Topic | Topic • short invitation
+
+Do not use the exact same structure repeatedly.
+
+EMOJIS
+Use emojis naturally and fairly often, especially when the source itself uses them. Some listings should use several emojis, some one or two, and some none. Do not automatically put an emoji at the beginning.
+
+WRITING CHARACTER
+Descriptions can be slightly imperfect or informal. Fragments are okay. "&", "|", "•", selective capitalization, exclamation points, and compact lists are okay. Avoid making every sentence grammatically polished.
+
+Do NOT write generic phrases such as:
+- a vibrant community
+- a welcoming community
+- a place for enthusiasts
+- connect with like-minded people
+- stay up to date
+- whether you're a beginner or expert
+- offers something for everyone
+- your go-to destination
+
+Do not explain what Telegram is. Do not repeatedly say "Telegram channel", "Telegram group", or "community".
+
+LONG DESCRIPTION
+
+The LONG DESCRIPTION is the richer listing-page copy. It must be between 400 and 2000 CHARACTERS, not words. Aim for about 650-1200 characters unless the source has unusually little or unusually rich information.
+
+Make it visually interesting and easy to scan, similar to a well-written Discord server directory description. Do NOT default to 3-4 polished essay paragraphs.
+
+Use a mix of these structures when supported:
+- a short opening hook or 1-2 sentence intro
+- blank lines between sections
+- feature lines beginning with symbols such as ➜, >, •, ✦, ★, ♡, or relevant emojis
+- short mini-sections such as "What you'll find:", "Why join:", "Inside:", or "Other stuff:" when natural
+- compact lists of games, topics, activities, content, tools, or benefits
+- a short closing invitation
+
+Example SHAPE only — do not copy facts or wording:
+
+A casual place for gaming, memes and late-night chat 🎮
+
+What you'll find:
+➜ Active chats & discussion
+➜ Games, clips, memes and shared interests
+➜ Events or giveaways ONLY if the source actually supports them
+
+Other stuff:
+♡ Specific topics pulled from the Telegram bio/posts
+♡ Useful recurring content or activities
+
+Come hang out if this sounds like your thing ✨
+
+Formatting rules:
+- Preserve real line breaks in the JSON string.
+- Use 2-6 visually distinct blocks or groups when enough source material exists.
+- Lists should usually contain 3-8 supported items.
+- Do not use markdown headings with #. Plain text labels are better.
+- Do not overuse the exact same arrow or emoji across every listing.
+- Do not make every long description use the same template.
+- Keep it natural, slightly promotional, and owner-written.
+- Avoid corporate prose, SEO filler, and generic summaries.
+- Do not repeat the short description verbatim.
+
+SOURCE ACCURACY
+Every specific claim must be supported by the Telegram title, bio, description, or repeated recent posts.
+
+Do not invent giveaways, discounts, staff, voice chat, events, prizes, official status, products, services, games, topics, or features unless the source supports them.
+
+Recent posts may be used to identify repeated topics and recurring content. Do not treat one isolated post as a permanent feature.
+
+FINAL LENGTH CHECK
+Before returning JSON, count approximately by characters and ensure long_description is at least 400 characters and no more than 2000 characters. If it is too short, add more supported detail and formatting. If it is too long, tighten it while preserving the most useful specifics.
+`.trim()
+
+function buildUserAiDraftPrompt(basePrompt = "") {
+  const existing = String(basePrompt || "").trim()
+  if (!existing) return USER_AI_DRAFT_WRITING_PROMPT
+  return `${existing}\n\n${USER_AI_DRAFT_WRITING_PROMPT}`.slice(0, 8000)
+}
+
+async function generateUserAiDraftContent(input, basePrompt = "") {
+  const prompt = buildUserAiDraftPrompt(basePrompt)
+  let best = null
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const aiContent = await generateAiImportContent({
+      ...input,
+      customAiPrompt:
+        attempt === 0
+          ? prompt
+          : `${prompt}\n\nRETRY REQUIREMENT: Your previous long_description was too short. Return a substantially richer, well-formatted long_description between 400 and 2000 characters, using only supported source details.`.slice(0, 8000),
+    })
+
+    if (
+      !best ||
+      String(aiContent.long_description || "").length >
+        String(best.long_description || "").length
+    ) {
+      best = aiContent
+    }
+
+    const length = String(aiContent.long_description || "").length
+    if (length >= 400 && length <= 2000) return aiContent
+  }
+
+  return best
+}
+
 async function getUserAiDraftSettings() {
   try {
     const state = await getContinuousAutomationState()
@@ -9992,18 +10127,20 @@ app.post("/api/listings/ai-draft", async (req, res) => {
       }
     }
 
-    const aiContent = await generateAiImportContent({
-      title: telegramTitle,
-      username: telegramUsername,
-      telegramDescription,
-      memberCount,
-      listingType,
-      recentPosts: postContext.posts,
-      postContextSource: postContext.source,
-      analyzeRecentPosts: settings.analyzeRecentPosts,
-      recentPostLimit: settings.recentPostLimit,
-      customAiPrompt: settings.customAiPrompt,
-    })
+    const aiContent = await generateUserAiDraftContent(
+      {
+        title: telegramTitle,
+        username: telegramUsername,
+        telegramDescription,
+        memberCount,
+        listingType,
+        recentPosts: postContext.posts,
+        postContextSource: postContext.source,
+        analyzeRecentPosts: settings.analyzeRecentPosts,
+        recentPostLimit: settings.recentPostLimit,
+      },
+      settings.customAiPrompt
+    )
 
     const shortInviteBase =
       stripTelegramHandle(telegramUsername) || telegramTitle || "telegram-listing"
