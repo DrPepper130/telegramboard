@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 })
 
 const BACKEND_BUILD_ID =
-  "telehub-paid-rank-instant-homepage-refresh-2026-08-13"
+  "telehub-homepage-full-pagination-paid-ranks-2026-08-13"
 
 app.get("/", (req, res) => {
   res.status(200).json({
@@ -4935,41 +4935,76 @@ function calculateRankingScore(listing, maxStats) {
 async function buildHomepageListings(limit = 18) {
   const cleanLimit = Math.min(Math.max(Number(limit) || 18, 1), 30)
 
-  const { data: listings, error: listingsError } = await supabaseAdmin
-    .from("channel_listings")
-    .select(`
-      id,
-      slug,
-      channel_name,
-      telegram_title,
-      listing_type,
-      telegram_username,
-      telegram_link,
-      description,
-      categories,
-      image_url,
-      icon_url,
-      member_count,
-      votes_count,
-      referral_boost_score,
-      paid_rank,
-      paid_rank_status,
-      is_nsfw,
-      is_banned,
-      status,
-      created_at,
-      updated_at,
-      last_synced_at,
-      framer_sync_status
-      `)
-    .eq("status", "approved")
-    .or("is_banned.is.null,is_banned.eq.false")
-    .or("is_nsfw.is.null,is_nsfw.eq.false")
-    .or("framer_sync_status.is.null,framer_sync_status.neq.pending_batch")
+  // Supabase/PostgREST commonly caps a single select response at 1,000 rows.
+  // TeleHub has far more homepage-eligible listings than that, so fetching
+  // once would silently rank only a partial candidate set and could exclude
+  // valid Sponsor/Gold/Silver listings. Page through the entire eligible set.
+  const homepagePageSize = Math.max(
+    100,
+    Math.min(Number(process.env.HOMEPAGE_LISTING_PAGE_SIZE || 1000), 1000)
+  )
 
-  if (listingsError) throw listingsError
+  const listings = []
+  let homepagePage = 0
 
-  const listingIds = (listings || []).map((item) => item.id)
+  while (true) {
+    const from = homepagePage * homepagePageSize
+    const to = from + homepagePageSize - 1
+
+    const { data: pageData, error: listingsError } = await supabaseAdmin
+      .from("channel_listings")
+      .select(`
+        id,
+        slug,
+        channel_name,
+        telegram_title,
+        listing_type,
+        telegram_username,
+        telegram_link,
+        description,
+        categories,
+        image_url,
+        icon_url,
+        member_count,
+        votes_count,
+        referral_boost_score,
+        paid_rank,
+        paid_rank_status,
+        is_nsfw,
+        is_banned,
+        status,
+        created_at,
+        updated_at,
+        last_synced_at,
+        framer_sync_status
+        `)
+      .eq("status", "approved")
+      .or("is_banned.is.null,is_banned.eq.false")
+      .or("is_nsfw.is.null,is_nsfw.eq.false")
+      .or("framer_sync_status.is.null,framer_sync_status.neq.pending_batch")
+      .order("id", { ascending: true })
+      .range(from, to)
+
+    if (listingsError) throw listingsError
+
+    const rows = Array.isArray(pageData) ? pageData : []
+    listings.push(...rows)
+
+    if (rows.length < homepagePageSize) break
+
+    homepagePage += 1
+  }
+
+  console.log("Homepage ranking candidate fetch complete:", {
+    eligible_candidates: listings.length,
+    page_size: homepagePageSize,
+    pages_fetched:
+      listings.length === 0
+        ? 0
+        : Math.ceil(listings.length / homepagePageSize),
+  })
+
+  const listingIds = listings.map((item) => item.id)
 
   let snapshots = []
 
