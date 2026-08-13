@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 })
 
 const BACKEND_BUILD_ID =
-  "telehub-ai-formatted-long-desc-everywhere-2026-08-12"
+  "telehub-admin-language-filter-toggle-2026-08-13"
 
 app.get("/", (req, res) => {
   res.status(200).json({
@@ -9570,7 +9570,9 @@ async function importSingleTelegramListing(
     ].filter(Boolean).join(" "),
   })
 
-  if (!languageCheck.isEnglish) {
+  const filterNonEnglish = options?.filterNonEnglish !== false
+
+  if (filterNonEnglish && !languageCheck.isEnglish) {
     await onStage("language_filtered", {
       telegram_username: telegramUsername,
       telegram_title: telegramTitle,
@@ -9591,6 +9593,15 @@ async function importSingleTelegramListing(
       metadata_source: profileSource,
       public_posts_found: postContext.postCount,
     }
+  }
+
+  if (!filterNonEnglish && !languageCheck.isEnglish) {
+    await onStage("language_filter_bypassed", {
+      telegram_username: telegramUsername,
+      telegram_title: telegramTitle,
+      reason: languageCheck.reason,
+      language_check: languageCheck,
+    })
   }
 
   await onStage("ai_generation_started", {
@@ -10342,6 +10353,7 @@ app.post("/api/admin/import-telegram-listings", async (req, res) => {
         ? requestedBackgroundMode
         : "none",
       analyzeRecentPosts: req.body?.analyze_recent_posts !== false,
+      filterNonEnglish: req.body?.filter_non_english !== false,
       recentPostLimit: Math.max(
         1,
         Math.min(Number(req.body?.recent_post_limit || 8), 20)
@@ -10604,6 +10616,7 @@ function continuousAutomationSettings(state) {
       : "related",
     sync_to_framer: false,
     analyze_recent_posts: raw.analyze_recent_posts !== false,
+    filter_non_english: raw.filter_non_english !== false,
     recent_post_limit: Math.max(
       1,
       Math.min(Number(raw.recent_post_limit || 20), 20)
@@ -13465,6 +13478,7 @@ async function processContinuousAutomationQueue(
             deferFramerBatch: false,
             backgroundMode: settings.background_mode,
             analyzeRecentPosts: settings.analyze_recent_posts,
+            filterNonEnglish: settings.filter_non_english,
             recentPostLimit: settings.recent_post_limit,
             postContextMaxCharacters: settings.post_context_max_characters,
             customAiPrompt: settings.custom_ai_prompt,
@@ -14319,6 +14333,10 @@ app.post("/api/admin/automation/toggle", async (req, res) => {
         req.body?.analyze_recent_posts === undefined
           ? currentSettings.analyze_recent_posts !== false
           : req.body.analyze_recent_posts !== false,
+      filter_non_english:
+        req.body?.filter_non_english === undefined
+          ? currentSettings.filter_non_english !== false
+          : req.body.filter_non_english !== false,
       recent_post_limit: Math.max(
         1,
         Math.min(
