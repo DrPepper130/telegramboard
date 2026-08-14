@@ -16,11 +16,7 @@ app.use((req, res, next) => {
 })
 
 const BACKEND_BUILD_ID =
-  "telehub-supabase-only-no-framer-cms-2026-08-13"
-
-// TeleHub listing pages are served directly from Supabase/Vercel.
-// Old Framer CMS compatibility code is hard-disabled below.
-const FRAMER_CMS_ENABLED = false
+  "telehub-background-source-rotation-2026-08-13"
 
 app.get("/", (req, res) => {
   res.status(200).json({
@@ -2110,7 +2106,6 @@ function isPermanentTelegramListingFailure(errorMessage) {
   ].some((needle) => message.includes(needle))
 }
 
-
 async function removeBrokenListingFromPublic(listing, errorMessage) {
   const now = new Date().toISOString()
 
@@ -2119,19 +2114,38 @@ async function removeBrokenListingFromPublic(listing, errorMessage) {
     .update({
       status: "needs_update",
       admin_reviewed: false,
+      framer_sync_status: "removed",
+      framer_sync_error: String(errorMessage || "Telegram invite is no longer valid."),
       updated_at: now,
     })
     .eq("id", listing.id)
 
   if (statusError) throw statusError
 
+  let framerResult = null
+
+  try {
+    framerResult = await deleteListingFromFramerCMS(listing, {
+      publish: false,
+    })
+  } catch (framerError) {
+    await supabaseAdmin
+      .from("channel_listings")
+      .update({
+        framer_sync_status: "failed",
+        framer_sync_error: `Telegram invite failed: ${errorMessage}. Framer removal failed: ${framerError.message}`,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", listing.id)
+
+    throw framerError
+  }
+
   return {
     listing_id: listing.id,
-    removed_from_public: true,
-    direct_from_supabase: true,
+    framer: framerResult,
   }
 }
-
 
 async function runHourlyTelegramSync(options = {}) {
   const startedAt = Date.now()
@@ -2139,7 +2153,7 @@ async function runHourlyTelegramSync(options = {}) {
   const { data: listings, error } = await supabaseAdmin
     .from("channel_listings")
     .select(
-      "id, telegram_chat_id, telegram_username, telegram_link, telegram_title, telegram_description, listing_type, member_count, icon_url, short_invite, slug, telegram_metadata_synced_at, last_member_scraped_at, last_metadata_scraped_at, last_icon_scraped_at, scrape_source, scrape_failure_count"
+      "id, telegram_chat_id, telegram_username, telegram_link, telegram_title, telegram_description, listing_type, member_count, icon_url, short_invite, slug, framer_cms_item_id, telegram_metadata_synced_at, last_member_scraped_at, last_metadata_scraped_at, last_icon_scraped_at, scrape_source, scrape_failure_count"
     )
     .eq("status", "approved")
     .or("is_banned.is.null,is_banned.eq.false")
@@ -2176,7 +2190,10 @@ async function runHourlyTelegramSync(options = {}) {
 
   const removedListings = []
   const removalFailures = []
+  let anyCmsItemRemoved = false
 
+  // Handle permanent failures only after the Telegram scan completes.
+  // This keeps temporary network errors and rate limits from hiding listings.
   for (let index = 0; index < results.length; index += 1) {
     const result = results[index]
     const listing = listings[index]
@@ -2184,15 +2201,24 @@ async function runHourlyTelegramSync(options = {}) {
     if (result.ok || !result.permanent_failure) continue
 
     try {
-      await removeBrokenListingFromPublic(listing, result.error)
+      const removal = await queueFramerSync(() =>
+        removeBrokenListingFromPublic(listing, result.error)
+      )
+
+      const deleted = removal?.framer?.deleted === true
+      if (deleted) anyCmsItemRemoved = true
+
       result.removed_from_public = true
+      result.framer_cms_deleted = deleted
       removedListings.push({
         id: listing.id,
         error: result.error,
+        framer_cms_deleted: deleted,
       })
     } catch (removeError) {
       result.removed_from_public = false
       result.removal_error = removeError.message
+
       removalFailures.push({
         id: listing.id,
         error: result.error,
@@ -2201,7 +2227,32 @@ async function runHourlyTelegramSync(options = {}) {
     }
   }
 
+  let framerDeployed = false
+
+  // deleteListingFromFramerCMS was called with publish:false for each item.
+  // Publish and deploy once after every broken CMS item has been removed.
+  if (
+    anyCmsItemRemoved &&
+    options.publish !== false &&
+    process.env.FRAMER_AUTO_DEPLOY !== "false"
+  ) {
+    const { connect } = await import("framer-api")
+    const framer = await connect(
+      process.env.FRAMER_PROJECT_URL,
+      process.env.FRAMER_API_KEY
+    )
+
+    try {
+      const publication = await framer.publish()
+      await framer.deploy(publication.deployment.id)
+      framerDeployed = true
+    } finally {
+      await framer.disconnect()
+    }
+  }
+
   let homepageCache = null
+
   try {
     homepageCache = await updateHomepageListingCache()
   } catch (cacheErr) {
@@ -2218,8 +2269,7 @@ async function runHourlyTelegramSync(options = {}) {
     ).length,
     removed_from_public: removedListings.length,
     removal_failed: removalFailures.length,
-    framer_deployed: false,
-    framer_cms_disabled: true,
+    framer_deployed: framerDeployed,
     concurrency: TELEGRAM_SYNC_CONCURRENCY,
     metadata_refreshed: results.filter(
       (item) => item.ok && item.metadata_refreshed
@@ -2269,7 +2319,7 @@ app.post("/api/auth/is-admin", async (req, res) => {
 })
 
 
-// Authenticated voting endpoint used by the TeleHub listing page.
+// Authenticated voting endpoint used by the Framer listing page.
 // Normal users may cast one vote across TeleHub every 24 hours.
 // Admins may vote without the 24-hour restriction.
 app.post("/api/listings/vote", async (req, res) => {
@@ -2665,9 +2715,10 @@ const FRAMER_CONTENT_FIELDS = new Set([
   "status",
 ])
 
-
 function shouldSyncFramerForChangedFields(changedFields) {
-  return false
+  return (changedFields || []).some((field) =>
+    FRAMER_CONTENT_FIELDS.has(String(field || "").trim())
+  )
 }
 
 function cleanCmsSlug(value) {
@@ -3036,30 +3087,702 @@ async function buildFullFramerFieldData(listing, fields, framer) {
 // - every item is sent at most once
 // - payloads are uploaded as arrays in configurable batches
 // - Framer publishes and deploys once at the end
+async function syncScheduledListingsToFramerCMS(
+  listings,
+  fullSyncListingIds,
+  options = {}
+) {
+  if (!process.env.FRAMER_API_KEY || !process.env.FRAMER_PROJECT_URL) {
+    throw new Error(
+      "Missing FRAMER_API_KEY or FRAMER_PROJECT_URL in Render environment variables."
+    )
+  }
 
-async function syncScheduledListingsToFramerCMS(listings, fullSyncListingIds, options = {}) {
-  return {
-    ok: true, disabled: true, direct_from_supabase: true,
-    updated: 0, full_updated: 0, member_only_updated: 0,
-    image_skipped: 0, skipped: Array.isArray(listings) ? listings.length : 0,
-    failed: 0, deployed: false, batches: 0, results: [],
+  const approvedListings = (listings || []).filter(
+    (listing) =>
+      listing &&
+      listing.status === "approved" &&
+      !listing.is_banned &&
+      (listing.framer_cms_item_id || listing.short_invite)
+  )
+
+  if (!approvedListings.length) {
+    return {
+      ok: true,
+      updated: 0,
+      full_updated: 0,
+      member_only_updated: 0,
+      image_skipped: 0,
+      skipped: 0,
+      failed: 0,
+      deployed: false,
+      batches: 0,
+      results: [],
+    }
+  }
+
+  const fullIdSet = new Set(
+    [...(fullSyncListingIds || [])].map((value) => String(value))
+  )
+
+  const { connect } = await import("framer-api")
+  const framer = await connect(
+    process.env.FRAMER_PROJECT_URL,
+    process.env.FRAMER_API_KEY
+  )
+
+  try {
+    const collection = await getFramerCollection(framer)
+    const fields = await collection.getFields()
+    const existingItems = await collection.getItems()
+    const existingById = new Map(existingItems.map((item) => [item.id, item]))
+    const existingBySlug = new Map(
+      existingItems.map((item) => [item.slug, item])
+    )
+    const imageFieldIds = new Set(
+      fields
+        .filter((field) => field.type === "image")
+        .map((field) => field.id)
+    )
+
+    console.log("Bulk scheduled Framer sync started:", {
+      listings: approvedListings.length,
+      full_sync_listings: fullIdSet.size,
+      cms_items: existingItems.length,
+    })
+
+    const entries = []
+    const results = []
+
+    for (const listing of approvedListings) {
+      const isFullSync = fullIdSet.has(String(listing.id))
+      const existingItem =
+        (listing.framer_cms_item_id
+          ? existingById.get(listing.framer_cms_item_id)
+          : null) ||
+        (listing.short_invite
+          ? existingBySlug.get(cleanCmsSlug(listing.short_invite))
+          : null)
+
+      if (!existingItem?.id) {
+        results.push({
+          id: listing.id,
+          ok: false,
+          skipped: true,
+          full_sync: isFullSync,
+          error: "Framer CMS item not found.",
+        })
+        continue
+      }
+
+      try {
+        let fieldData
+        let warnings = []
+        let cmsSlug = existingItem.slug
+
+        if (isFullSync) {
+          const fullPayload = await buildFullFramerFieldData(
+            listing,
+            fields,
+            framer
+          )
+          fieldData = fullPayload.fieldData
+          warnings = fullPayload.warnings
+          cmsSlug = existingItem.slug || fullPayload.cmsSlug
+        } else {
+          fieldData = {}
+          addCmsField(
+            fieldData,
+            fields,
+            "Member Count",
+            Number(listing.member_count || 0)
+          )
+          addCmsField(
+            fieldData,
+            fields,
+            "Last Synced At",
+            listing.last_synced_at || new Date().toISOString()
+          )
+        }
+
+        const result = {
+          id: listing.id,
+          ok: null,
+          full_sync: isFullSync,
+          cms_item_id: existingItem.id,
+          warnings,
+          image_skipped: false,
+        }
+
+        results.push(result)
+        entries.push({
+          listing,
+          result,
+          payload: {
+            id: existingItem.id,
+            slug: cmsSlug,
+            fieldData,
+          },
+        })
+      } catch (err) {
+        results.push({
+          id: listing.id,
+          ok: false,
+          full_sync: isFullSync,
+          error: err.message,
+        })
+      }
+    }
+
+    const chunkSize = Math.max(
+      1,
+      Math.min(
+        Number(process.env.FRAMER_SCHEDULED_SYNC_BATCH_SIZE || 100),
+        250
+      )
+    )
+
+    let batches = 0
+    let uploadedCount = 0
+
+    async function uploadEntriesResilient(batchEntries, depth = 0) {
+      if (!batchEntries.length) return
+
+      batches += 1
+
+      try {
+        await collection.addItems(
+          batchEntries.map((entry) => entry.payload)
+        )
+
+        for (const entry of batchEntries) {
+          entry.result.ok = true
+          uploadedCount += 1
+        }
+
+        console.log("Bulk scheduled Framer batch uploaded:", {
+          batch: batches,
+          batch_size: batchEntries.length,
+          uploaded_so_far: uploadedCount,
+          total: entries.length,
+          split_depth: depth,
+        })
+
+        return
+      } catch (err) {
+        console.warn("Bulk Framer batch failed; isolating item:", {
+          batch_size: batchEntries.length,
+          split_depth: depth,
+          error: err.message,
+        })
+
+        if (batchEntries.length > 1) {
+          const midpoint = Math.ceil(batchEntries.length / 2)
+
+          await uploadEntriesResilient(
+            batchEntries.slice(0, midpoint),
+            depth + 1
+          )
+          await uploadEntriesResilient(
+            batchEntries.slice(midpoint),
+            depth + 1
+          )
+          return
+        }
+
+        const entry = batchEntries[0]
+        const originalFieldData = entry.payload.fieldData || {}
+        const fieldDataWithoutImages = {}
+
+        for (const [fieldId, value] of Object.entries(originalFieldData)) {
+          if (!imageFieldIds.has(fieldId)) {
+            fieldDataWithoutImages[fieldId] = value
+          }
+        }
+
+        const removedImageFieldCount =
+          Object.keys(originalFieldData).length -
+          Object.keys(fieldDataWithoutImages).length
+
+        if (removedImageFieldCount > 0) {
+          try {
+            batches += 1
+
+            await collection.addItems([
+              {
+                ...entry.payload,
+                fieldData: fieldDataWithoutImages,
+              },
+            ])
+
+            entry.result.ok = true
+            entry.result.image_skipped = true
+            entry.result.warnings = [
+              ...(entry.result.warnings || []),
+              `Framer could not decode one of this listing's images, so existing CMS images were preserved. Original error: ${err.message}`,
+            ]
+            uploadedCount += 1
+
+            console.warn(
+              "Framer listing uploaded without image fields:",
+              {
+                listing_id: entry.listing.id,
+                cms_item_id: entry.payload.id,
+                removed_image_fields: removedImageFieldCount,
+              }
+            )
+            return
+          } catch (retryErr) {
+            entry.result.ok = false
+            entry.result.error =
+              `Full payload failed: ${err.message}. ` +
+              `Retry without images also failed: ${retryErr.message}`
+            return
+          }
+        }
+
+        entry.result.ok = false
+        entry.result.error = err.message
+      }
+    }
+
+    for (let index = 0; index < entries.length; index += chunkSize) {
+      await uploadEntriesResilient(
+        entries.slice(index, index + chunkSize)
+      )
+    }
+
+    let deployed = false
+
+    if (
+      uploadedCount > 0 &&
+      options.publish !== false &&
+      process.env.FRAMER_AUTO_DEPLOY !== "false"
+    ) {
+      const publication = await framer.publish()
+      await framer.deploy(publication.deployment.id)
+      deployed = true
+    }
+
+    const now = new Date().toISOString()
+    const successfulFullSyncs = results.filter(
+      (item) => item.full_sync && item.ok === true
+    )
+    const failedFullSyncs = results.filter(
+      (item) => item.full_sync && item.ok === false
+    )
+
+    for (const result of successfulFullSyncs) {
+      const warningText =
+        Array.isArray(result.warnings) && result.warnings.length
+          ? result.warnings.join(" | ")
+          : null
+
+      const { error } = await supabaseAdmin
+        .from("channel_listings")
+        .update({
+          framer_sync_status: "synced",
+          framer_synced_at: now,
+          framer_sync_error: warningText,
+          updated_at: now,
+        })
+        .eq("id", result.id)
+
+      if (error) {
+        console.warn("Could not save successful bulk Framer status:", {
+          listing_id: result.id,
+          error: error.message,
+        })
+      }
+    }
+
+    for (const result of failedFullSyncs) {
+      const { error } = await supabaseAdmin
+        .from("channel_listings")
+        .update({
+          framer_sync_status: "failed",
+          framer_sync_error: result.error,
+          updated_at: now,
+        })
+        .eq("id", result.id)
+
+      if (error) {
+        console.warn("Could not save failed bulk Framer status:", {
+          listing_id: result.id,
+          error: error.message,
+        })
+      }
+    }
+
+    return {
+      ok: results.every(
+        (item) => item.ok === true || item.skipped === true
+      ),
+      updated: results.filter((item) => item.ok === true).length,
+      full_updated: successfulFullSyncs.length,
+      member_only_updated: results.filter(
+        (item) => !item.full_sync && item.ok === true
+      ).length,
+      image_skipped: results.filter(
+        (item) => item.image_skipped === true
+      ).length,
+      skipped: results.filter((item) => item.skipped).length,
+      failed: results.filter((item) => item.ok === false).length,
+      deployed,
+      batches,
+      batch_size: chunkSize,
+      results,
+    }
+  } finally {
+    await framer.disconnect()
   }
 }
-
 
 async function syncMemberCountsToFramerCMS(listings, options = {}) {
-  return {
-    ok: true, disabled: true, direct_from_supabase: true,
-    updated: 0, skipped: Array.isArray(listings) ? listings.length : 0,
-    failed: 0, deployed: false, results: [],
+  if (!process.env.FRAMER_API_KEY || !process.env.FRAMER_PROJECT_URL) {
+    throw new Error(
+      "Missing FRAMER_API_KEY or FRAMER_PROJECT_URL in Render environment variables."
+    )
+  }
+
+  const approvedListings = (listings || []).filter(
+    (listing) =>
+      listing &&
+      listing.status === "approved" &&
+      !listing.is_banned &&
+      (listing.framer_cms_item_id || listing.short_invite)
+  )
+
+  if (!approvedListings.length) {
+    return {
+      ok: true,
+      updated: 0,
+      skipped: 0,
+      deployed: false,
+      results: [],
+    }
+  }
+
+  const { connect } = await import("framer-api")
+  const framer = await connect(
+    process.env.FRAMER_PROJECT_URL,
+    process.env.FRAMER_API_KEY
+  )
+
+  try {
+    const collection = await getFramerCollection(framer)
+    const fields = await collection.getFields()
+    const existingItems = await collection.getItems()
+    const existingById = new Map(existingItems.map((item) => [item.id, item]))
+    const existingBySlug = new Map(existingItems.map((item) => [item.slug, item]))
+
+    const results = []
+    const payloads = []
+
+    for (const listing of approvedListings) {
+      const existingItem =
+        (listing.framer_cms_item_id
+          ? existingById.get(listing.framer_cms_item_id)
+          : null) ||
+        (listing.short_invite
+          ? existingBySlug.get(cleanCmsSlug(listing.short_invite))
+          : null)
+
+      if (!existingItem?.id) {
+        results.push({
+          id: listing.id,
+          ok: false,
+          skipped: true,
+          error: "Framer CMS item not found.",
+        })
+        continue
+      }
+
+      const fieldData = {}
+      addCmsField(
+        fieldData,
+        fields,
+        "Member Count",
+        Number(listing.member_count || 0)
+      )
+      addCmsField(
+        fieldData,
+        fields,
+        "Last Synced At",
+        listing.last_synced_at || new Date().toISOString()
+      )
+
+      payloads.push({
+        id: existingItem.id,
+        slug: existingItem.slug,
+        fieldData,
+      })
+      results.push({
+        id: listing.id,
+        ok: true,
+        cms_item_id: existingItem.id,
+      })
+    }
+
+    const chunkSize = Math.max(
+      1,
+      Math.min(Number(process.env.FRAMER_MEMBER_SYNC_BATCH_SIZE || 100), 250)
+    )
+
+    for (let index = 0; index < payloads.length; index += chunkSize) {
+      await collection.addItems(payloads.slice(index, index + chunkSize))
+    }
+
+    let deployed = false
+
+    if (
+      payloads.length &&
+      options.publish !== false &&
+      process.env.FRAMER_AUTO_DEPLOY !== "false"
+    ) {
+      const publication = await framer.publish()
+      await framer.deploy(publication.deployment.id)
+      deployed = true
+    }
+
+    return {
+      ok: true,
+      updated: payloads.length,
+      skipped: results.filter((item) => item.skipped).length,
+      deployed,
+      results,
+    }
+  } finally {
+    await framer.disconnect()
   }
 }
 
-
 async function syncListingToFramerCMS(listingId, options = {}) {
-  return {
-    ok: true, disabled: true, direct_from_supabase: true,
-    listing_id: listingId, deployed: false, framer_cms_item_id: null,
+  if (!process.env.FRAMER_API_KEY || !process.env.FRAMER_PROJECT_URL) {
+    throw new Error("Missing FRAMER_API_KEY or FRAMER_PROJECT_URL in Render environment variables.")
+  }
+
+  const { data: existingListing, error: listingError } = await supabaseAdmin
+    .from("channel_listings")
+    .select("*")
+    .eq("id", listingId)
+    .single()
+
+  if (listingError) throw listingError
+  if (!existingListing) throw new Error("Listing not found.")
+  if (existingListing.status !== "approved") {
+    throw new Error("Only approved listings can be synced to Framer CMS.")
+  }
+  if (existingListing.is_banned) {
+    throw new Error("Banned listings cannot be synced to Framer CMS.")
+  }
+
+  await supabaseAdmin
+    .from("channel_listings")
+    .update({
+      framer_sync_status: "syncing",
+      framer_sync_error: null,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", listingId)
+
+  let telegramSyncWarning = null
+
+  if (options.skipTelegramSync !== true) {
+    try {
+      await syncListingTelegramData(existingListing)
+    } catch (err) {
+      telegramSyncWarning = err.message
+      console.warn("Telegram sync before Framer CMS sync failed:", err.message)
+    }
+  }
+
+  const { data: listing, error: freshError } = await supabaseAdmin
+    .from("channel_listings")
+    .select("*")
+    .eq("id", listingId)
+    .single()
+
+  if (freshError) throw freshError
+
+  const cmsSlug = await ensureUniqueShortInvite(listing)
+  const cms = buildCmsText({ ...listing, short_invite: cmsSlug })
+  const telegramUsername =
+    listing.telegram_username ||
+    (stripTelegramHandle(listing.telegram_link)
+      ? `@${stripTelegramHandle(listing.telegram_link)}`
+      : "")
+  // Telegram icon is the actual channel/group avatar pulled from Telegram.
+  // Uploaded user image remains separate as the optional background/banner image.
+  const telegramIconUrl = String(listing.icon_url || "").trim()
+  const uploadedBackgroundUrl = String(listing.image_url || "").trim()
+
+  const { connect } = await import("framer-api")
+  const framer = await connect(process.env.FRAMER_PROJECT_URL, process.env.FRAMER_API_KEY)
+
+  try {
+    const collection = await getFramerCollection(framer)
+    const fields = await collection.getFields()
+
+    console.log(
+      "FRAMER CMS FIELDS:",
+      fields.map((field) => ({
+        id: field.id,
+        name: field.name,
+        type: field.type,
+      }))
+    )
+    console.log("TELEGRAM ICON URL FOR CMS:", telegramIconUrl)
+    console.log("BACKGROUND IMAGE URL FOR CMS:", uploadedBackgroundUrl)
+
+    const fieldData = {}
+
+    addCmsField(fieldData, fields, "Name", cms.name)
+    addCmsField(fieldData, fields, "Supabase Listing ID", String(listing.id))
+    addCmsField(fieldData, fields, "Original App Slug", listing.slug || "")
+    addCmsField(fieldData, fields, "Description", cms.description)
+    addCmsField(fieldData, fields, "Short Description", cms.shortDescription)
+    addCmsField(fieldData, fields, "Telegram URL", listing.telegram_link || "")
+    addCmsField(fieldData, fields, "Telegram Username", telegramUsername)
+    addCmsField(fieldData, fields, "Listing Type", cms.listingType)
+    addCmsField(fieldData, fields, "Category", cms.categories || "General")
+
+    // IMPORTANT:
+    // Icon Image = Telegram channel/group avatar from listing.icon_url.
+    // Background Image URL = optional user-uploaded background/banner from listing.image_url.
+    // Both can be Framer Image fields. For Image fields, we pass the public image URL string.
+    const iconImageResult = await addCmsImageField(
+      fieldData,
+      fields,
+      framer,
+      "Icon Image",
+      telegramIconUrl,
+      `${cms.name} Telegram icon`,
+      { required: true }
+    )
+
+    const backgroundImageResult = await addCmsImageField(
+      fieldData,
+      fields,
+      framer,
+      "Background Image URL",
+      uploadedBackgroundUrl,
+      `${cms.name} background image`,
+      { required: false }
+    )
+
+    // Extra URL/text fallbacks if those fields exist in your CMS.
+    addCmsField(fieldData, fields, "Icon Image URL", telegramIconUrl)
+    addCmsField(fieldData, fields, "Telegram Icon URL", telegramIconUrl)
+    addCmsField(fieldData, fields, "Icon URL", telegramIconUrl)
+    addCmsField(fieldData, fields, "Background Image URL Text", uploadedBackgroundUrl)
+
+    addCmsField(fieldData, fields, "Member Count", cms.memberCount)
+    addCmsField(fieldData, fields, "Votes Count", Number(listing.votes_count || 0))
+    addCmsField(fieldData, fields, "Paid Rank", listing.paid_rank || "free")
+    addCmsField(fieldData, fields, "Status", listing.status || "approved")
+    addCmsField(fieldData, fields, "Is NSFW", boolValue(listing.is_nsfw))
+    addCmsField(fieldData, fields, "Short Invite", cmsSlug)
+    addCmsField(fieldData, fields, "Created At", listing.created_at || new Date().toISOString())
+    addCmsField(fieldData, fields, "Last Synced At", listing.last_synced_at || new Date().toISOString())
+    addCmsField(fieldData, fields, "SEO Title", cms.seoTitle)
+    addCmsField(fieldData, fields, "SEO Description", cms.seoDescription)
+    addCmsField(fieldData, fields, "Intro Text", cms.introText)
+    addCmsField(fieldData, fields, "Safety Note", cms.safetyNote)
+    addCmsField(fieldData, fields, "FAQ 1 Question", cms.faq1Question)
+    addCmsField(fieldData, fields, "FAQ 1 Answer", cms.faq1Answer)
+    addCmsField(fieldData, fields, "FAQ 2 Question", cms.faq2Question)
+    addCmsField(fieldData, fields, "FAQ 2 Answer", cms.faq2Answer)
+    addCmsField(fieldData, fields, "FAQ 3 Question", cms.faq3Question)
+    addCmsField(fieldData, fields, "FAQ 3 Answer", cms.faq3Answer)
+
+    // Framer unmanaged CMS collections create new items when no item id is provided.
+    // Only include an id when we have confirmed that item already exists in Framer.
+    const existingItems = await collection.getItems()
+    const existingCmsItem =
+      existingItems.find((item) => item.slug === cmsSlug) ||
+      (listing.framer_cms_item_id
+        ? existingItems.find((item) => item.id === listing.framer_cms_item_id)
+        : null)
+
+    const itemPayload = {
+      slug: cmsSlug,
+      fieldData,
+    }
+
+    if (existingCmsItem?.id) {
+      itemPayload.id = existingCmsItem.id
+    }
+
+    await collection.addItems([itemPayload])
+
+    let framerCmsItemId = existingCmsItem?.id || null
+
+    if (!framerCmsItemId) {
+      const itemsAfterCreate = await collection.getItems()
+      const createdItem = itemsAfterCreate.find((item) => item.slug === cmsSlug)
+      framerCmsItemId = createdItem?.id || null
+    }
+
+    let deployed = false
+
+    if (process.env.FRAMER_AUTO_DEPLOY !== "false" && options.publish !== false) {
+      const publication = await framer.publish()
+      await framer.deploy(publication.deployment.id)
+      deployed = true
+    }
+
+    const now = new Date().toISOString()
+    const framerWarnings = []
+
+    if (telegramSyncWarning) {
+      framerWarnings.push(`Telegram sync warning: ${telegramSyncWarning}`)
+    }
+
+    if (!iconImageResult.ok) {
+      framerWarnings.push(`Icon Image warning: ${iconImageResult.error}`)
+    }
+
+    if (!backgroundImageResult.ok && !backgroundImageResult.skipped) {
+      framerWarnings.push(`Background Image warning: ${backgroundImageResult.error}`)
+    }
+
+    await supabaseAdmin
+      .from("channel_listings")
+      .update({
+        short_invite: cmsSlug,
+        framer_cms_item_id: framerCmsItemId,
+        framer_sync_status: "synced",
+        framer_synced_at: now,
+        framer_sync_error: framerWarnings.length ? framerWarnings.join(" | ") : null,
+        updated_at: now,
+      })
+      .eq("id", listing.id)
+
+    return {
+      ok: true,
+      slug: cmsSlug,
+      url: `https://telehub.to/channel/${cmsSlug}`,
+      deployed,
+      framer_cms_item_id: framerCmsItemId,
+      icon_image: iconImageResult,
+      background_image: backgroundImageResult,
+      framer_sync_warning: framerWarnings.length ? framerWarnings.join(" | ") : null,
+      telegram_sync_warning: telegramSyncWarning,
+    }
+  } catch (err) {
+    await supabaseAdmin
+      .from("channel_listings")
+      .update({
+        framer_sync_status: "failed",
+        framer_sync_error: err.message,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", listing.id)
+
+    throw err
+  } finally {
+    await framer.disconnect()
   }
 }
 
@@ -3115,16 +3838,63 @@ async function findFramerCmsItemForListing(collection, fields, listing) {
   return null
 }
 
-
 async function publishFramerIfNeeded(framer, options = {}) {
-  return false
+  if (process.env.FRAMER_AUTO_DEPLOY === "false" || options.publish === false) {
+    return false
+  }
+
+  const publication = await framer.publish()
+  await framer.deploy(publication.deployment.id)
+  return true
 }
 
-
 async function deleteListingFromFramerCMS(listing, options = {}) {
-  return {
-    ok: true, disabled: true, found: false, deleted: false, deployed: false,
-    reason: "Framer CMS retired; Supabase is the only listing store.",
+  if (!process.env.FRAMER_API_KEY || !process.env.FRAMER_PROJECT_URL) {
+    throw new Error("Missing FRAMER_API_KEY or FRAMER_PROJECT_URL in Render environment variables.")
+  }
+
+  const { connect } = await import("framer-api")
+  const framer = await connect(process.env.FRAMER_PROJECT_URL, process.env.FRAMER_API_KEY)
+
+  try {
+    const collection = await getFramerCollection(framer)
+    const fields = await collection.getFields()
+    const cmsItem = await findFramerCmsItemForListing(collection, fields, listing)
+
+    if (!cmsItem?.id) {
+      console.warn("No matching Framer CMS item found for deleted listing:", {
+        id: listing.id,
+        short_invite: listing.short_invite,
+        slug: listing.slug,
+        framer_cms_item_id: listing.framer_cms_item_id,
+      })
+
+      return {
+        ok: true,
+        found: false,
+        deleted: false,
+        deployed: false,
+        message: "No matching Framer CMS item was found. Supabase listing can still be deleted.",
+      }
+    }
+
+    if (typeof collection.removeItems !== "function") {
+      throw new Error("Framer collection.removeItems is unavailable. Update framer-api or check the collection type.")
+    }
+
+    await collection.removeItems([cmsItem.id])
+    const deployed = await publishFramerIfNeeded(framer, options)
+
+    return {
+      ok: true,
+      found: true,
+      deleted: true,
+      deployed,
+      framer_cms_item_id: cmsItem.id,
+      framer_slug: cmsItem.slug || null,
+    }
+  } finally {
+    await framer.disconnect()
   }
 }
 
@@ -3148,8 +3918,9 @@ async function safeDeleteRelatedRows(tableName, listingId) {
   return { table: tableName, ok: true }
 }
 
-
 async function deleteListingEverywhere(listing, options = {}) {
+  const framerResult = await deleteListingFromFramerCMS(listing, options)
+
   const relatedTables = [
     "listing_referral_clicks",
     "channel_member_snapshots",
@@ -3158,6 +3929,7 @@ async function deleteListingEverywhere(listing, options = {}) {
   ]
 
   const relatedDeletes = []
+
   for (const tableName of relatedTables) {
     relatedDeletes.push(await safeDeleteRelatedRows(tableName, listing.id))
   }
@@ -3170,6 +3942,7 @@ async function deleteListingEverywhere(listing, options = {}) {
   if (listingDeleteError) throw listingDeleteError
 
   let homepageCache = null
+
   try {
     homepageCache = await updateHomepageListingCache()
   } catch (cacheErr) {
@@ -3180,11 +3953,13 @@ async function deleteListingEverywhere(listing, options = {}) {
     ok: true,
     listing_id: listing.id,
     short_invite: listing.short_invite || null,
-    direct_from_supabase: true,
-    framer: { disabled: true, deleted: false },
+    framer: framerResult,
     related_deletes: relatedDeletes,
     homepage_cache: homepageCache
-      ? { updated_at: homepageCache.updated_at, count: homepageCache.listings.length }
+      ? {
+          updated_at: homepageCache.updated_at,
+          count: homepageCache.listings.length,
+        }
       : null,
   }
 }
@@ -3423,6 +4198,8 @@ app.post("/api/admin/listings/review-approve", async (req, res) => {
           : cleanString(updates.image_url) || null,
       status: "approved",
       admin_reviewed: true,
+      framer_sync_status: null,
+      framer_sync_error: null,
       updated_at: new Date().toISOString(),
     }
 
@@ -3519,6 +4296,8 @@ app.post("/api/admin/listings/lifecycle", async (req, res) => {
       updatePayload = {
         status: "rejected",
         admin_reviewed: true,
+        framer_sync_status: null,
+        framer_sync_error: null,
         updated_at: now,
       }
     } else if (cleanAction === "ban") {
@@ -3526,6 +4305,8 @@ app.post("/api/admin/listings/lifecycle", async (req, res) => {
         is_banned: true,
         admin_reviewed: true,
         ban_reason: String(reason || "Temporarily banned by admin."),
+        framer_sync_status: null,
+        framer_sync_error: null,
         updated_at: now,
       }
     } else {
@@ -3533,6 +4314,8 @@ app.post("/api/admin/listings/lifecycle", async (req, res) => {
         is_banned: false,
         ban_reason: null,
         status: "approved",
+        framer_sync_status: null,
+        framer_sync_error: null,
         updated_at: now,
       }
     }
@@ -3661,28 +4444,59 @@ app.post("/api/framer/delete-listing", async (req, res) => {
 })
 
 app.post("/api/framer/sync-all-listings", async (req, res) => {
-  // Compatibility endpoint only. Framer CMS has been retired.
-  if (req.headers.authorization !== `Bearer ${process.env.CRON_SECRET}`) {
-    return res.status(401).json({ error: "Unauthorized" })
-  }
+  try {
+    if (req.headers.authorization !== `Bearer ${process.env.CRON_SECRET}`) {
+      return res.status(401).json({ error: "Unauthorized" })
+    }
 
-  return res.json({
-    ok: true,
-    disabled: true,
-    direct_from_supabase: true,
-    deployed: false,
-    count: 0,
-    results: [],
-    message: "Framer CMS sync is disabled. TeleHub listing pages read from Supabase/Vercel.",
-  })
+    const { data: listings, error } = await supabaseAdmin
+      .from("channel_listings")
+      .select("id")
+      .eq("status", "approved")
+      .or("is_banned.is.null,is_banned.eq.false")
+
+    if (error) throw error
+
+    const results = []
+
+    for (const listing of listings || []) {
+      try {
+        const result = await queueFramerSync(() =>
+          syncListingToFramerCMS(listing.id, { publish: false, skipTelegramSync: false })
+        )
+        results.push({ id: listing.id, ok: true, slug: result.slug })
+      } catch (err) {
+        results.push({ id: listing.id, ok: false, error: err.message })
+      }
+    }
+
+    let deployed = false
+
+    if (process.env.FRAMER_AUTO_DEPLOY !== "false") {
+      const { connect } = await import("framer-api")
+      const framer = await connect(process.env.FRAMER_PROJECT_URL, process.env.FRAMER_API_KEY)
+      try {
+        const publication = await framer.publish()
+        await framer.deploy(publication.deployment.id)
+        deployed = true
+      } finally {
+        await framer.disconnect()
+      }
+    }
+
+    return res.json({ ok: true, deployed, count: results.length, results })
+  } catch (err) {
+    console.error("Framer sync-all error:", err)
+    return res.status(500).json({ error: err.message })
+  }
 })
 
 // Schedule this endpoint once per day at 12:00 AM America/Phoenix.
 // Render cron uses UTC, so Phoenix midnight is 07:00 UTC year-round.
 // It refreshes member counts daily, metadata weekly, and icons monthly.
 // Telegram public pages are scraped first, with Bot API fallback.
-// Listing pages are Supabase/Vercel-only. This cron refreshes Telegram data,
-// rankings, and homepage caches without any Framer CMS work.
+// Framer receives daily member fields plus full CMS refreshes for listings
+// whose weekly metadata or monthly icon changed, then publishes once.
 app.get("/api/cron/daily-full-sync", async (req, res) => {
   try {
     if (req.query.secret !== process.env.CRON_SECRET) {
@@ -4161,10 +4975,13 @@ async function buildHomepageListings(limit = 18) {
         status,
         created_at,
         updated_at,
-        last_synced_at        `)
+        last_synced_at,
+        framer_sync_status
+        `)
       .eq("status", "approved")
       .or("is_banned.is.null,is_banned.eq.false")
       .or("is_nsfw.is.null,is_nsfw.eq.false")
+      .or("framer_sync_status.is.null,framer_sync_status.neq.pending_batch")
       .order("id", { ascending: true })
       .range(from, to)
 
@@ -7485,6 +8302,7 @@ app.get("/api/listings/ranked", async (req, res) => {
         .select("*")
         .eq("status", "approved")
         .eq("is_banned", false)
+        .or("framer_sync_status.is.null,framer_sync_status.neq.pending_batch")
         .order("id", { ascending: true })
         .range(from, from + listingPageSize - 1)
 
@@ -8071,7 +8889,7 @@ function sanitizeAiImportContent(raw, fallback) {
   if (!description) description = fallback.description
   if (!longDescription) longDescription = fallback.long_description
 
-  // Keep generated names readable in TeleHub cards and listing pages.
+  // Keep generated names readable in cards and Framer CMS.
   displayName = displayName
     .replace(/[|•—–:/]\s*[|•—–:/]+/g, " • ")
     .replace(/\s{2,}/g, " ")
@@ -8996,6 +9814,7 @@ async function importSingleTelegramListing(
     last_metadata_scraped_at: now,
     scrape_source: profileSource,
     scrape_failure_count: 0,
+    framer_sync_status: null,
   }
 
   const { data: inserted, error: insertError } = await supabaseAdmin
@@ -9608,6 +10427,36 @@ async function markManualImportQueueItemComplete(originalLink, result) {
   }
 }
 
+const ALLOWED_BACKGROUND_MODES = [
+  "none",
+  "icon",
+  "related",
+  "telegram_post",
+]
+
+function normalizeBackgroundModes(rawModes, fallback = ["related"]) {
+  const input = Array.isArray(rawModes)
+    ? rawModes
+    : rawModes === null || rawModes === undefined
+      ? []
+      : [rawModes]
+
+  const cleaned = Array.from(
+    new Set(
+      input
+        .map((value) => String(value || "").toLowerCase().trim())
+        .filter((value) => ALLOWED_BACKGROUND_MODES.includes(value))
+    )
+  )
+
+  return cleaned.length ? cleaned : [...fallback]
+}
+
+function backgroundModeForIndex(modes, index = 0) {
+  const cleanModes = normalizeBackgroundModes(modes)
+  return cleanModes[Math.abs(Number(index) || 0) % cleanModes.length]
+}
+
 app.post("/api/admin/import-telegram-listings", async (req, res) => {
   try {
     const authHeader = req.headers.authorization || ""
@@ -9635,23 +10484,18 @@ app.post("/api/admin/import-telegram-listings", async (req, res) => {
       return res.status(400).json({ error: "Paste at least one public Telegram link." })
     }
 
-    const requestedBackgroundMode = String(
-      req.body?.background_mode ||
-      (req.body?.use_icon_as_background !== false ? "icon" : "none")
-    ).toLowerCase()
-
-    const allowedBackgroundModes = new Set([
-      "none",
-      "icon",
-      "related",
-      "telegram_post",
-    ])
+    const requestedBackgroundModes = normalizeBackgroundModes(
+      Array.isArray(req.body?.background_modes)
+        ? req.body.background_modes
+        : req.body?.background_mode ||
+            (req.body?.use_icon_as_background !== false ? "icon" : "none"),
+      ["none"]
+    )
 
     const options = {
       syncToFramer: false,
-      backgroundMode: allowedBackgroundModes.has(requestedBackgroundMode)
-        ? requestedBackgroundMode
-        : "none",
+      backgroundModes: requestedBackgroundModes,
+      backgroundMode: requestedBackgroundModes[0] || "none",
       analyzeRecentPosts: req.body?.analyze_recent_posts !== false,
       filterNonEnglish: req.body?.filter_non_english !== false,
       recentPostLimit: Math.max(
@@ -9675,7 +10519,17 @@ app.post("/api/admin/import-telegram-listings", async (req, res) => {
       const link = linksToImport[index]
 
       try {
-        const result = await importSingleTelegramListing(link, options, user)
+        const result = await importSingleTelegramListing(
+          link,
+          {
+            ...options,
+            backgroundMode: backgroundModeForIndex(
+              options.backgroundModes,
+              index
+            ),
+          },
+          user
+        )
         results.push(result)
         await markManualImportQueueItemComplete(link, result)
       } catch (err) {
@@ -9909,11 +10763,21 @@ function continuousAutomationSettings(state) {
       1,
       Math.min(Number(raw.import_batch_size || 20), MAX_ADMIN_IMPORT_LIMIT)
     ),
-    background_mode: ["none", "icon", "related", "telegram_post"].includes(
-      String(raw.background_mode || "related")
-    )
-      ? String(raw.background_mode || "related")
-      : "related",
+    background_modes: normalizeBackgroundModes(
+      Array.isArray(raw.background_modes)
+        ? raw.background_modes
+        : raw.background_mode || "related",
+      ["related"]
+    ),
+    background_mode: backgroundModeForIndex(
+      normalizeBackgroundModes(
+        Array.isArray(raw.background_modes)
+          ? raw.background_modes
+          : raw.background_mode || "related",
+        ["related"]
+      ),
+      0
+    ),
     sync_to_framer: false,
     analyze_recent_posts: raw.analyze_recent_posts !== false,
     filter_non_english: raw.filter_non_english !== false,
@@ -12127,29 +12991,571 @@ function isTransientContinuousImportError(error) {
 let adminReviewFramerBatchRunning = false
 const ADMIN_REVIEW_FRAMER_BATCH_SIZE = 20
 
-
 async function syncAdminReviewListingBatchToFramer(listingIds) {
-  return { ok: true, disabled: true, synced: 0, failed: 0, deployed: false, results: [] }
-}
+  const cleanIds = Array.from(
+    new Set((listingIds || []).map((value) => String(value || "").trim()).filter(Boolean))
+  )
 
+  if (!cleanIds.length) {
+    return { ok: true, synced: 0, failed: 0, deployed: false, results: [] }
+  }
+
+  if (!process.env.FRAMER_API_KEY || !process.env.FRAMER_PROJECT_URL) {
+    throw new Error(
+      "Missing FRAMER_API_KEY or FRAMER_PROJECT_URL in Render environment variables."
+    )
+  }
+
+  const { data: listings, error: listingError } = await supabaseAdmin
+    .from("channel_listings")
+    .select("*")
+    .in("id", cleanIds)
+
+  if (listingError) throw listingError
+
+  const eligible = (listings || []).filter(
+    (listing) =>
+      listing &&
+      listing.status === "approved" &&
+      !listing.is_banned &&
+      listing.framer_sync_status === "pending_review_batch"
+  )
+
+  if (!eligible.length) {
+    return { ok: true, synced: 0, failed: 0, deployed: false, results: [] }
+  }
+
+  const { connect } = await import("framer-api")
+  const framer = await connect(
+    process.env.FRAMER_PROJECT_URL,
+    process.env.FRAMER_API_KEY
+  )
+
+  try {
+    const collection = await getFramerCollection(framer)
+    const fields = await collection.getFields()
+    const existingItems = await collection.getItems()
+
+    const existingById = new Map(
+      existingItems.map((item) => [String(item.id), item])
+    )
+    const existingBySlug = new Map(
+      existingItems.map((item) => [String(item.slug), item])
+    )
+
+    const entries = []
+    const results = []
+
+    // Prepare all 20 payloads first. There is no collection.addItems call
+    // inside this loop.
+    for (const listing of eligible) {
+      try {
+        const fullPayload = await buildFullFramerFieldData(
+          listing,
+          fields,
+          framer
+        )
+
+        const cmsSlug = fullPayload.cmsSlug
+        const existingItem =
+          (listing.framer_cms_item_id
+            ? existingById.get(String(listing.framer_cms_item_id))
+            : null) ||
+          existingBySlug.get(String(cmsSlug)) ||
+          null
+
+        const payload = {
+          slug: cmsSlug,
+          fieldData: fullPayload.fieldData,
+        }
+
+        if (existingItem?.id) payload.id = existingItem.id
+
+        const result = {
+          listing_id: listing.id,
+          ok: null,
+          slug: cmsSlug,
+          existing_cms_item_id: existingItem?.id || null,
+          warnings: fullPayload.warnings || [],
+        }
+
+        entries.push({ listing, payload, result })
+        results.push(result)
+      } catch (error) {
+        results.push({
+          listing_id: listing.id,
+          ok: false,
+          error: error.message || "Could not prepare Framer payload.",
+        })
+      }
+    }
+
+    if (!entries.length) {
+      return {
+        ok: false,
+        synced: 0,
+        failed: results.filter((item) => item.ok === false).length,
+        deployed: false,
+        results,
+      }
+    }
+
+    console.log("ADMIN REVIEW FRAMER BATCH:", {
+      requested: eligible.length,
+      prepared: entries.length,
+      add_items_calls: 1,
+    })
+
+    // One CMS array call for the entire review batch.
+    await collection.addItems(entries.map((entry) => entry.payload))
+
+    for (const entry of entries) entry.result.ok = true
+
+    let deployed = false
+    if (process.env.FRAMER_AUTO_DEPLOY !== "false") {
+      const publication = await framer.publish()
+      await framer.deploy(publication.deployment.id)
+      deployed = true
+    }
+
+    const itemsAfter = await collection.getItems()
+    const afterBySlug = new Map(
+      itemsAfter.map((item) => [String(item.slug), item])
+    )
+    const now = new Date().toISOString()
+
+    for (const entry of entries) {
+      const cmsItem =
+        (entry.result.existing_cms_item_id
+          ? itemsAfter.find(
+              (item) =>
+                String(item.id) === String(entry.result.existing_cms_item_id)
+            )
+          : null) ||
+        afterBySlug.get(String(entry.result.slug)) ||
+        null
+
+      const warningText =
+        Array.isArray(entry.result.warnings) && entry.result.warnings.length
+          ? entry.result.warnings.join(" | ")
+          : null
+
+      await supabaseAdmin
+        .from("channel_listings")
+        .update({
+          framer_cms_item_id: cmsItem?.id || entry.listing.framer_cms_item_id || null,
+          framer_sync_status: deployed ? "synced" : "pending_review_batch",
+          framer_synced_at: deployed ? now : entry.listing.framer_synced_at || null,
+          framer_sync_error: deployed
+            ? warningText
+            : "Admin review batch uploaded but was not deployed.",
+          updated_at: now,
+        })
+        .eq("id", entry.listing.id)
+    }
+
+    console.log("ADMIN REVIEW FRAMER BATCH COMPLETE:", {
+      synced: deployed ? entries.length : 0,
+      failed: results.filter((item) => item.ok === false).length,
+      deployed,
+    })
+
+    return {
+      ok: results.every((item) => item.ok !== false),
+      synced: deployed ? entries.length : 0,
+      failed: results.filter((item) => item.ok === false).length,
+      deployed,
+      results,
+    }
+  } catch (error) {
+    const now = new Date().toISOString()
+    await supabaseAdmin
+      .from("channel_listings")
+      .update({
+        framer_sync_status: "pending_review_batch",
+        framer_sync_error: String(error.message || "Admin review Framer batch failed.").slice(0, 2000),
+        updated_at: now,
+      })
+      .in("id", cleanIds)
+
+    throw error
+  } finally {
+    await framer.disconnect()
+  }
+}
 
 async function getPendingAdminReviewFramerCount() {
-  return 0
-}
+  const { count, error } = await supabaseAdmin
+    .from("channel_listings")
+    .select("*", { count: "exact", head: true })
+    .eq("status", "approved")
+    .eq("is_banned", false)
+    .eq("framer_sync_status", "pending_review_batch")
 
+  if (error) throw error
+  return Number(count || 0)
+}
 
 async function flushAdminReviewFramerBatches(options = {}) {
-  return { ok: true, disabled: true, batches: 0, synced: 0, failed: 0, pending: 0 }
-}
+  if (adminReviewFramerBatchRunning) {
+    return {
+      ok: true,
+      already_running: true,
+      pending: await getPendingAdminReviewFramerCount(),
+    }
+  }
 
+  adminReviewFramerBatchRunning = true
+
+  try {
+    let totalSynced = 0
+    let totalFailed = 0
+    let batches = 0
+
+    while (true) {
+      const { data: pending, error } = await supabaseAdmin
+        .from("channel_listings")
+        .select("id")
+        .eq("status", "approved")
+        .eq("is_banned", false)
+        .eq("framer_sync_status", "pending_review_batch")
+        .order("updated_at", { ascending: true })
+        .limit(ADMIN_REVIEW_FRAMER_BATCH_SIZE)
+
+      if (error) throw error
+
+      const rows = pending || []
+      if (!rows.length) break
+      if (rows.length < ADMIN_REVIEW_FRAMER_BATCH_SIZE && options.force !== true) {
+        break
+      }
+
+      const result = await queueFramerSync(() =>
+        syncAdminReviewListingBatchToFramer(rows.map((row) => row.id))
+      )
+
+      batches += 1
+      totalSynced += Number(result.synced || 0)
+      totalFailed += Number(result.failed || 0)
+
+      // Avoid an infinite loop when Framer could not clear this batch.
+      if (!result.deployed || result.synced === 0) break
+
+      if (options.force === true) {
+        // force is used for the final partial batch; after one partial upload,
+        // continue only if another full batch still exists.
+        options = { ...options, force: false }
+      }
+    }
+
+    return {
+      ok: totalFailed === 0,
+      batches,
+      synced: totalSynced,
+      failed: totalFailed,
+      pending: await getPendingAdminReviewFramerCount(),
+    }
+  } finally {
+    adminReviewFramerBatchRunning = false
+  }
+}
 
 function kickAdminReviewFramerBatchIfReady() {
-  // Framer CMS retired. Intentionally no-op.
+  setImmediate(async () => {
+    try {
+      const pending = await getPendingAdminReviewFramerCount()
+      if (pending >= ADMIN_REVIEW_FRAMER_BATCH_SIZE) {
+        await flushAdminReviewFramerBatches()
+      }
+    } catch (error) {
+      console.error("Admin review Framer batch worker failed:", error)
+    }
+  })
 }
 
-
 async function syncAndPublishContinuousFramerBatch(batchItems, runId) {
-  return { ok: true, disabled: true, synced: 0, failed: 0, deployed: false, results: [] }
+  const validItems = (batchItems || []).filter(
+    (entry) => entry?.result?.created && entry?.result?.listing_id
+  )
+
+  if (!validItems.length) {
+    return {
+      synced: 0,
+      failed: 0,
+      deployed: false,
+      results: [],
+    }
+  }
+
+  if (!process.env.FRAMER_API_KEY || !process.env.FRAMER_PROJECT_URL) {
+    throw new Error(
+      "Missing FRAMER_API_KEY or FRAMER_PROJECT_URL in Render environment variables."
+    )
+  }
+
+  const listingIds = validItems.map((entry) => entry.result.listing_id)
+
+  const { data: listings, error: listingError } = await supabaseAdmin
+    .from("channel_listings")
+    .select("*")
+    .in("id", listingIds)
+
+  if (listingError) throw listingError
+
+  const listingById = new Map(
+    (listings || []).map((listing) => [String(listing.id), listing])
+  )
+
+  await logScraperEvent({
+    runId,
+    stage: "continuous_framer_batch_started",
+    message:
+      `True bulk Framer CMS batch started for ${validItems.length} AI-created listing(s).`,
+    metadata: {
+      batch_size: validItems.length,
+      framer_api_calls_expected: 1,
+    },
+  })
+
+  const { connect } = await import("framer-api")
+  const framer = await connect(
+    process.env.FRAMER_PROJECT_URL,
+    process.env.FRAMER_API_KEY
+  )
+
+  try {
+    const collection = await getFramerCollection(framer)
+    const fields = await collection.getFields()
+    const existingItems = await collection.getItems()
+
+    const existingById = new Map(
+      existingItems.map((item) => [String(item.id), item])
+    )
+    const existingBySlug = new Map(
+      existingItems.map((item) => [String(item.slug), item])
+    )
+
+    const entries = []
+    const results = []
+
+    // Build every CMS payload first. No Framer write occurs inside this loop.
+    for (const queueEntry of validItems) {
+      const listing = listingById.get(String(queueEntry.result.listing_id))
+
+      if (
+        !listing ||
+        listing.status !== "approved" ||
+        listing.is_banned
+      ) {
+        results.push({
+          queue_item_id: queueEntry.item.id,
+          listing_id: queueEntry.result.listing_id,
+          ok: false,
+          skipped: true,
+          error: "Listing is no longer eligible for Framer CMS.",
+        })
+        continue
+      }
+
+      try {
+        const fullPayload = await buildFullFramerFieldData(
+          listing,
+          fields,
+          framer
+        )
+
+        const cmsSlug = fullPayload.cmsSlug
+        const existingItem =
+          (listing.framer_cms_item_id
+            ? existingById.get(String(listing.framer_cms_item_id))
+            : null) ||
+          existingBySlug.get(String(cmsSlug)) ||
+          null
+
+        const payload = {
+          slug: cmsSlug,
+          fieldData: fullPayload.fieldData,
+        }
+
+        // Existing items update by id; brand-new AI listings intentionally
+        // omit id so Framer creates them as part of the same addItems array.
+        if (existingItem?.id) {
+          payload.id = existingItem.id
+        }
+
+        const result = {
+          queue_item_id: queueEntry.item.id,
+          listing_id: listing.id,
+          slug: cmsSlug,
+          ok: null,
+          warnings: fullPayload.warnings || [],
+          existing_cms_item_id: existingItem?.id || null,
+        }
+
+        entries.push({
+          queueEntry,
+          listing,
+          payload,
+          result,
+        })
+        results.push(result)
+      } catch (error) {
+        results.push({
+          queue_item_id: queueEntry.item.id,
+          listing_id: listing.id,
+          ok: false,
+          error: error.message || "Could not build Framer CMS payload.",
+        })
+      }
+    }
+
+    if (!entries.length) {
+      return {
+        synced: 0,
+        failed: results.filter((item) => item.ok === false).length,
+        deployed: false,
+        results,
+      }
+    }
+
+    // THIS is the important change:
+    // One array -> one collection.addItems() call for the whole 20-listing batch.
+    await collection.addItems(entries.map((entry) => entry.payload))
+
+    for (const entry of entries) {
+      entry.result.ok = true
+    }
+
+    let deployed = false
+
+    if (process.env.FRAMER_AUTO_DEPLOY !== "false") {
+      const publication = await framer.publish()
+      await framer.deploy(publication.deployment.id)
+      deployed = true
+    }
+
+    // Resolve CMS item ids after the array upload.
+    const itemsAfterBatch = await collection.getItems()
+    const afterBySlug = new Map(
+      itemsAfterBatch.map((item) => [String(item.slug), item])
+    )
+
+    const now = new Date().toISOString()
+
+    for (const entry of entries) {
+      const cmsItem =
+        (entry.result.existing_cms_item_id
+          ? itemsAfterBatch.find(
+              (item) =>
+                String(item.id) ===
+                String(entry.result.existing_cms_item_id)
+            )
+          : null) ||
+        afterBySlug.get(String(entry.result.slug)) ||
+        null
+
+      const warningText =
+        Array.isArray(entry.result.warnings) &&
+        entry.result.warnings.length
+          ? entry.result.warnings.join(" | ")
+          : null
+
+      if (deployed) {
+        await supabaseAdmin
+          .from("channel_listings")
+          .update({
+            framer_cms_item_id: cmsItem?.id || null,
+            framer_sync_status: "synced",
+            framer_synced_at: now,
+            framer_sync_error: warningText,
+            updated_at: now,
+          })
+          .eq("id", entry.listing.id)
+
+        const patchedResult = {
+          ...entry.queueEntry.result,
+          framer_synced: true,
+          framer_error: null,
+          framer_batch_pending: false,
+        }
+
+        await supabaseAdmin
+          .from("scraper_queue")
+          .update({
+            result: patchedResult,
+            framer_synced: true,
+            stage: "published",
+            error: null,
+            updated_at: now,
+          })
+          .eq("id", entry.queueEntry.item.id)
+      } else {
+        await supabaseAdmin
+          .from("channel_listings")
+          .update({
+            framer_sync_status: "pending_batch",
+            framer_sync_error:
+              "CMS batch uploaded but was not deployed.",
+            updated_at: now,
+          })
+          .eq("id", entry.listing.id)
+      }
+    }
+
+    await logScraperEvent({
+      runId,
+      level: deployed ? "success" : "warning",
+      stage: "continuous_framer_batch_completed",
+      message:
+        `Framer array batch complete: ${entries.length} listing(s) sent in one addItems call; ` +
+        `${deployed ? "one publish/deploy completed" : "deployment skipped"}.`,
+      metadata: {
+        requested: validItems.length,
+        array_size: entries.length,
+        framer_add_items_calls: 1,
+        deployed,
+        failed: results.filter((item) => item.ok === false).length,
+      },
+    })
+
+    return {
+      synced: deployed ? entries.length : 0,
+      failed: results.filter((item) => item.ok === false).length,
+      deployed,
+      results,
+    }
+  } catch (error) {
+    const now = new Date().toISOString()
+
+    // Keep these listings private/pending so a later batch/retry can handle them.
+    if (listingIds.length) {
+      await supabaseAdmin
+        .from("channel_listings")
+        .update({
+          framer_sync_status: "pending_batch",
+          framer_sync_error: String(
+            error.message || "Framer bulk batch failed."
+          ).slice(0, 2000),
+          updated_at: now,
+        })
+        .in("id", listingIds)
+    }
+
+    await logScraperEvent({
+      runId,
+      level: "error",
+      stage: "continuous_framer_batch_failed",
+      message:
+        error.message || "True bulk Framer CMS batch failed.",
+      metadata: {
+        batch_size: validItems.length,
+      },
+    })
+
+    throw error
+  } finally {
+    await framer.disconnect()
+  }
 }
 
 async function processContinuousAutomationQueue(
@@ -12157,10 +13563,7 @@ async function processContinuousAutomationQueue(
   state,
   producerState
 ) {
-  const settings = {
-    ...continuousAutomationSettings(state),
-    sync_to_framer: false,
-  }
+  const settings = continuousAutomationSettings(state)
   const adminUser = { id: state.created_by }
   const framerBatchSize = Math.max(
     1,
@@ -12173,6 +13576,7 @@ async function processContinuousAutomationQueue(
   let totalFramerSynced = 0
   let anyDeployed = false
   let pendingFramerBatch = []
+  let backgroundRotationIndex = 0
 
   if (!adminUser.id) {
     throw new Error(
@@ -12237,7 +13641,10 @@ async function processContinuousAutomationQueue(
           {
             syncToFramer: false,
             deferFramerBatch: false,
-            backgroundMode: settings.background_mode,
+            backgroundMode: backgroundModeForIndex(
+              settings.background_modes || [settings.background_mode],
+              backgroundRotationIndex++
+            ),
             analyzeRecentPosts: settings.analyze_recent_posts,
             filterNonEnglish: settings.filter_non_english,
             recentPostLimit: settings.recent_post_limit,
@@ -12405,7 +13812,10 @@ async function createContinuousAutomationRun(state) {
       country_id: "global",
       sort: "graph",
       sync_to_framer: false,
-      use_icon_as_background: settings.background_mode === "icon",
+      use_icon_as_background:
+        Array.isArray(settings.background_modes) &&
+        settings.background_modes.length === 1 &&
+        settings.background_modes[0] === "icon",
       created_by: state.created_by,
       discovery_stop_requested: false,
       stop_all_requested: false,
@@ -13073,20 +14483,33 @@ app.post("/api/admin/automation/toggle", async (req, res) => {
           MAX_ADMIN_IMPORT_LIMIT
         )
       ),
-      background_mode: ["none", "icon", "related", "telegram_post"].includes(
-        String(
-          req.body?.background_mode ||
-            currentSettings.background_mode ||
-            "related"
-        )
-      )
-        ? String(
-            req.body?.background_mode ||
-              currentSettings.background_mode ||
-              "related"
-          )
-        : "related",
-      sync_to_framer: false,
+      background_modes: normalizeBackgroundModes(
+        Array.isArray(req.body?.background_modes)
+          ? req.body.background_modes
+          : Array.isArray(currentSettings.background_modes)
+            ? currentSettings.background_modes
+            : req.body?.background_mode ||
+                currentSettings.background_mode ||
+                "related",
+        ["related"]
+      ),
+      background_mode: backgroundModeForIndex(
+        normalizeBackgroundModes(
+          Array.isArray(req.body?.background_modes)
+            ? req.body.background_modes
+            : Array.isArray(currentSettings.background_modes)
+              ? currentSettings.background_modes
+              : req.body?.background_mode ||
+                  currentSettings.background_mode ||
+                  "related",
+          ["related"]
+        ),
+        0
+      ),
+      sync_to_framer:
+        req.body?.sync_to_framer === undefined
+          ? currentSettings.sync_to_framer !== false
+          : req.body.sync_to_framer !== false,
       analyze_recent_posts:
         req.body?.analyze_recent_posts === undefined
           ? currentSettings.analyze_recent_posts !== false
