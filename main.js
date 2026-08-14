@@ -6005,6 +6005,11 @@ app.post("/api/listings/claim/verify", async (req, res) => {
         String(updates.image_url || "").trim() || listing.image_url || null,
       icon_url:
         String(updates.icon_url || "").trim() || listing.icon_url || null,
+      member_count:
+        Number.isFinite(Number(updates.member_count)) &&
+        Number(updates.member_count) >= 0
+          ? Math.round(Number(updates.member_count))
+          : Number(listing.member_count || 0),
       status: "approved",
       admin_reviewed: false,
       updated_at: new Date().toISOString(),
