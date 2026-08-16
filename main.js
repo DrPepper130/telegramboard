@@ -8415,7 +8415,7 @@ Do not always begin with an emoji. Do not use the same emoji repeatedly.
 
 SHORT DESCRIPTION
 
-description may contain 0 to 250 characters, but it should usually be 12 to 70 words so it fits naturally on a directory card.
+description may contain 0 to 250 words, but it should usually be 12 to 70 words so it fits naturally on a directory card.
 
 The description may be:
 - one compact sentence
@@ -8476,7 +8476,7 @@ Do not force the description to use all available words. Empty descriptions are 
 
 LONG DESCRIPTION
 
-The long_description is the richer listing-page copy. It must be between 400 and 2000 CHARACTERS, not words. Aim for about 1000-2000 characters when the source contains enough useful detail.
+The long_description is the richer listing-page copy. It must be between 400 and 2000 CHARACTERS, not words. Aim for about 650-1200 characters when the source contains enough useful detail.
 
 Make it visually interesting and easy to scan, closer to a well-written Telegram/Discord directory description than a polished essay. Do not default to 3-4 formal paragraphs.
 
@@ -8838,8 +8838,16 @@ async function importSingleTelegramListing(
     500,
     Math.min(Number(options?.postContextMaxCharacters || 5000), 15000)
   )
+  const requestedBackgroundModes = normalizeImportBackgroundModes(
+    options?.backgroundModes,
+    options?.backgroundMode || "related"
+  )
+  const selectedBackgroundMode = pickImportBackgroundMode(
+    requestedBackgroundModes,
+    normalizedTelegramLink
+  )
   const needsPostContext =
-    analyzeRecentPosts || String(options?.backgroundMode || "") === "telegram_post"
+    analyzeRecentPosts || selectedBackgroundMode === "telegram_post"
 
   if (needsPostContext) {
     try {
@@ -9053,7 +9061,7 @@ async function importSingleTelegramListing(
 
   try {
     backgroundResult = await chooseAndUploadImportBackground({
-      mode: options.backgroundMode,
+      mode: selectedBackgroundMode,
       listingId: inserted.id,
       iconUrl,
       postContext,
@@ -9064,7 +9072,7 @@ async function importSingleTelegramListing(
   } catch (err) {
     backgroundResult = {
       imageUrl: null,
-      source: String(options.backgroundMode || "none"),
+      source: String(selectedBackgroundMode || "none"),
       error: err.message,
     }
     console.error("Auto import background selection failed:", err.message)
@@ -9073,7 +9081,8 @@ async function importSingleTelegramListing(
   await onStage("listing_media_selected", {
     icon_url: iconUrl,
     image_url: backgroundResult.imageUrl,
-    background_mode: options.backgroundMode,
+    background_mode: selectedBackgroundMode,
+    background_modes: requestedBackgroundModes,
     background_source: backgroundResult.source,
     background_error: backgroundResult.error || null,
     public_post_images_found: postContext.imageCount || 0,
@@ -9142,7 +9151,8 @@ async function importSingleTelegramListing(
     icon_url: iconUrl,
     icon_error: iconError,
     image_url: backgroundResult.imageUrl,
-    background_mode: options.backgroundMode,
+    background_mode: selectedBackgroundMode,
+    background_modes: requestedBackgroundModes,
     background_source: backgroundResult.source,
     background_error: backgroundResult.error || null,
     related_background_query: backgroundResult.query || null,
@@ -9647,18 +9657,15 @@ app.post("/api/admin/import-telegram-listings", async (req, res) => {
       (req.body?.use_icon_as_background !== false ? "icon" : "none")
     ).toLowerCase()
 
-    const allowedBackgroundModes = new Set([
-      "none",
-      "icon",
-      "related",
-      "telegram_post",
-    ])
+    const requestedBackgroundModes = normalizeImportBackgroundModes(
+      req.body?.background_modes,
+      requestedBackgroundMode
+    )
 
     const options = {
       syncToFramer: false,
-      backgroundMode: allowedBackgroundModes.has(requestedBackgroundMode)
-        ? requestedBackgroundMode
-        : "none",
+      backgroundModes: requestedBackgroundModes,
+      backgroundMode: requestedBackgroundModes[0],
       analyzeRecentPosts: req.body?.analyze_recent_posts !== false,
       filterNonEnglish: req.body?.filter_non_english !== false,
       recentPostLimit: Math.max(
@@ -9887,6 +9894,44 @@ async function isContinuousAutomationEnabled() {
   }
 }
 
+const IMPORT_BACKGROUND_MODES = [
+  "none",
+  "icon",
+  "related",
+  "telegram_post",
+]
+
+function normalizeImportBackgroundModes(value, fallbackMode = "related") {
+  const requested = Array.isArray(value) ? value : []
+  const valid = [
+    ...new Set(
+      requested
+        .map((mode) => String(mode || "").trim().toLowerCase())
+        .filter((mode) => IMPORT_BACKGROUND_MODES.includes(mode))
+    ),
+  ]
+
+  if (valid.length) return valid
+
+  const fallback = String(fallbackMode || "related").trim().toLowerCase()
+  return [
+    IMPORT_BACKGROUND_MODES.includes(fallback)
+      ? fallback
+      : "related",
+  ]
+}
+
+function pickImportBackgroundMode(modes, seed = "") {
+  const validModes = normalizeImportBackgroundModes(modes)
+  if (validModes.length === 1) return validModes[0]
+
+  // Stable per Telegram listing so a multi-source configuration distributes
+  // listings across the selected choices without changing on retries.
+  const index = stableStringHash(String(seed || "")) % validModes.length
+  return validModes[index]
+}
+
+
 function continuousAutomationSettings(state) {
   const raw =
     state?.settings && typeof state.settings === "object"
@@ -9916,11 +9961,14 @@ function continuousAutomationSettings(state) {
       1,
       Math.min(Number(raw.import_batch_size || 20), MAX_ADMIN_IMPORT_LIMIT)
     ),
-    background_mode: ["none", "icon", "related", "telegram_post"].includes(
-      String(raw.background_mode || "related")
-    )
-      ? String(raw.background_mode || "related")
-      : "related",
+    background_modes: normalizeImportBackgroundModes(
+      raw.background_modes,
+      raw.background_mode || "related"
+    ),
+    background_mode: normalizeImportBackgroundModes(
+      raw.background_modes,
+      raw.background_mode || "related"
+    )[0],
     sync_to_framer: false,
     analyze_recent_posts: raw.analyze_recent_posts !== false,
     filter_non_english: raw.filter_non_english !== false,
@@ -12244,6 +12292,7 @@ async function processContinuousAutomationQueue(
           {
             syncToFramer: false,
             deferFramerBatch: false,
+            backgroundModes: settings.background_modes,
             backgroundMode: settings.background_mode,
             analyzeRecentPosts: settings.analyze_recent_posts,
             filterNonEnglish: settings.filter_non_english,
@@ -13015,6 +13064,11 @@ app.post("/api/admin/automation/toggle", async (req, res) => {
         ? current.settings
         : {}
 
+    const requestedBackgroundModes = normalizeImportBackgroundModes(
+      req.body?.background_modes ?? currentSettings.background_modes,
+      req.body?.background_mode ?? currentSettings.background_mode ?? "related"
+    )
+
     const settings = {
       ...currentSettings,
       seed_limit: Math.max(
@@ -13080,19 +13134,8 @@ app.post("/api/admin/automation/toggle", async (req, res) => {
           MAX_ADMIN_IMPORT_LIMIT
         )
       ),
-      background_mode: ["none", "icon", "related", "telegram_post"].includes(
-        String(
-          req.body?.background_mode ||
-            currentSettings.background_mode ||
-            "related"
-        )
-      )
-        ? String(
-            req.body?.background_mode ||
-              currentSettings.background_mode ||
-              "related"
-          )
-        : "related",
+      background_modes: requestedBackgroundModes,
+      background_mode: requestedBackgroundModes[0],
       sync_to_framer: false,
       analyze_recent_posts:
         req.body?.analyze_recent_posts === undefined
