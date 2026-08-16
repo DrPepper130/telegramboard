@@ -8415,7 +8415,7 @@ Do not always begin with an emoji. Do not use the same emoji repeatedly.
 
 SHORT DESCRIPTION
 
-description may contain 0 to 250 words, but it should usually be 12 to 70 words so it fits naturally on a directory card.
+description may contain 0 to 250 characters, but it should usually be 12 to 70 words so it fits naturally on a directory card.
 
 The description may be:
 - one compact sentence
@@ -8476,7 +8476,7 @@ Do not force the description to use all available words. Empty descriptions are 
 
 LONG DESCRIPTION
 
-The long_description is the richer listing-page copy. It must be between 400 and 2000 CHARACTERS, not words. Aim for about 650-1200 characters when the source contains enough useful detail.
+The long_description is the richer listing-page copy. It must be between 400 and 2000 CHARACTERS, not words. Aim for about 1000-2000 characters when the source contains enough useful detail.
 
 Make it visually interesting and easy to scan, closer to a well-written Telegram/Discord directory description than a polished essay. Do not default to 3-4 formal paragraphs.
 
