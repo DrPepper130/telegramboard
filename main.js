@@ -4163,8 +4163,9 @@ app.get("/api/analytics/owner-summary", async (req, res) => {
 
 app.get("/api/referrals/track", async (req, res) => {
   try {
+    // Legacy compatibility for old /go?code= links.
+    // Referral clicks no longer affect ranking and are no longer recorded.
     const code = cleanReferralCode(req.query.code)
-    const visitorId = cleanVisitorId(req.query.visitor_id)
 
     if (!code) {
       return res.status(400).json({ error: "Missing referral code" })
@@ -4172,7 +4173,7 @@ app.get("/api/referrals/track", async (req, res) => {
 
     const { data: listing, error } = await supabaseAdmin
       .from("channel_listings")
-      .select("*")
+      .select("id, telegram_link, short_invite, status, is_banned")
       .eq("short_invite", code)
       .eq("status", "approved")
       .maybeSingle()
@@ -4183,125 +4184,17 @@ app.get("/api/referrals/track", async (req, res) => {
       return res.status(404).json({ error: "Invite not found" })
     }
 
-    const nowDate = new Date()
-    const now = nowDate.toISOString()
-    const resetNeeded = shouldResetReferralWindow(listing)
-
-    const windowStartDate = resetNeeded
-      ? nowDate
-      : new Date(listing.referral_last_reset || now)
-
-    const windowStart = windowStartDate.toISOString()
-
-    const ip = getClientIp(req)
-    const userAgent = req.headers["user-agent"] || ""
-
-    const visitorHash = hashValue(visitorId)
-    const ipHash = hashValue(ip)
-    const userAgentHash = hashValue(userAgent)
-    const ipUserAgentHash = hashValue(`${ip || ""}|${userAgent || ""}`)
-
-    const startingClicks = resetNeeded
-      ? 0
-      : Number(listing.referral_clicks_today || 0)
-
-    let alreadyCounted = false
-
-    let duplicateChecks = []
-
-    if (visitorHash) {
-      duplicateChecks.push(`visitor_hash.eq.${visitorHash}`)
-    }
-
-    if (ipHash) {
-      duplicateChecks.push(`ip_hash.eq.${ipHash}`)
-    }
-
-    if (ipUserAgentHash) {
-      duplicateChecks.push(`ip_user_agent_hash.eq.${ipUserAgentHash}`)
-    }
-
-    if (duplicateChecks.length > 0) {
-      const { data: existingClick, error: existingError } = await supabaseAdmin
-        .from("listing_referral_clicks")
-        .select("id")
-        .eq("listing_id", listing.id)
-        .gte("created_at", windowStart)
-        .or(duplicateChecks.join(","))
-        .limit(1)
-        .maybeSingle()
-
-      if (existingError) throw existingError
-
-      alreadyCounted = !!existingClick
-    }
-
-    const canCount =
-      !alreadyCounted &&
-      startingClicks < REFERRAL_DAILY_CAP &&
-      (visitorHash || ipHash || ipUserAgentHash)
-
-    const nextClicks = canCount ? startingClicks + 1 : startingClicks
-    const nextBoost = Math.round(
-      (Math.min(nextClicks, REFERRAL_DAILY_CAP) / REFERRAL_DAILY_CAP) * 100
-    )
-
-    if (canCount) {
-      await supabaseAdmin.from("listing_referral_clicks").insert({
-        listing_id: listing.id,
-        short_invite: code,
-
-        // Keep raw values only if your table already has these columns.
-        // If you prefer privacy-only, remove ip_address and user_agent.
-        ip_address: ip,
-        user_agent: userAgent,
-
-        visitor_hash: visitorHash,
-        ip_hash: ipHash,
-        user_agent_hash: userAgentHash,
-        ip_user_agent_hash: ipUserAgentHash,
-
-        counted: true,
-        created_at: now,
-      })
-    } else {
-      await supabaseAdmin.from("listing_referral_clicks").insert({
-        listing_id: listing.id,
-        short_invite: code,
-        ip_address: ip,
-        user_agent: userAgent,
-        visitor_hash: visitorHash,
-        ip_hash: ipHash,
-        user_agent_hash: userAgentHash,
-        ip_user_agent_hash: ipUserAgentHash,
-        counted: false,
-        created_at: now,
-      })
-    }
-
-    const { error: updateError } = await supabaseAdmin
-      .from("channel_listings")
-      .update({
-        referral_clicks_today: nextClicks,
-        referral_boost_score: nextBoost,
-        referral_last_reset: resetNeeded ? now : listing.referral_last_reset,
-        updated_at: now,
-      })
-      .eq("id", listing.id)
-
-    if (updateError) throw updateError
-
     return res.json({
       ok: true,
-      counted: canCount,
-      already_counted: alreadyCounted,
+      legacy: true,
+      counted: false,
       telegram_link: listing.telegram_link,
-      clicks_today: nextClicks,
-      boost_percent: nextBoost,
-      daily_cap: REFERRAL_DAILY_CAP,
+      clicks_today: 0,
+      boost_percent: 0,
+      daily_cap: 0,
     })
   } catch (err) {
-    console.error("Referral tracking error:", err)
+    console.error("Legacy /go lookup error:", err)
     return res.status(500).json({ error: err.message })
   }
 })
@@ -4373,10 +4266,11 @@ function cleanDirectorySearch(value) {
 
 
 const RANKING_WEIGHTS = {
-  votes: 0.35,
-  referralBoost: 0.25,
-  memberGrowth: 0.25,
-  freshness: 0.15,
+  // Same relative balance as the old non-referral factors after removing
+  // the 25% referral term: 35/75, 25/75, 15/75.
+  votes: 0.4666666667,
+  memberGrowth: 0.3333333333,
+  freshness: 0.20,
 }
 
 function clampNumber(value, min, max) {
@@ -4415,11 +4309,6 @@ function calculateRankingScore(listing, maxStats) {
     maxStats.maxVotes
   )
 
-  const referralScore = clampNumber(
-    listing.referral_boost_score || 0,
-    0,
-    100
-  )
 
   const memberGrowthScore = normalizeLogScore(
     listing.member_growth_24h || 0,
@@ -4430,7 +4319,6 @@ function calculateRankingScore(listing, maxStats) {
 
   const rankingScore =
     voteScore * RANKING_WEIGHTS.votes +
-    referralScore * RANKING_WEIGHTS.referralBoost +
     memberGrowthScore * RANKING_WEIGHTS.memberGrowth +
     freshnessScore * RANKING_WEIGHTS.freshness
 
@@ -4438,7 +4326,6 @@ function calculateRankingScore(listing, maxStats) {
     ranking_score: Math.round(rankingScore * 100) / 100,
     ranking_breakdown: {
       vote_score: Math.round(voteScore * 100) / 100,
-      referral_score: Math.round(referralScore * 100) / 100,
       member_growth_score: Math.round(memberGrowthScore * 100) / 100,
       freshness_score: Math.round(freshnessScore * 100) / 100,
     },
