@@ -3152,6 +3152,8 @@ async function safeDeleteRelatedRows(tableName, listingId) {
 async function deleteListingEverywhere(listing, options = {}) {
   const relatedTables = [
     "listing_referral_clicks",
+    "listing_analytics_events",
+    "listing_analytics_daily",
     "channel_member_snapshots",
     "channel_votes",
     "channel_listing_changes",
@@ -3832,6 +3834,332 @@ function cleanVisitorId(value) {
     .replace(/[^a-zA-Z0-9_-]/g, "")
     .slice(0, 80)
 }
+
+
+// ========================================
+// LISTING OWNER ANALYTICS
+// ========================================
+
+const LISTING_ANALYTICS_EVENT_TYPES = new Set([
+  "impression",
+  "page_view",
+  "telegram_click",
+])
+
+function cleanAnalyticsEventType(value) {
+  const eventType = String(value || "").trim().toLowerCase()
+  return LISTING_ANALYTICS_EVENT_TYPES.has(eventType) ? eventType : null
+}
+
+function cleanAnalyticsListingId(value) {
+  const id = String(value || "").trim()
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id)
+    ? id
+    : null
+}
+
+function analyticsVisitorHash(req, suppliedVisitorId = "") {
+  const visitorId = cleanVisitorId(suppliedVisitorId)
+  const ip = getClientIp(req) || ""
+  const userAgent = String(req.headers["user-agent"] || "").slice(0, 600)
+
+  // Browser-generated visitor IDs are preferred because many visitors can share
+  // an IP. IP + UA remains a fallback for blocked/localStorage-disabled clients.
+  return hashValue(
+    visitorId
+      ? `visitor:${visitorId}`
+      : `fallback:${ip}|${userAgent}`
+  )
+}
+
+app.post("/api/analytics/track", async (req, res) => {
+  try {
+    const listingId = cleanAnalyticsListingId(req.body?.listing_id)
+    const eventType = cleanAnalyticsEventType(req.body?.event_type)
+
+    if (!listingId || !eventType) {
+      return res.status(400).json({
+        ok: false,
+        error: "Missing or invalid listing analytics event.",
+      })
+    }
+
+    const { data: listing, error: listingError } = await supabaseAdmin
+      .from("channel_listings")
+      .select("id, status, is_banned")
+      .eq("id", listingId)
+      .maybeSingle()
+
+    if (listingError) throw listingError
+
+    if (
+      !listing ||
+      String(listing.status || "").toLowerCase() !== "approved" ||
+      listing.is_banned === true
+    ) {
+      return res.status(404).json({
+        ok: false,
+        error: "Listing not found.",
+      })
+    }
+
+    const visitorHash = analyticsVisitorHash(
+      req,
+      req.body?.visitor_id || ""
+    )
+
+    if (!visitorHash) {
+      return res.status(400).json({
+        ok: false,
+        error: "Could not identify analytics visitor.",
+      })
+    }
+
+    const { data: counted, error: rpcError } = await supabaseAdmin.rpc(
+      "telehub_record_listing_analytics",
+      {
+        p_listing_id: listingId,
+        p_event_type: eventType,
+        p_visitor_hash: visitorHash,
+      }
+    )
+
+    if (rpcError) {
+      const error = new Error(
+        `Listing analytics storage is not ready. Run the TeleHub analytics SQL migration first. ${rpcError.message}`
+      )
+      error.code = "ANALYTICS_MIGRATION_REQUIRED"
+      throw error
+    }
+
+    res.set("Cache-Control", "no-store")
+
+    return res.json({
+      ok: true,
+      counted: counted === true,
+      event_type: eventType,
+    })
+  } catch (err) {
+    console.error("Listing analytics track error:", err)
+
+    return res.status(500).json({
+      ok: false,
+      error: err.message || "Could not record listing analytics.",
+      code: err.code || null,
+    })
+  }
+})
+
+function analyticsDateKey(value) {
+  const date = value instanceof Date ? value : new Date(value)
+  if (!Number.isFinite(date.getTime())) return ""
+  return date.toISOString().slice(0, 10)
+}
+
+function analyticsEmptyDay(day) {
+  return {
+    day,
+    impressions: 0,
+    page_views: 0,
+    telegram_clicks: 0,
+  }
+}
+
+function analyticsSeries(days, rows) {
+  const byDay = new Map()
+
+  for (const row of rows || []) {
+    const day = analyticsDateKey(row.day)
+    if (!day) continue
+
+    byDay.set(day, {
+      day,
+      impressions: Math.max(0, Number(row.impressions || 0)),
+      page_views: Math.max(0, Number(row.page_views || 0)),
+      telegram_clicks: Math.max(0, Number(row.telegram_clicks || 0)),
+    })
+  }
+
+  const result = []
+  const today = new Date()
+
+  for (let offset = days - 1; offset >= 0; offset -= 1) {
+    const dayDate = new Date(today)
+    dayDate.setUTCHours(0, 0, 0, 0)
+    dayDate.setUTCDate(dayDate.getUTCDate() - offset)
+
+    const key = analyticsDateKey(dayDate)
+    result.push(byDay.get(key) || analyticsEmptyDay(key))
+  }
+
+  return result
+}
+
+app.get("/api/analytics/owner-summary", async (req, res) => {
+  try {
+    const user = await requireTelehubUser(req)
+    const days = Math.max(
+      1,
+      Math.min(Number.parseInt(req.query.days, 10) || 30, 90)
+    )
+
+    const { data: listings, error: listingsError } = await supabaseAdmin
+      .from("channel_listings")
+      .select(
+        "id, user_id, member_count, paid_rank, paid_rank_status, created_at"
+      )
+      .eq("user_id", user.id)
+
+    if (listingsError) throw listingsError
+
+    const ownedListings = listings || []
+    const listingIds = ownedListings.map((item) => item.id).filter(Boolean)
+
+    if (!listingIds.length) {
+      return res.json({
+        ok: true,
+        days,
+        listings: [],
+      })
+    }
+
+    const sinceDate = new Date()
+    sinceDate.setUTCHours(0, 0, 0, 0)
+    sinceDate.setUTCDate(sinceDate.getUTCDate() - (days - 1))
+
+    const snapshotSince = new Date(sinceDate)
+    snapshotSince.setUTCDate(snapshotSince.getUTCDate() - 2)
+
+    const [dailyResult, snapshotResult] = await Promise.all([
+      supabaseAdmin
+        .from("listing_analytics_daily")
+        .select(
+          "listing_id, day, impressions, page_views, telegram_clicks"
+        )
+        .in("listing_id", listingIds)
+        .gte("day", analyticsDateKey(sinceDate))
+        .order("day", { ascending: true }),
+      supabaseAdmin
+        .from("channel_member_snapshots")
+        .select("listing_id, member_count, created_at")
+        .in("listing_id", listingIds)
+        .gte("created_at", snapshotSince.toISOString())
+        .order("created_at", { ascending: true }),
+    ])
+
+    if (dailyResult.error) {
+      const error = new Error(
+        `Listing analytics storage is not ready. Run the TeleHub analytics SQL migration first. ${dailyResult.error.message}`
+      )
+      error.code = "ANALYTICS_MIGRATION_REQUIRED"
+      throw error
+    }
+
+    if (snapshotResult.error) throw snapshotResult.error
+
+    const dailyByListing = new Map()
+    for (const row of dailyResult.data || []) {
+      const id = String(row.listing_id || "")
+      if (!dailyByListing.has(id)) dailyByListing.set(id, [])
+      dailyByListing.get(id).push(row)
+    }
+
+    const snapshotsByListing = new Map()
+    for (const row of snapshotResult.data || []) {
+      const id = String(row.listing_id || "")
+      if (!snapshotsByListing.has(id)) snapshotsByListing.set(id, [])
+      snapshotsByListing.get(id).push(row)
+    }
+
+    const summaries = ownedListings.map((listing) => {
+      const rows = dailyByListing.get(String(listing.id)) || []
+      const series = analyticsSeries(days, rows)
+
+      const totals = series.reduce(
+        (acc, row) => {
+          acc.impressions += Number(row.impressions || 0)
+          acc.page_views += Number(row.page_views || 0)
+          acc.telegram_clicks += Number(row.telegram_clicks || 0)
+          return acc
+        },
+        {
+          impressions: 0,
+          page_views: 0,
+          telegram_clicks: 0,
+        }
+      )
+
+      const snapshots =
+        snapshotsByListing.get(String(listing.id)) || []
+
+      const firstSnapshot = snapshots.find(
+        (snapshot) =>
+          new Date(snapshot.created_at).getTime() >= sinceDate.getTime()
+      ) || snapshots[0]
+
+      const startingMembers = Number(
+        firstSnapshot?.member_count ?? listing.member_count ?? 0
+      )
+      const currentMembers = Number(listing.member_count || 0)
+      const memberGrowth = currentMembers - startingMembers
+
+      const impressionToViewRate =
+        totals.impressions > 0
+          ? (totals.page_views / totals.impressions) * 100
+          : 0
+
+      const impressionToTelegramRate =
+        totals.impressions > 0
+          ? (totals.telegram_clicks / totals.impressions) * 100
+          : 0
+
+      const viewToTelegramRate =
+        totals.page_views > 0
+          ? (totals.telegram_clicks / totals.page_views) * 100
+          : 0
+
+      const paidRank =
+        String(listing.paid_rank_status || "").toLowerCase() === "active"
+          ? String(listing.paid_rank || "free").toLowerCase()
+          : "free"
+
+      return {
+        listing_id: listing.id,
+        days,
+        totals,
+        rates: {
+          impression_to_view_percent:
+            Math.round(impressionToViewRate * 100) / 100,
+          impression_to_telegram_percent:
+            Math.round(impressionToTelegramRate * 100) / 100,
+          view_to_telegram_percent:
+            Math.round(viewToTelegramRate * 100) / 100,
+        },
+        member_growth: memberGrowth,
+        current_members: currentMembers,
+        paid_rank: paidRank,
+        series,
+      }
+    })
+
+    res.set("Cache-Control", "private, no-store")
+
+    return res.json({
+      ok: true,
+      days,
+      listings: summaries,
+    })
+  } catch (err) {
+    console.error("Owner analytics summary error:", err)
+
+    return res.status(err.statusCode || 500).json({
+      ok: false,
+      error: err.message || "Could not load listing analytics.",
+      code: err.code || null,
+    })
+  }
+})
+
 
 app.get("/api/referrals/track", async (req, res) => {
   try {
