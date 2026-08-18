@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 })
 
 const BACKEND_BUILD_ID =
-  "telehub-analytics-snapshot-loop-escape-2026-08-18"
+  "telehub-acquisition-conversion-tracking-2026-08-18"
 
 // TeleHub listing pages are served directly from Supabase/Vercel.
 // Old Framer CMS compatibility code is hard-disabled below.
@@ -3994,6 +3994,222 @@ function analyticsSeries(days, rows) {
 
   return result
 }
+
+
+function cleanAcquisitionString(value, maxLength = 300) {
+  return String(value || "").trim().slice(0, maxLength)
+}
+
+function cleanAcquisitionTouch(value) {
+  if (!value || typeof value !== "object") return null
+
+  return {
+    source: cleanAcquisitionString(value.source, 120),
+    medium: cleanAcquisitionString(value.medium, 120),
+    campaign: cleanAcquisitionString(value.campaign, 180),
+    content: cleanAcquisitionString(value.content, 180),
+    term: cleanAcquisitionString(value.term, 180),
+    twclid: cleanAcquisitionString(value.twclid, 300),
+    reddit_click_id: cleanAcquisitionString(value.reddit_click_id, 300),
+    landing_url: cleanAcquisitionString(value.landing_url, 1500),
+    referrer: cleanAcquisitionString(value.referrer, 1500),
+    captured_at: cleanAcquisitionString(value.captured_at, 64),
+  }
+}
+
+app.post("/api/analytics/acquisition-conversion", async (req, res) => {
+  try {
+    const user = await requireTelehubUser(req)
+    const listingId = cleanAcquisitionString(req.body?.listing_id, 80)
+    const conversionType = cleanAcquisitionString(
+      req.body?.conversion_type,
+      40
+    )
+
+    if (!listingId) {
+      return res.status(400).json({ ok: false, error: "Missing listing_id." })
+    }
+
+    if (
+      conversionType !== "listing_created" &&
+      conversionType !== "listing_claimed"
+    ) {
+      return res.status(400).json({
+        ok: false,
+        error: "Invalid conversion_type.",
+      })
+    }
+
+    const { data: listing, error: listingError } = await supabaseAdmin
+      .from("channel_listings")
+      .select("id, user_id")
+      .eq("id", listingId)
+      .maybeSingle()
+
+    if (listingError) throw listingError
+
+    if (!listing || listing.user_id !== user.id) {
+      return res.status(403).json({
+        ok: false,
+        error: "You do not own this listing.",
+      })
+    }
+
+    const attribution =
+      req.body?.attribution && typeof req.body.attribution === "object"
+        ? req.body.attribution
+        : {}
+
+    const firstTouch = cleanAcquisitionTouch(attribution.first_touch)
+    const lastTouch = cleanAcquisitionTouch(attribution.last_touch)
+    const preferredTouch = lastTouch || firstTouch || {}
+    const visitorId = cleanAcquisitionString(req.body?.visitor_id, 180)
+
+    const row = {
+      listing_id: listing.id,
+      user_id: user.id,
+      conversion_type: conversionType,
+      visitor_id: visitorId || null,
+
+      first_source: firstTouch?.source || null,
+      first_medium: firstTouch?.medium || null,
+      first_campaign: firstTouch?.campaign || null,
+      first_content: firstTouch?.content || null,
+      first_term: firstTouch?.term || null,
+
+      source: preferredTouch.source || null,
+      medium: preferredTouch.medium || null,
+      campaign: preferredTouch.campaign || null,
+      content: preferredTouch.content || null,
+      term: preferredTouch.term || null,
+
+      twclid: preferredTouch.twclid || firstTouch?.twclid || null,
+      reddit_click_id:
+        preferredTouch.reddit_click_id ||
+        firstTouch?.reddit_click_id ||
+        null,
+
+      landing_url:
+        preferredTouch.landing_url || firstTouch?.landing_url || null,
+      referrer: preferredTouch.referrer || firstTouch?.referrer || null,
+
+      attribution: {
+        first_touch: firstTouch,
+        last_touch: lastTouch,
+      },
+    }
+
+    const { data: stored, error: insertError } = await supabaseAdmin
+      .from("listing_acquisition_conversions")
+      .upsert(row, {
+        onConflict: "listing_id,conversion_type",
+        ignoreDuplicates: true,
+      })
+      .select(
+        "id, listing_id, conversion_type, source, medium, campaign, content, created_at"
+      )
+      .maybeSingle()
+
+    if (insertError) {
+      const error = new Error(
+        `Acquisition conversion storage is not ready. Run the acquisition tracking SQL migration first. ${insertError.message}`
+      )
+      error.code = "ACQUISITION_MIGRATION_REQUIRED"
+      throw error
+    }
+
+    res.set("Cache-Control", "no-store")
+
+    return res.json({
+      ok: true,
+      conversion: stored || null,
+      source: row.source,
+      campaign: row.campaign,
+    })
+  } catch (err) {
+    console.error("Acquisition conversion tracking error:", err)
+    return res.status(err.statusCode || 500).json({
+      ok: false,
+      error: err.message || "Could not record acquisition conversion.",
+      code: err.code || null,
+    })
+  }
+})
+
+app.get("/api/admin/acquisition-summary", async (req, res) => {
+  try {
+    const user = await requireTelehubUser(req)
+    const isAdmin = await isUserAdmin(user)
+
+    if (!isAdmin) {
+      return res.status(403).json({ error: "Admin access required." })
+    }
+
+    const days = Math.max(
+      1,
+      Math.min(Number.parseInt(req.query?.days, 10) || 30, 365)
+    )
+    const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000)
+
+    const { data, error } = await supabaseAdmin
+      .from("listing_acquisition_conversions")
+      .select(
+        "listing_id, conversion_type, source, medium, campaign, content, term, created_at"
+      )
+      .gte("created_at", since.toISOString())
+      .order("created_at", { ascending: false })
+
+    if (error) throw error
+
+    const groups = new Map()
+
+    for (const item of data || []) {
+      const key = [
+        item.source || "direct/unknown",
+        item.medium || "",
+        item.campaign || "(no campaign)",
+        item.content || "",
+      ].join("||")
+
+      if (!groups.has(key)) {
+        groups.set(key, {
+          source: item.source || "direct/unknown",
+          medium: item.medium || "",
+          campaign: item.campaign || "(no campaign)",
+          content: item.content || "",
+          listings_created: 0,
+          listings_claimed: 0,
+          total_conversions: 0,
+        })
+      }
+
+      const group = groups.get(key)
+      if (item.conversion_type === "listing_created") {
+        group.listings_created += 1
+      }
+      if (item.conversion_type === "listing_claimed") {
+        group.listings_claimed += 1
+      }
+      group.total_conversions += 1
+    }
+
+    return res.json({
+      ok: true,
+      days,
+      total_conversions: (data || []).length,
+      campaigns: Array.from(groups.values()).sort(
+        (a, b) => b.total_conversions - a.total_conversions
+      ),
+      recent: data || [],
+    })
+  } catch (err) {
+    console.error("Acquisition summary error:", err)
+    return res.status(err.statusCode || 500).json({
+      ok: false,
+      error: err.message || "Could not load acquisition summary.",
+    })
+  }
+})
 
 app.get("/api/analytics/owner-summary", async (req, res) => {
   try {
