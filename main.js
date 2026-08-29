@@ -9005,50 +9005,146 @@ LONG DESCRIPTION
 
 The long_description is the richer listing-page copy. It must be between 400 and 2000 CHARACTERS, not words. Aim for about 650-1200 characters when the source contains enough useful detail.
 
-Make it visually interesting and easy to scan, closer to a well-written Telegram/Discord directory description than a polished essay. Do not default to 3-4 formal paragraphs.
+The most important goal is STRUCTURAL VARIETY.
 
-Use varied combinations of:
-- a short opening hook or 1-2 sentence intro
-- blank lines between sections
-- feature lines beginning with symbols such as ➜, >, •, ✦, ★, ♡, or relevant emojis
-- short mini-sections such as "What you'll find:", "Why join:", "Inside:", "Highlights:", or "Other stuff:" when natural
-- compact lists of supported games, topics, activities, content, tools, or benefits
-- a short closing invitation when natural
+Different listings should look like they were written by different community owners. Do not use one repeating template.
 
-Formatting rules:
-- Preserve real line breaks in the JSON string.
-- Use 2-6 visually distinct blocks or groups when enough source material exists.
-- Lists should usually contain 3-8 supported items.
-- Do not use markdown headings with #. Plain-text labels are better.
-- Do not use the exact same arrows, section labels, or emoji pattern across every listing.
-- Keep it natural, slightly promotional, and owner-written.
-- Avoid corporate prose, SEO filler, generic summaries, and repetitive sentence structures.
-- Do not repeat the short description verbatim.
+Choose whichever structure best fits the source material. Possible structures include:
 
-Every specific feature in the long description must be source-supported. Never invent giveaways, discounts, staff, voice chat, events, prizes, official status, products, services, games, topics, or features.
+- mostly normal paragraphs with little or no formatting
+- a short welcome line followed by several emoji-led statements
+- a compact topic ribbon followed by one or two paragraphs
+- a mini landing-page style description with a few named sections
+- a narrative or story-like description
+- a short intro followed by one simple list
+- mostly short fragments separated by line breaks
+- a dense owner-written paragraph with casual punctuation
+- a highly formatted promotional description
+- a plain factual description with no emojis
+- a mix of prose and one small feature section
+- an unusual personal or themed introduction followed by practical details
 
-Before returning JSON, make sure long_description is at least 400 characters and no more than 2000 characters. If the source has limited detail, expand only with grounded explanation and organization rather than invented claims.
+Do NOT default to:
+intro → heading → arrow list → second list → closing invitation
 
-CATEGORIES
+That exact pattern should be uncommon.
 
-Return 2 to 5 short Title Case categories.
-Put the most specific category first.
-Avoid duplicates and near-duplicates.
-Do not use Telegram as a category unless the channel is specifically about Telegram.
+FORMAT DIVERSITY
 
-NSFW
+Some long descriptions should:
+- have no headings
+- have no bullets
+- have no arrows
+- have no emojis
+- be almost entirely prose
+- contain only 2 or 3 paragraphs
+- be visually dense
+- be very sparse
+- use one decorative separator or emoji ribbon
+- use short section labels
+- use a list only once
+- contain a sign-off or themed closing when it fits
+- end without any call to action
 
-Set is_nsfw to true only when clearly adult, sexually explicit, pornographic, drug-focused, gambling-focused, or strongly mature.
+Other descriptions may be more heavily formatted, but this should not be the default.
 
-FINAL SILENT CHECK
+Do not repeatedly use:
+- ➜
+- ➡️
+- •
+- "What you'll find:"
+- "Why join:"
+- "Inside:"
+- "Highlights:"
+- "What we cover:"
+- "Join us"
+- "Come chat"
+- "There’s always something happening here"
 
-Before returning:
-- confirm all claims are source-supported
-- confirm the title follows its assigned profile
-- confirm emoji count fits the budget
-- confirm the description structure is not generic
-- confirm the short and long descriptions are different
-- confirm valid JSON with all five fields
+If you use bullets or symbols, vary them naturally and use them only when they improve readability.
+
+Do not force multiple lists into the same description.
+
+VOICE
+
+The writing should feel owner-written rather than generated.
+
+Depending on the source, the voice may be:
+- casual
+- enthusiastic
+- understated
+- playful
+- informative
+- quirky
+- promotional
+- story-like
+- direct
+- slightly messy
+- highly organized
+
+Do not make every listing equally polished or equally energetic.
+
+Sentence lengths should vary. Some descriptions may use fragments. Some may use long conversational sentences. Some may be very concise.
+
+EMOJIS
+
+Emoji usage should vary heavily.
+
+Some descriptions:
+- use several emojis
+- use only one or two
+- use emojis as section markers
+- use an emoji/topic ribbon
+- use no emojis at all
+
+Do not automatically begin each section with an emoji.
+
+CONTENT
+
+Use the Telegram title, bio, description, member count, and repeated themes from recent public posts to make the long description specific.
+
+Prefer summarizing recurring themes from recent posts rather than quoting individual posts.
+
+Do not invent unsupported:
+- giveaways
+- discounts
+- staff
+- voice chat
+- events
+- prizes
+- official status
+- products
+- services
+- games
+- topics
+- activity levels
+- moderation quality
+- community size claims beyond supplied data
+
+If the source has limited information, write a simpler grounded description. Do not pad it with generic filler.
+
+Avoid generic AI phrases such as:
+- vibrant community
+- welcoming community
+- connect with like-minded people
+- something for everyone
+- your go-to destination
+- whether you're a beginner or expert
+- whether you're a seasoned player or just starting out
+- stay up to date
+- buzzing with activity
+
+Do not repeat the short description verbatim.
+
+FINAL STRUCTURE CHECK
+
+Before returning the result, silently check:
+
+- Does this long description visibly differ in structure from a typical intro + arrow-list template?
+- Did you avoid unnecessary arrows and repeated section labels?
+- Would this look plausible as something a real Discord or Telegram owner typed themselves?
+- Are all specific claims supported by the source?
+- Is long_description between 400 and 2000 characters?
 
 Return only the JSON object.
 `.trim()
