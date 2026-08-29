@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 })
 
 const BACKEND_BUILD_ID =
-  "telehub-recent-activity-filter-2026-08-28"
+  "telehub-master-admin-ai-prompt-2026-08-29"
 
 // TeleHub listing pages are served directly from Supabase/Vercel.
 // Old Framer CMS compatibility code is hard-disabled below.
@@ -8676,131 +8676,13 @@ function fallbackImportContent({
 async function generateAiImportContent(input) {
   const fallback = fallbackImportContent(input)
 
-  const creativeProfiles = [
-    {
-      name: "clean_minimal",
-      title_style:
-        "Use a clean name plus one useful descriptor. No emoji and no keyword ribbon.",
-      tone: "simple, confident, human",
-      description_shape:
-        "one compact sentence with no sales language",
-      emoji_budget: "none",
-      formatting_style: "plain sentence",
-    },
-    {
-      name: "discadia_ribbon",
-      title_style:
-        "Use the recognizable name followed by 3 to 7 supported topics separated by a pipe and bullets.",
-      tone: "energetic directory listing",
-      description_shape:
-        "a lively keyword-rich paragraph with short fragments",
-      emoji_budget: "moderate",
-      formatting_style: "pipe and bullet rhythm",
-    },
-    {
-      name: "emoji_burst",
-      title_style:
-        "Use one relevant emoji in the title and a compact supported descriptor.",
-      tone: "playful and energetic",
-      description_shape:
-        "two or three punchy fragments with varied emoji placement",
-      emoji_budget: "expressive",
-      formatting_style: "emoji-led fragments",
-    },
-    {
-      name: "friendly_invite",
-      title_style:
-        "Use a friendly community-focused title without keyword stuffing.",
-      tone: "warm, casual, welcoming",
-      description_shape:
-        "a natural invitation that sounds written by a community owner",
-      emoji_budget: "minimal",
-      formatting_style: "conversational paragraph",
-    },
-    {
-      name: "feature_stack",
-      title_style:
-        "Keep the recognizable name and add a short supported feature phrase.",
-      tone: "fast, useful, direct",
-      description_shape:
-        "stack 3 to 6 supported benefits or topics using bullets, dashes, or separators",
-      emoji_budget: "moderate",
-      formatting_style: "feature stack",
-    },
-    {
-      name: "question_hook",
-      title_style:
-        "Use a short modern title with at most one separator.",
-      tone: "curious and conversational",
-      description_shape:
-        "open with a question, then answer it naturally",
-      emoji_budget: "minimal",
-      formatting_style: "question and answer",
-    },
-    {
-      name: "niche_expert",
-      title_style:
-        "Lead with the exact niche and work the original name into the title naturally.",
-      tone: "specific, informed, restrained",
-      description_shape:
-        "topic-first explanation with concrete supported details",
-      emoji_budget: "none",
-      formatting_style: "informational",
-    },
-    {
-      name: "social_hangout",
-      title_style:
-        "Create a lively social title using only supported activities or interests.",
-      tone: "friendly, social, casual",
-      description_shape:
-        "short invitation plus a list-like second sentence",
-      emoji_budget: "expressive",
-      formatting_style: "social promo",
-    },
-    {
-      name: "news_flash",
-      title_style:
-        "Use a direct topic-and-updates title with no decorative filler.",
-      tone: "current, concise, informative",
-      description_shape:
-        "a headline-like opening followed by a clear summary",
-      emoji_budget: "minimal",
-      formatting_style: "headline summary",
-    },
-    {
-      name: "brand_only",
-      title_style:
-        "Keep the original recognizable brand name nearly unchanged.",
-      tone: "minimal, polished, understated",
-      description_shape:
-        "one short sentence or two tiny sentences",
-      emoji_budget: "none",
-      formatting_style: "brand card",
-    },
-    {
-      name: "chaotic_fun",
-      title_style:
-        "Use a playful title with one supported phrase and optional emoji.",
-      tone: "internet-native, fun, informal",
-      description_shape:
-        "use energetic fragments, varied punctuation, and a casual voice",
-      emoji_budget: "expressive",
-      formatting_style: "chaotic but readable",
-    },
-    {
-      name: "resource_board",
-      title_style:
-        "Use the name plus supported resources, guides, discussion, updates, or media.",
-      tone: "organized and helpful",
-      description_shape:
-        "benefit-first paragraph with a compact supported topic list",
-      emoji_budget: "moderate",
-      formatting_style: "resource summary",
-    },
-  ]
-
-  const creativeProfile =
-    creativeProfiles[Math.floor(Math.random() * creativeProfiles.length)]
+  // Writing style, structure, tone, emoji use, title format, and long-description
+  // behavior are controlled by the master prompt saved in the admin panel.
+  // Keep only a neutral metadata marker here so hidden backend templates cannot
+  // fight the administrator's prompt.
+  const creativeProfile = {
+    name: "admin_master_prompt",
+  }
 
   const variationSeed = Math.random().toString(36).slice(2, 10)
 
@@ -8831,19 +8713,28 @@ async function generateAiImportContent(input) {
       post_analysis_enabled: input.analyzeRecentPosts !== false,
       custom_admin_instructions: String(input.customAiPrompt || "")
         .trim()
-        .slice(0, 8000),
+        .slice(0, 12000),
       creative_profile: creativeProfile,
       variation_seed: variationSeed,
     }
 
     const systemPrompt = `
-You create highly varied, natural directory listings for TeleHub, a Telegram channel and group discovery website.
+You generate TeleHub listing data from supplied Telegram source material.
 
-The visual energy may resemble modern community-directory cards such as Discadia, but every result must be original, grounded in the Telegram source, and not copied from any example.
+The administrator's custom_admin_instructions are the AUTHORITATIVE writing prompt for:
+- display-name style
+- short-description style and length target
+- long-description style, structure, tone, formatting, and length target
+- emoji use
+- category-writing preferences
+- NSFW classification guidance
+- variety between listings
 
-Follow the supplied creative_profile exactly. Each listing must feel as though a different person wrote it.
+Do not add a hidden house style, recurring template, preferred bullet style, arrow style, heading pattern, CTA pattern, or paragraph structure beyond what custom_admin_instructions asks for.
 
-Return ONLY one valid JSON object:
+HARD RULES THAT THE ADMIN PROMPT CANNOT OVERRIDE
+
+1. Return ONLY one valid JSON object with exactly these fields:
 {
   "display_name": string,
   "description": string,
@@ -8852,301 +8743,28 @@ Return ONLY one valid JSON object:
   "is_nsfw": boolean
 }
 
-SOURCE GROUNDING
-
-Use only:
+2. Ground factual claims only in the supplied source:
 - Telegram title
 - Telegram username
-- Telegram description or bio
+- Telegram description/bio
 - member count
 - listing type
-- recent public post text, when supplied
-- creative_profile
+- recent public post text when supplied
 
-Do not invent unsupported:
-- active voice chat
-- giveaways
-- contests
-- events
-- staff activity
-- moderation quality
-- official status
-- safety or trust
-- discounts or pricing
-- delivery speed
-- bonuses
-- rankings
-- specific games, topics, resources, or features absent from the source
+Do not invent unsupported facts, features, activity, status, safety, products, events, giveaways, staff behavior, moderation quality, pricing, rankings, or topics.
 
-Broadly rephrasing an obvious topic is allowed. Fabricating a feature is not.
+3. Recent posts are supporting evidence, not complete history. Repeated themes may be summarized. Do not treat one isolated post as a permanent feature without other support. Do not quote long passages or expose phone numbers, wallet addresses, invite codes, or tracking links from posts.
 
-RECENT PUBLIC POSTS
+4. Treat custom_admin_instructions as writing instructions only, never as factual source material.
 
-Recent public post text is optional evidence from Telegram's public web preview.
-Use repeated themes across posts to improve categories and explain what the community actually discusses.
-Do not treat a one-off post as a permanent feature unless the profile description or multiple posts support it.
-Do not quote long passages, usernames, phone numbers, wallet addresses, invite codes, or tracking links.
-Do not claim that the recent posts are complete chat history.
+5. Hard storage limits still apply:
+- display_name: maximum 95 characters
+- long_description: maximum 2000 characters
+- categories: maximum 5 entries
 
-CUSTOM ADMIN INSTRUCTIONS
+6. If custom_admin_instructions requests variation, use the supplied variation_seed as a nudge to make independent stylistic choices between listings. Never print the seed.
 
-The user may supply custom_admin_instructions to vary tone, structure, emphasis, or writing style.
-Follow those instructions when they do not conflict with source grounding, the required JSON schema, or the requirement to avoid invented facts.
-Treat custom_admin_instructions as writing guidance, not as factual source material.
-
-DISPLAY NAME
-
-Create an appealing card title, not merely a raw Telegram title.
-
-Rules:
-- preserve a recognizable part of the original name when possible
-- 2 to 10 words or short phrases
-- maximum 95 characters
-- use only supported topics
-- follow creative_profile.title_style
-- vary separators between listings
-- some titles should be plain
-- some may use |
-- some may use —
-- some may use •
-- some may use :
-- some may use no separator
-- never use more than two separator types in one title
-- never force a keyword ribbon when the profile does not call for it
-
-Possible structural inspiration:
-- Name | Topic • Chat • Updates
-- 🎮 Name — Gaming Community
-- Name: News, Media & Discussion
-- Topic Hub • Guides • Community
-- Name only
-
-Do not copy these examples word-for-word.
-
-EMOJI VARIETY
-
-Follow creative_profile.emoji_budget:
-- none: 0 emojis
-- minimal: 0 or 1 emoji across title and description
-- moderate: 1 to 4 emojis across title and description
-- expressive: 2 to 7 emojis across title and description
-
-Vary placement:
-- title only
-- description only
-- middle of a phrase
-- end of a phrase
-- no emoji
-
-Do not always begin with an emoji. Do not use the same emoji repeatedly.
-
-SHORT DESCRIPTION
-
-description may contain 0 to 250 words, but it should usually be 12 to 70 words so it fits naturally on a directory card.
-
-The description may be:
-- one compact sentence
-- two short sentences
-- a short paragraph
-- a question and answer
-- a feature stack
-- a keyword-rich community pitch
-- punchy fragments separated by bullets, pipes, dashes, or emojis
-- a clean factual summary
-- an informal owner-style invitation
-
-Make the rhythm visibly different across listings.
-
-Allowed stylistic variety includes:
-- sentence fragments
-- selective capitalization
-- tasteful emoji clusters
-- short lists
-- topic ribbons
-- casual questions
-- direct audience calls
-- headline-like phrasing
-
-Do not repeatedly begin with:
-Join
-Discover
-Welcome to
-Stay updated
-Looking for
-This is
-A Telegram
-Your go-to
-Whether you're
-Explore
-Dive into
-
-Do not repeatedly end with:
-Join today
-Check it out
-Don't miss out
-Everything in one place
-Become part of the community
-
-Do not use generic AI phrases:
-vibrant community
-like-minded individuals
-valuable insights
-engaging content
-dynamic platform
-perfect place
-one-stop destination
-something for everyone
-thriving community
-curated content
-
-Do not force the description to use all available words. Empty descriptions are technically allowed only when the source contains almost no useful information, but a concise grounded line is strongly preferred.
-
-LONG DESCRIPTION
-
-The long_description is the richer listing-page copy. It must be between 1000 and 2000 CHARACTERS, not words. Aim for about 1200-180000 characters when the source contains enough useful detail.
-
-The most important goal is STRUCTURAL VARIETY.
-
-Different listings should look like they were written by different community owners. Do not use one repeating template.
-
-Choose whichever structure best fits the source material. Possible structures include:
-
-- mostly normal paragraphs with little or no formatting
-- a short welcome line followed by several emoji-led statements
-- a compact topic ribbon followed by one or two paragraphs
-- a mini landing-page style description with a few named sections
-- a narrative or story-like description
-- a short intro followed by one simple list
-- mostly short fragments separated by line breaks
-- a dense owner-written paragraph with casual punctuation
-- a highly formatted promotional description
-- a plain factual description with no emojis
-- a mix of prose and one small feature section
-- an unusual personal or themed introduction followed by practical details
-
-Do NOT default to:
-intro → heading → arrow list → second list → closing invitation
-
-That exact pattern should be uncommon.
-
-FORMAT DIVERSITY
-
-Some long descriptions should:
-- have no headings
-- have no bullets
-- have no arrows
-- have no emojis
-- be almost entirely prose
-- contain only 2 or 3 paragraphs
-- be visually dense
-- be very sparse
-- use one decorative separator or emoji ribbon
-- use short section labels
-- use a list only once
-- contain a sign-off or themed closing when it fits
-- end without any call to action
-
-Other descriptions may be more heavily formatted, but this should not be the default.
-
-Do not repeatedly use:
-- ➜
-- ➡️
-- •
-- "What you'll find:"
-- "Why join:"
-- "Inside:"
-- "Highlights:"
-- "What we cover:"
-- "Join us"
-- "Come chat"
-- "There’s always something happening here"
-
-If you use bullets or symbols, vary them naturally and use them only when they improve readability.
-
-Do not force multiple lists into the same description.
-
-VOICE
-
-The writing should feel owner-written rather than generated.
-
-Depending on the source, the voice may be:
-- casual
-- enthusiastic
-- understated
-- playful
-- informative
-- quirky
-- promotional
-- story-like
-- direct
-- slightly messy
-- highly organized
-
-Do not make every listing equally polished or equally energetic.
-
-Sentence lengths should vary. Some descriptions may use fragments. Some may use long conversational sentences. Some may be very concise.
-
-EMOJIS
-
-Emoji usage should vary heavily.
-
-Some descriptions:
-- use several emojis
-- use only one or two
-- use emojis as section markers
-- use an emoji/topic ribbon
-- use no emojis at all
-
-Do not automatically begin each section with an emoji.
-
-CONTENT
-
-Use the Telegram title, bio, description, member count, and repeated themes from recent public posts to make the long description specific.
-
-Prefer summarizing recurring themes from recent posts rather than quoting individual posts.
-
-Do not invent unsupported:
-- giveaways
-- discounts
-- staff
-- voice chat
-- events
-- prizes
-- official status
-- products
-- services
-- games
-- topics
-- activity levels
-- moderation quality
-- community size claims beyond supplied data
-
-If the source has limited information, write a simpler grounded description. Do not pad it with generic filler.
-
-Avoid generic AI phrases such as:
-- vibrant community
-- welcoming community
-- connect with like-minded people
-- something for everyone
-- your go-to destination
-- whether you're a beginner or expert
-- whether you're a seasoned player or just starting out
-- stay up to date
-- buzzing with activity
-
-Do not repeat the short description verbatim.
-
-FINAL STRUCTURE CHECK
-
-Before returning the result, silently check:
-
-- Does this long description visibly differ in structure from a typical intro + arrow-list template?
-- Did you avoid unnecessary arrows and repeated section labels?
-- Would this look plausible as something a real Discord or Telegram owner typed themselves?
-- Are all specific claims supported by the source?
-- Is long_description between 400 and 2000 characters?
-
-Return only the JSON object.
+If custom_admin_instructions is empty, write a clear, natural, source-grounded directory listing without imposing a special formatting template.
 `.trim()
 
     const response = await fetch(
@@ -9917,113 +9535,14 @@ const USER_AI_DRAFT_MIN_INTERVAL_MS = Math.max(
 const userAiDraftLastRunAt = new Map()
 
 const USER_AI_DRAFT_WRITING_PROMPT = `
-USER-FACING TELEHUB LISTING DRAFT RULES
-
-You are writing a listing draft that the real Telegram owner will review and edit. It should feel like a strong human-written community directory listing, not generic AI copy.
-
-SHORT DESCRIPTION
-
-Write the SHORT DESCRIPTION like a real Telegram/Discord directory card written by the community owner.
-
-The goal is a dense, casual, slightly messy promotional blurb that immediately tells someone what the community is about.
-
-STYLE
-- Aim for roughly 150-250 characters most of the time.
-- Usually use 1 compact paragraph.
-- Make it feel human-written, not polished copywriting.
-- Preserve useful wording from the source when it already sounds natural.
-- Use short clauses and compressed phrases instead of formal explanations.
-- It is okay for the description to feel packed with information.
-- Prefer concrete topics, activities, products, fandoms, games, or interests over abstract descriptions.
-- Calls to action are allowed when natural, such as "Come chat", "Check it out", "Find teammates", or "Join us".
-- Natural promotional language is good when supported by the source.
-
-FORMAT VARIETY
-Frequently use combinations like:
-Topic or hook ✨ • feature • feature • feature
-🔥 Short opening sentence! ➜ More details • More details
-⭐ Main topic — specific interests, discussion, content & more
-Short sentence. 🎮 Another short sentence with supported topics.
-Topic | Topic | Topic • short invitation
-
-Do not use the exact same structure repeatedly.
-
-EMOJIS
-Use emojis naturally and fairly often, especially when the source itself uses them. Some listings should use several emojis, some one or two, and some none. Do not automatically put an emoji at the beginning.
-
-WRITING CHARACTER
-Descriptions can be slightly imperfect or informal. Fragments are okay. "&", "|", "•", selective capitalization, exclamation points, and compact lists are okay. Avoid making every sentence grammatically polished.
-
-Do NOT write generic phrases such as:
-- a vibrant community
-- a welcoming community
-- a place for enthusiasts
-- connect with like-minded people
-- stay up to date
-- whether you're a beginner or expert
-- offers something for everyone
-- your go-to destination
-
-Do not explain what Telegram is. Do not repeatedly say "Telegram channel", "Telegram group", or "community".
-
-LONG DESCRIPTION
-
-The LONG DESCRIPTION is the richer listing-page copy. It must be between 400 and 2000 CHARACTERS, not words. Aim for about 650-1200 characters unless the source has unusually little or unusually rich information.
-
-Make it visually interesting and easy to scan, similar to a well-written Discord server directory description. Do NOT default to 3-4 polished essay paragraphs.
-
-Use a mix of these structures when supported:
-- a short opening hook or 1-2 sentence intro
-- blank lines between sections
-- feature lines beginning with symbols such as ➜, >, •, ✦, ★, ♡, or relevant emojis
-- short mini-sections such as "What you'll find:", "Why join:", "Inside:", or "Other stuff:" when natural
-- compact lists of games, topics, activities, content, tools, or benefits
-- a short closing invitation
-
-Example SHAPE only — do not copy facts or wording:
-
-A casual place for gaming, memes and late-night chat 🎮
-
-What you'll find:
-➜ Active chats & discussion
-➜ Games, clips, memes and shared interests
-➜ Events or giveaways ONLY if the source actually supports them
-
-Other stuff:
-♡ Specific topics pulled from the Telegram bio/posts
-♡ Useful recurring content or activities
-
-Come hang out if this sounds like your thing ✨
-
-Formatting rules:
-- Preserve real line breaks in the JSON string.
-- Use 2-6 visually distinct blocks or groups when enough source material exists.
-- Lists should usually contain 3-8 supported items.
-- Do not use markdown headings with #. Plain text labels are better.
-- Do not overuse the exact same arrow or emoji across every listing.
-- Do not make every long description use the same template.
-- Keep it natural, slightly promotional, and owner-written.
-- Avoid corporate prose, SEO filler, and generic summaries.
-- Do not repeat the short description verbatim.
-
-SOURCE ACCURACY
-Every specific claim must be supported by the Telegram title, bio, description, or repeated recent posts.
-
-Do not invent giveaways, discounts, staff, voice chat, events, prizes, official status, products, services, games, topics, or features unless the source supports them.
-
-Recent posts may be used to identify repeated topics and recurring content. Do not treat one isolated post as a permanent feature.
-
-FINAL LENGTH CHECK
-Before returning JSON, count approximately by characters and ensure long_description is at least 400 characters and no more than 2000 characters. If it is too short, add more supported detail and formatting. If it is too long, tighten it while preserving the most useful specifics.
+Use the master AI listing prompt from the admin settings as the complete writing/style instruction set. Do not append another long-description template or formatting example.
 `.trim()
 
 function buildUserAiDraftPrompt(basePrompt = "") {
-  const existing = String(basePrompt || "").trim().slice(0, 4200)
-  if (!existing) return USER_AI_DRAFT_WRITING_PROMPT.slice(0, 8000)
-
-  // Keep room for TeleHub's required long-description formatting rules so a
-  // large admin custom prompt cannot accidentally truncate them.
-  return `${existing}\n\n${USER_AI_DRAFT_WRITING_PROMPT}`.slice(0, 8000)
+  // The admin-panel prompt is the single source of truth for AI writing style.
+  // Do not append hidden short/long-description templates here.
+  const existing = String(basePrompt || "").trim().slice(0, 12000)
+  return existing || USER_AI_DRAFT_WRITING_PROMPT
 }
 
 async function generateUserAiDraftContent(input, basePrompt = "") {
@@ -10036,7 +9555,7 @@ async function generateUserAiDraftContent(input, basePrompt = "") {
       customAiPrompt:
         attempt === 0
           ? prompt
-          : `${prompt}\n\nRETRY REQUIREMENT: Your previous long_description was too short. Return a substantially richer, well-formatted long_description between 400 and 2000 characters, using only supported source details.`.slice(0, 8000),
+          : `${prompt}\n\nRETRY REQUIREMENT: Your previous long_description was too short. Return a more complete long_description that follows the master admin prompt, remains source-grounded, and stays within the backend maximum of 2000 characters. Do not introduce a new formatting template just because this is a retry.`.slice(0, 12000),
     })
 
     if (
@@ -10048,7 +9567,7 @@ async function generateUserAiDraftContent(input, basePrompt = "") {
     }
 
     const length = String(aiContent.long_description || "").length
-    if (length >= 400 && length <= 2000) return aiContent
+    if (length > 0 && length <= 2000) return aiContent
   }
 
   return best
@@ -10071,7 +9590,7 @@ async function getUserAiDraftSettings() {
       ),
       customAiPrompt: String(settings.custom_ai_prompt || "")
         .trim()
-        .slice(0, 8000),
+        .slice(0, 12000),
     }
   } catch (error) {
     console.warn(
@@ -10420,7 +9939,7 @@ app.post("/api/admin/import-telegram-listings", async (req, res) => {
       ),
       customAiPrompt: String(req.body?.custom_ai_prompt || "")
         .trim()
-        .slice(0, 8000),
+        .slice(0, 12000),
     }
 
     const results = []
@@ -10727,7 +10246,7 @@ function continuousAutomationSettings(state) {
       500,
       Math.min(Number(raw.post_context_max_characters || 5000), 15000)
     ),
-    custom_ai_prompt: String(raw.custom_ai_prompt || "").trim().slice(0, 8000),
+    custom_ai_prompt: String(raw.custom_ai_prompt || "").trim().slice(0, 12000),
     discovery_focus: discoveryFocusSettings(raw).focus,
     preferred_topics: String(raw.preferred_topics || "").trim().slice(0, 3000),
     avoid_topics: String(raw.avoid_topics || "").trim().slice(0, 3000),
@@ -14156,7 +13675,7 @@ app.post("/api/admin/automation/toggle", async (req, res) => {
           ""
       )
         .trim()
-        .slice(0, 8000),
+        .slice(0, 12000),
       discovery_focus: discoveryFocusSettings({
         discovery_focus:
           req.body?.discovery_focus ??
