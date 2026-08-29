@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 })
 
 const BACKEND_BUILD_ID =
-  "telehub-acquisition-conversion-tracking-2026-08-18"
+  "telehub-recent-activity-filter-2026-08-28"
 
 // TeleHub listing pages are served directly from Supabase/Vercel.
 // Old Framer CMS compatibility code is hard-disabled below.
@@ -881,8 +881,22 @@ async function fetchPublicTelegramPostContext(listing, options = {}) {
     const posts = []
     const imageUrls = []
     const telegramLinks = []
+    const postTimestamps = []
     const messageRegex =
       /<div[^>]+class="[^"]*tgme_widget_message_text[^"]*"[^>]*>([\s\S]*?)<\/div>/gi
+
+    // Telegram's public /s/ pages expose each visible post timestamp in a
+    // <time datetime="..."> element. Capture all valid timestamps so the
+    // importer can reject stale channels before spending an AI request.
+    const postTimeRegex =
+      /<time[^>]+datetime=["']([^"']+)["'][^>]*>/gi
+
+    let postTimeMatch
+    while ((postTimeMatch = postTimeRegex.exec(html))) {
+      const rawTimestamp = decodeHtmlEntities(postTimeMatch[1] || "").trim()
+      const timestampMs = Date.parse(rawTimestamp)
+      if (Number.isFinite(timestampMs)) postTimestamps.push(timestampMs)
+    }
 
     // Public Telegram post pages expose photo URLs in inline background-image
     // styles. Video posts often expose a poster image instead.
@@ -948,6 +962,10 @@ async function fetchPublicTelegramPostContext(listing, options = {}) {
       totalCharacters += clipped.length
     }
 
+    const latestPostTimestampMs = postTimestamps.length
+      ? Math.max(...postTimestamps)
+      : null
+
     return {
       username,
       pageUrl,
@@ -958,6 +976,11 @@ async function fetchPublicTelegramPostContext(listing, options = {}) {
       imageCount: imageUrls.length,
       telegramLinks,
       telegramLinkCount: telegramLinks.length,
+      latestPostAt:
+        Number.isFinite(latestPostTimestampMs)
+          ? new Date(latestPostTimestampMs).toISOString()
+          : null,
+      postTimestampCount: postTimestamps.length,
       source: "tme_public_posts",
     }
   } finally {
@@ -9329,11 +9352,18 @@ async function importSingleTelegramListing(
     contextText: "",
     imageUrls: [],
     imageCount: 0,
+    latestPostAt: null,
+    postTimestampCount: 0,
     source: null,
   }
   let postContextError = null
 
   const analyzeRecentPosts = options?.analyzeRecentPosts !== false
+  const requireRecentActivity = options?.requireRecentActivity !== false
+  const maxActivityAgeDays = Math.max(
+    1,
+    Math.min(Number(options?.maxActivityAgeDays || 60), 3650)
+  )
   const recentPostLimit = Math.max(
     1,
     Math.min(Number(options?.recentPostLimit || 8), 20)
@@ -9351,7 +9381,9 @@ async function importSingleTelegramListing(
     normalizedTelegramLink
   )
   const needsPostContext =
-    analyzeRecentPosts || selectedBackgroundMode === "telegram_post"
+    analyzeRecentPosts ||
+    requireRecentActivity ||
+    selectedBackgroundMode === "telegram_post"
 
   if (needsPostContext) {
     try {
@@ -9379,8 +9411,110 @@ async function importSingleTelegramListing(
     post_context_source: postContext.source,
     public_posts_found: postContext.postCount,
     public_post_images_found: postContext.imageCount || 0,
+    latest_public_post_at: postContext.latestPostAt || null,
+    public_post_timestamps_found: Number(postContext.postTimestampCount || 0),
+    activity_filter_enabled: requireRecentActivity,
+    activity_max_age_days: maxActivityAgeDays,
     post_context_error: postContextError?.message || null,
   })
+
+  if (requireRecentActivity) {
+    if (postContextError) {
+      await onStage("activity_check_unavailable", {
+        telegram_username: telegramUsername,
+        telegram_title: telegramTitle,
+        max_activity_age_days: maxActivityAgeDays,
+        code: postContextError?.code || null,
+        error: postContextError?.message || "Recent activity could not be checked.",
+      })
+
+      return {
+        ok: true,
+        skipped: true,
+        filtered: true,
+        reason: "activity_unavailable",
+        error:
+          "Listing skipped because TeleHub could not verify a recent public Telegram post.",
+        link: normalizedTelegramLink,
+        telegram_username: telegramUsername,
+        telegram_title: telegramTitle,
+        metadata_source: profileSource,
+        latest_public_post_at: null,
+        activity_max_age_days: maxActivityAgeDays,
+      }
+    }
+
+    const latestPostMs = postContext.latestPostAt
+      ? Date.parse(postContext.latestPostAt)
+      : NaN
+
+    if (!Number.isFinite(latestPostMs)) {
+      await onStage("activity_filtered", {
+        telegram_username: telegramUsername,
+        telegram_title: telegramTitle,
+        reason: "no_public_post_timestamp",
+        max_activity_age_days: maxActivityAgeDays,
+        public_posts_found: postContext.postCount,
+        public_post_timestamps_found: Number(postContext.postTimestampCount || 0),
+      })
+
+      return {
+        ok: true,
+        skipped: true,
+        filtered: true,
+        reason: "inactive_channel",
+        activity_reason: "no_public_post_timestamp",
+        error:
+          "Listing filtered because no dated public Telegram post could be verified.",
+        link: normalizedTelegramLink,
+        telegram_username: telegramUsername,
+        telegram_title: telegramTitle,
+        metadata_source: profileSource,
+        latest_public_post_at: null,
+        activity_max_age_days: maxActivityAgeDays,
+        public_posts_found: postContext.postCount,
+      }
+    }
+
+    const activityAgeMs = Math.max(0, Date.now() - latestPostMs)
+    const activityAgeDays = activityAgeMs / (24 * 60 * 60 * 1000)
+
+    if (activityAgeDays > maxActivityAgeDays) {
+      await onStage("activity_filtered", {
+        telegram_username: telegramUsername,
+        telegram_title: telegramTitle,
+        reason: "latest_public_post_too_old",
+        latest_public_post_at: postContext.latestPostAt,
+        activity_age_days: Number(activityAgeDays.toFixed(2)),
+        max_activity_age_days: maxActivityAgeDays,
+      })
+
+      return {
+        ok: true,
+        skipped: true,
+        filtered: true,
+        reason: "inactive_channel",
+        activity_reason: "latest_public_post_too_old",
+        error: `Listing filtered because its newest public Telegram post is older than ${maxActivityAgeDays} days.`,
+        link: normalizedTelegramLink,
+        telegram_username: telegramUsername,
+        telegram_title: telegramTitle,
+        metadata_source: profileSource,
+        latest_public_post_at: postContext.latestPostAt,
+        activity_age_days: Number(activityAgeDays.toFixed(2)),
+        activity_max_age_days: maxActivityAgeDays,
+        public_posts_found: postContext.postCount,
+      }
+    }
+
+    await onStage("activity_verified", {
+      telegram_username: telegramUsername,
+      telegram_title: telegramTitle,
+      latest_public_post_at: postContext.latestPostAt,
+      activity_age_days: Number(activityAgeDays.toFixed(2)),
+      max_activity_age_days: maxActivityAgeDays,
+    })
+  }
 
   const languageCheck = analyzeLikelyEnglishListingContent({
     title: telegramTitle,
@@ -9430,6 +9564,9 @@ async function importSingleTelegramListing(
     public_posts_found: postContext.postCount,
     post_context_characters: postContext.contextText.length,
     post_analysis_enabled: analyzeRecentPosts,
+    activity_filter_enabled: requireRecentActivity,
+    latest_public_post_at: postContext.latestPostAt || null,
+    activity_max_age_days: maxActivityAgeDays,
     requested_post_limit: recentPostLimit,
     requested_post_context_characters: postContextMaxCharacters,
     custom_prompt_characters: String(options?.customAiPrompt || "").trim().length,
@@ -10171,6 +10308,11 @@ app.post("/api/admin/import-telegram-listings", async (req, res) => {
       backgroundModes: requestedBackgroundModes,
       backgroundMode: requestedBackgroundModes[0],
       analyzeRecentPosts: req.body?.analyze_recent_posts !== false,
+      requireRecentActivity: req.body?.require_recent_activity !== false,
+      maxActivityAgeDays: Math.max(
+        1,
+        Math.min(Number(req.body?.max_activity_age_days || 60), 3650)
+      ),
       filterNonEnglish: req.body?.filter_non_english !== false,
       recentPostLimit: Math.max(
         1,
@@ -10475,6 +10617,11 @@ function continuousAutomationSettings(state) {
     )[0],
     sync_to_framer: false,
     analyze_recent_posts: raw.analyze_recent_posts !== false,
+    require_recent_activity: raw.require_recent_activity !== false,
+    max_activity_age_days: Math.max(
+      1,
+      Math.min(Number(raw.max_activity_age_days || 60), 3650)
+    ),
     filter_non_english: raw.filter_non_english !== false,
     recent_post_limit: Math.max(
       1,
@@ -12991,6 +13138,8 @@ async function processContinuousAutomationQueue(
             backgroundModes: settings.background_modes,
             backgroundMode: settings.background_mode,
             analyzeRecentPosts: settings.analyze_recent_posts,
+            requireRecentActivity: settings.require_recent_activity,
+            maxActivityAgeDays: settings.max_activity_age_days,
             filterNonEnglish: settings.filter_non_english,
             recentPostLimit: settings.recent_post_limit,
             postContextMaxCharacters: settings.post_context_max_characters,
@@ -13864,6 +14013,21 @@ app.post("/api/admin/automation/toggle", async (req, res) => {
         req.body?.analyze_recent_posts === undefined
           ? currentSettings.analyze_recent_posts !== false
           : req.body.analyze_recent_posts !== false,
+      require_recent_activity:
+        req.body?.require_recent_activity === undefined
+          ? currentSettings.require_recent_activity !== false
+          : req.body.require_recent_activity !== false,
+      max_activity_age_days: Math.max(
+        1,
+        Math.min(
+          Number(
+            req.body?.max_activity_age_days ??
+              currentSettings.max_activity_age_days ??
+              60
+          ),
+          3650
+        )
+      ),
       filter_non_english:
         req.body?.filter_non_english === undefined
           ? currentSettings.filter_non_english !== false
