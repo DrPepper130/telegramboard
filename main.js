@@ -9003,7 +9003,7 @@ Do not force the description to use all available words. Empty descriptions are 
 
 LONG DESCRIPTION
 
-The long_description is the richer listing-page copy. It must be between 400 and 2000 CHARACTERS, not words. Aim for about 650-1200 characters when the source contains enough useful detail.
+The long_description is the richer listing-page copy. It must be between 1000 and 2000 CHARACTERS, not words. Aim for about 1200-180000 characters when the source contains enough useful detail.
 
 The most important goal is STRUCTURAL VARIETY.
 
