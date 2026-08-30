@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 })
 
 const BACKEND_BUILD_ID =
-  "telehub-master-admin-ai-prompt-2026-08-29"
+  "telehub-description-language-filter-2026-08-30"
 
 // TeleHub listing pages are served directly from Supabase/Vercel.
 // Old Framer CMS compatibility code is hard-disabled below.
@@ -8940,6 +8940,47 @@ function analyzeLikelyEnglishListingContent({ title, description }) {
   }
 }
 
+function analyzeLikelyEnglishTelegramDescription(description) {
+  const cleanDescription = cleanText(description)
+  const scripts = countScriptLetters(cleanDescription)
+
+  // countScriptLetters only counts Unicode letters. Emojis, punctuation,
+  // numbers, URLs, whitespace, and symbols cannot make a description fail.
+  // Be deliberately lenient: short descriptions and genuinely mixed-script
+  // descriptions pass. We only reject when the bio is clearly dominated by
+  // a non-Latin script (for example, a Russian/Cyrillic description paired
+  // with an English title).
+  if (scripts.total < 16) {
+    return {
+      isEnglishEnough: true,
+      ambiguous: true,
+      reason: "telegram_description_too_short_to_classify",
+      scripts,
+    }
+  }
+
+  const nonLatinRatio = scripts.non_latin / scripts.total
+
+  if (scripts.non_latin >= 12 && nonLatinRatio >= 0.6) {
+    return {
+      isEnglishEnough: false,
+      reason: "telegram_description_mostly_non_latin",
+      non_latin_ratio: Number(nonLatinRatio.toFixed(3)),
+      scripts,
+    }
+  }
+
+  return {
+    isEnglishEnough: true,
+    ambiguous: scripts.non_latin > 0,
+    reason: scripts.non_latin > 0
+      ? "telegram_description_latin_or_mixed_allowed"
+      : "telegram_description_latin",
+    non_latin_ratio: Number(nonLatinRatio.toFixed(3)),
+    scripts,
+  }
+}
+
 async function importSingleTelegramListing(
   link,
   options,
@@ -9227,6 +9268,50 @@ async function importSingleTelegramListing(
       latest_public_post_at: postContext.latestPostAt,
       activity_age_days: Number(activityAgeDays.toFixed(2)),
       max_activity_age_days: maxActivityAgeDays,
+    })
+  }
+
+  const descriptionLanguageCheck =
+    analyzeLikelyEnglishTelegramDescription(telegramDescription)
+  const filterNonEnglishDescription =
+    options?.filterNonEnglishDescription !== false
+
+  if (
+    filterNonEnglishDescription &&
+    !descriptionLanguageCheck.isEnglishEnough
+  ) {
+    await onStage("telegram_description_language_filtered", {
+      telegram_username: telegramUsername,
+      telegram_title: telegramTitle,
+      reason: descriptionLanguageCheck.reason,
+      description_language_check: descriptionLanguageCheck,
+    })
+
+    return {
+      ok: true,
+      skipped: true,
+      filtered: true,
+      reason: "telegram_description_non_english",
+      error:
+        "Listing filtered because its Telegram description is clearly mostly non-Latin text.",
+      link: normalizedTelegramLink,
+      telegram_username: telegramUsername,
+      telegram_title: telegramTitle,
+      description_language_check: descriptionLanguageCheck,
+      metadata_source: profileSource,
+      public_posts_found: postContext.postCount,
+    }
+  }
+
+  if (
+    !filterNonEnglishDescription &&
+    !descriptionLanguageCheck.isEnglishEnough
+  ) {
+    await onStage("telegram_description_language_filter_bypassed", {
+      telegram_username: telegramUsername,
+      telegram_title: telegramTitle,
+      reason: descriptionLanguageCheck.reason,
+      description_language_check: descriptionLanguageCheck,
     })
   }
 
@@ -9929,6 +10014,8 @@ app.post("/api/admin/import-telegram-listings", async (req, res) => {
         Math.min(Number(req.body?.max_activity_age_days || 60), 3650)
       ),
       filterNonEnglish: req.body?.filter_non_english !== false,
+      filterNonEnglishDescription:
+        req.body?.filter_non_english_description !== false,
       recentPostLimit: Math.max(
         1,
         Math.min(Number(req.body?.recent_post_limit || 8), 20)
@@ -10238,6 +10325,8 @@ function continuousAutomationSettings(state) {
       Math.min(Number(raw.max_activity_age_days || 60), 3650)
     ),
     filter_non_english: raw.filter_non_english !== false,
+    filter_non_english_description:
+      raw.filter_non_english_description !== false,
     recent_post_limit: Math.max(
       1,
       Math.min(Number(raw.recent_post_limit || 20), 20)
@@ -12756,6 +12845,8 @@ async function processContinuousAutomationQueue(
             requireRecentActivity: settings.require_recent_activity,
             maxActivityAgeDays: settings.max_activity_age_days,
             filterNonEnglish: settings.filter_non_english,
+            filterNonEnglishDescription:
+              settings.filter_non_english_description,
             recentPostLimit: settings.recent_post_limit,
             postContextMaxCharacters: settings.post_context_max_characters,
             customAiPrompt: settings.custom_ai_prompt,
@@ -13647,6 +13738,10 @@ app.post("/api/admin/automation/toggle", async (req, res) => {
         req.body?.filter_non_english === undefined
           ? currentSettings.filter_non_english !== false
           : req.body.filter_non_english !== false,
+      filter_non_english_description:
+        req.body?.filter_non_english_description === undefined
+          ? currentSettings.filter_non_english_description !== false
+          : req.body.filter_non_english_description !== false,
       recent_post_limit: Math.max(
         1,
         Math.min(
