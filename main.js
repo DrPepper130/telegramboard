@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 })
 
 const BACKEND_BUILD_ID =
-  "telehub-listing-analytics-pilot-2026-08-31"
+  "telehub-listing-analytics-pilot-related-tags-post-filter-2026-08-31"
 
 // TeleHub listing pages are served directly from Supabase/Vercel.
 // Old Framer CMS compatibility code is hard-disabled below.
@@ -819,6 +819,34 @@ function compactTelegramPostText(value) {
     .trim()
 }
 
+function isMeaningfulTelegramPostText(value) {
+  const text = compactTelegramPostText(value)
+  if (!text) return false
+
+  // Telegram public previews can expose service/history events in the same
+  // feed area as authored posts. These are not useful listing content.
+  const serviceEventPatterns = [
+    /^channel created[.!]?$/i,
+    /^group created[.!]?$/i,
+    /^channel photo (?:was )?updated[.!]?$/i,
+    /^group photo (?:was )?updated[.!]?$/i,
+    /^channel (?:name|title) was changed to\b/i,
+    /^group (?:name|title) was changed to\b/i,
+    /^channel description (?:was )?(?:changed|updated)\b/i,
+    /^group description (?:was )?(?:changed|updated)\b/i,
+    /^channel username (?:was )?(?:changed|updated)\b/i,
+    /^group username (?:was )?(?:changed|updated)\b/i,
+    /^(?:a )?message was pinned[.!]?$/i,
+    /^pinned (?:a |the )?message[.!]?$/i,
+    /^(?:this )?message (?:was |has been )?deleted[.!]?$/i,
+    /^deleted message[.!]?$/i,
+    /^joined (?:the )?(?:channel|group)[.!]?$/i,
+    /^left (?:the )?(?:channel|group)[.!]?$/i,
+  ]
+
+  return !serviceEventPatterns.some((pattern) => pattern.test(text))
+}
+
 async function fetchPublicTelegramPostContext(listing, options = {}) {
   const username = publicTelegramUsername(listing)
 
@@ -952,7 +980,7 @@ async function fetchPublicTelegramPostContext(listing, options = {}) {
 
     while ((match = messageRegex.exec(html)) && posts.length < maxPosts) {
       const cleanText = compactTelegramPostText(match[1])
-      if (!cleanText) continue
+      if (!isMeaningfulTelegramPostText(cleanText)) continue
 
       const remaining = maxCharacters - totalCharacters
       if (remaining <= 0) break
@@ -4451,6 +4479,94 @@ function publicGrowthStat(currentMembers, snapshots, days) {
   }
 }
 
+function normalizeListingCategories(value) {
+  const raw = Array.isArray(value)
+    ? value
+    : typeof value === "string"
+      ? value.split(",")
+      : []
+
+  return Array.from(
+    new Set(
+      raw
+        .map((item) => String(item || "").trim().toLowerCase())
+        .filter(Boolean)
+    )
+  )
+}
+
+async function loadTagMatchedRelatedCommunities(listing) {
+  const sourceCategories = normalizeListingCategories(listing.categories)
+  if (!sourceCategories.length) return []
+
+  // Ask Postgres for listings sharing at least one category, then rank the
+  // candidates ourselves by the number of exact category/tag overlaps.
+  let query = supabaseAdmin
+    .from("channel_listings")
+    .select(
+      "id,short_invite,channel_name,telegram_title,telegram_username,member_count,icon_url,listing_type,categories,status,is_banned"
+    )
+    .neq("id", listing.id)
+    .eq("status", "approved")
+    .or("is_banned.is.null,is_banned.eq.false")
+    .limit(250)
+
+  // channel_listings.categories is stored as an array in the current TeleHub
+  // data model. If overlap filtering ever fails, fall back to a broader sample
+  // rather than failing the public analytics endpoint.
+  let result = await query.overlaps("categories", sourceCategories)
+
+  if (result.error) {
+    result = await supabaseAdmin
+      .from("channel_listings")
+      .select(
+        "id,short_invite,channel_name,telegram_title,telegram_username,member_count,icon_url,listing_type,categories,status,is_banned"
+      )
+      .neq("id", listing.id)
+      .eq("status", "approved")
+      .or("is_banned.is.null,is_banned.eq.false")
+      .limit(1000)
+  }
+
+  if (result.error) {
+    console.warn("Related-community tag match failed:", result.error.message)
+    return []
+  }
+
+  const sourceSet = new Set(sourceCategories)
+
+  return (result.data || [])
+    .filter((row) => row.short_invite)
+    .map((row) => {
+      const candidateCategories = normalizeListingCategories(row.categories)
+      const matchingTags = candidateCategories.filter((tag) => sourceSet.has(tag))
+
+      return {
+        row,
+        matchingTags,
+        matchCount: matchingTags.length,
+      }
+    })
+    .filter((item) => item.matchCount > 0)
+    .sort((a, b) => {
+      // Primary signal: most shared tags. Larger communities only break ties.
+      if (b.matchCount !== a.matchCount) return b.matchCount - a.matchCount
+      return Number(b.row.member_count || 0) - Number(a.row.member_count || 0)
+    })
+    .slice(0, 6)
+    .map(({ row, matchingTags, matchCount }) => ({
+      id: row.id,
+      short_invite: row.short_invite,
+      name: row.channel_name || row.telegram_title || row.telegram_username,
+      username: row.telegram_username,
+      member_count: Number(row.member_count || 0),
+      icon_url: row.icon_url || null,
+      listing_type: row.listing_type || "channel",
+      matching_tags: matchingTags,
+      matching_tag_count: matchCount,
+    }))
+}
+
 async function loadPilotGraphAnalytics(listing, liveTelegramLinks = []) {
   const username = String(
     listing.telegram_username ||
@@ -4511,44 +4627,9 @@ async function loadPilotGraphAnalytics(listing, liveTelegramLinks = []) {
     )
   )
 
-  let related = []
-  const relatedCandidates = outgoingUsernames.slice(0, 40)
-
-  if (relatedCandidates.length) {
-    const variants = Array.from(
-      new Set(
-        relatedCandidates.flatMap((value) => [
-          value,
-          `@${value}`,
-        ])
-      )
-    )
-
-    const { data, error } = await supabaseAdmin
-      .from("channel_listings")
-      .select(
-        "id,short_invite,channel_name,telegram_title,telegram_username,member_count,icon_url,listing_type,status,is_banned"
-      )
-      .in("telegram_username", variants)
-      .eq("status", "approved")
-      .or("is_banned.is.null,is_banned.eq.false")
-      .limit(6)
-
-    if (!error) {
-      related = (data || [])
-        .filter((row) => row.id !== listing.id && row.short_invite)
-        .slice(0, 6)
-        .map((row) => ({
-          id: row.id,
-          short_invite: row.short_invite,
-          name: row.channel_name || row.telegram_title || row.telegram_username,
-          username: row.telegram_username,
-          member_count: Number(row.member_count || 0),
-          icon_url: row.icon_url || null,
-          listing_type: row.listing_type || "channel",
-        }))
-    }
-  }
+  // For now, "Related communities" is intentionally independent of the graph:
+  // rank approved TeleHub listings by how many category/tags they share.
+  const related = await loadTagMatchedRelatedCommunities(listing)
 
   return {
     linked_communities: outgoingUsernames.length,
@@ -4556,6 +4637,7 @@ async function loadPilotGraphAnalytics(listing, liveTelegramLinks = []) {
     outgoing_usernames: outgoingUsernames.slice(0, 100),
     incoming_usernames: incomingUsernames.slice(0, 100),
     related_communities: related,
+    related_source: "category_tag_overlap",
     edge_storage_available:
       storedOutgoing.length > 0 ||
       storedIncoming.length > 0,
@@ -4579,7 +4661,7 @@ app.get("/api/public/listing-analytics-pilot", async (req, res) => {
     const { data: listing, error: listingError } = await supabaseAdmin
       .from("channel_listings")
       .select(
-        "id,short_invite,channel_name,telegram_title,telegram_username,telegram_link,member_count,last_synced_at,updated_at,status,is_banned"
+        "id,short_invite,channel_name,telegram_title,telegram_username,telegram_link,member_count,categories,last_synced_at,updated_at,status,is_banned"
       )
       .eq("short_invite", "telehub")
       .maybeSingle()
@@ -4678,7 +4760,9 @@ app.get("/api/public/listing-analytics-pilot", async (req, res) => {
         error: postContextError?.message || null,
       },
       network: graph,
-      recent_posts: (postContext.posts || []).slice(0, 3),
+      recent_posts: (postContext.posts || [])
+        .filter(isMeaningfulTelegramPostText)
+        .slice(0, 3),
     })
   } catch (err) {
     console.error("Public listing analytics pilot error:", err)
