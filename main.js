@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 })
 
 const BACKEND_BUILD_ID =
-  "telehub-listing-analytics-pilot-safe-post-cards-2026-08-31"
+  "telehub-listing-analytics-production-2026-08-31"
 
 // TeleHub listing pages are served directly from Supabase/Vercel.
 // Old Framer CMS compatibility code is hard-disabled below.
@@ -4654,16 +4654,17 @@ async function loadPilotGraphAnalytics(listing, liveTelegramLinks = []) {
 }
 
 
-// Public analytics pilot for ONE listing only.
-// Every other listing remains on the existing page/data behavior.
-app.get("/api/public/listing-analytics-pilot", async (req, res) => {
+// Public listing analytics used by every approved TeleHub listing page.
+// Expensive Telegram/public-post data is CDN-cacheable; member counts themselves
+// still come from the current channel_listings row.
+app.get("/api/public/listing-analytics", async (req, res) => {
   try {
     const requestedSlug = String(req.query?.slug || "").trim().toLowerCase()
 
-    if (requestedSlug !== "telehub") {
-      return res.status(404).json({
+    if (!requestedSlug) {
+      return res.status(400).json({
         ok: false,
-        error: "Analytics pilot is only enabled for /channel/telehub.",
+        error: "Missing listing slug.",
       })
     }
 
@@ -4672,7 +4673,7 @@ app.get("/api/public/listing-analytics-pilot", async (req, res) => {
       .select(
         "id,short_invite,channel_name,telegram_title,telegram_username,telegram_link,member_count,categories,last_synced_at,updated_at,status,is_banned"
       )
-      .eq("short_invite", "telehub")
+      .ilike("short_invite", requestedSlug)
       .maybeSingle()
 
     if (listingError) throw listingError
@@ -4693,61 +4694,15 @@ app.get("/api/public/listing-analytics-pilot", async (req, res) => {
 
     let snapshots = snapshotResult.data || []
     const currentMembers = Number(listing.member_count || 0)
-
-    // The listing's member_count can be fresher than channel_member_snapshots
-    // (for example after a manual/current Telegram sync). Always make the
-    // public chart end at the same current count shown at the top of the page.
-    // For this one-page pilot, also persist a fresh snapshot when the latest
-    // stored snapshot is missing, stale, or has a different count.
     const nowIso = new Date().toISOString()
-    const latestStoredSnapshot = snapshots.length
-      ? snapshots[snapshots.length - 1]
-      : null
-    const latestStoredMs = latestStoredSnapshot
-      ? new Date(latestStoredSnapshot.created_at).getTime()
-      : NaN
-    const latestStoredCount = latestStoredSnapshot
-      ? Number(latestStoredSnapshot.member_count || 0)
-      : null
-    const latestStoredAgeMs = Number.isFinite(latestStoredMs)
-      ? Date.now() - latestStoredMs
-      : Infinity
 
-    const shouldWriteFreshSnapshot =
-      currentMembers > 0 &&
-      (
-        !latestStoredSnapshot ||
-        latestStoredCount !== currentMembers ||
-        latestStoredAgeMs > 6 * 60 * 60 * 1000
-      )
-
-    if (shouldWriteFreshSnapshot) {
-      const { data: insertedSnapshot, error: freshSnapshotError } =
-        await supabaseAdmin
-          .from("channel_member_snapshots")
-          .insert({
-            listing_id: listing.id,
-            member_count: currentMembers,
-            created_at: nowIso,
-          })
-          .select("listing_id,member_count,created_at")
-          .single()
-
-      if (freshSnapshotError) {
-        console.warn("Pilot current member snapshot insert failed:", {
-          listing_id: listing.id,
-          error: freshSnapshotError.message,
-        })
-      } else if (insertedSnapshot) {
-        snapshots = [...snapshots, insertedSnapshot]
-      }
-    }
-
-    // Even if the insert fails, append an in-memory current point so the chart
-    // can never end on an old member count while the page header is newer.
+    // Do NOT persist snapshots from page views. Scheduled Telegram sync owns
+    // historical collection. We only append the current DB count in-memory so
+    // the chart cannot visually end behind the member count shown on the page.
     const finalSnapshot = snapshots.length
       ? snapshots[snapshots.length - 1]
       : null
+
     if (
       currentMembers > 0 &&
       Number(finalSnapshot?.member_count || 0) !== currentMembers
@@ -4757,7 +4712,7 @@ app.get("/api/public/listing-analytics-pilot", async (req, res) => {
         {
           listing_id: listing.id,
           member_count: currentMembers,
-          created_at: nowIso,
+          created_at: listing.last_synced_at || nowIso,
         },
       ]
     }
@@ -4803,27 +4758,48 @@ app.get("/api/public/listing-analytics-pilot", async (req, res) => {
       listing.last_synced_at ||
       latestSnapshotAt ||
       listing.updated_at ||
-      new Date().toISOString()
+      nowIso
 
-    res.set("Cache-Control", "no-store")
+    const meaningfulRecentPosts = (postContext.posts || [])
+      .filter(isMeaningfulTelegramPostText)
+      .slice(0, 3)
+
+    const activityAvailable =
+      !postContextError &&
+      Boolean(postContext.source)
+
+    const growthDay1 = publicGrowthStat(currentMembers, snapshots, 1)
+    const growthDay7 = publicGrowthStat(currentMembers, snapshots, 7)
+    const growthDay30 = publicGrowthStat(currentMembers, snapshots, 30)
+
+    // Cache the public analytics payload for one hour. This prevents Googlebot
+    // and normal page traffic from repeatedly re-scraping Telegram on every hit.
+    res.set(
+      "Cache-Control",
+      "public, max-age=300, s-maxage=3600, stale-while-revalidate=86400"
+    )
 
     return res.json({
       ok: true,
-      pilot: true,
-      slug: "telehub",
+      slug: listing.short_invite,
       listing_id: listing.id,
       current_members: currentMembers,
       statistics_updated_at: statisticsUpdatedAt,
       growth: {
-        day_1: publicGrowthStat(currentMembers, snapshots, 1),
-        day_7: publicGrowthStat(currentMembers, snapshots, 7),
-        day_30: publicGrowthStat(currentMembers, snapshots, 30),
+        day_1: growthDay1,
+        day_7: growthDay7,
+        day_30: growthDay30,
       },
+      growth_available:
+        growthDay1.change !== null ||
+        growthDay7.change !== null ||
+        growthDay30.change !== null,
       member_history: snapshots.map((snapshot) => ({
         member_count: Number(snapshot.member_count || 0),
         created_at: snapshot.created_at,
       })),
       activity: {
+        available: activityAvailable,
         latest_post_at: postContext.latestPostAt || null,
         posts_observed_last_7_days: postsLast7Days,
         average_observed_posts_per_day:
@@ -4833,21 +4809,32 @@ app.get("/api/public/listing-analytics-pilot", async (req, res) => {
         public_preview_post_count: Number(postContext.postCount || 0),
         source: postContext.source || null,
         warning:
-          "Post frequency is based on the posts currently exposed by Telegram's public web preview and can undercount very active channels.",
+          activityAvailable
+            ? "Post frequency is based on the posts currently exposed by Telegram's public web preview and can undercount very active channels."
+            : null,
         error: postContextError?.message || null,
       },
-      network: graph,
-      recent_posts: (postContext.posts || [])
-        .filter(isMeaningfulTelegramPostText)
-        .slice(0, 3),
+      network: {
+        ...graph,
+        available:
+          Number(graph.linked_communities || 0) > 0 ||
+          Number(graph.channels_linking_here || 0) > 0,
+      },
+      recent_posts: meaningfulRecentPosts,
     })
   } catch (err) {
-    console.error("Public listing analytics pilot error:", err)
+    console.error("Public listing analytics error:", err)
     return res.status(500).json({
       ok: false,
-      error: err.message || "Could not load public listing analytics pilot.",
+      error: err.message || "Could not load public listing analytics.",
     })
   }
+})
+
+// Temporary backwards-compatible alias while old pilot pages/cache disappear.
+app.get("/api/public/listing-analytics-pilot", async (req, res) => {
+  const slug = encodeURIComponent(String(req.query?.slug || ""))
+  return res.redirect(307, `/api/public/listing-analytics?slug=${slug}`)
 })
 
 
