@@ -4728,7 +4728,7 @@ app.get("/api/public/listing-analytics-pilot", async (req, res) => {
       listing.updated_at ||
       new Date().toISOString()
 
-    res.set("Cache-Control", "public, max-age=300, s-maxage=900")
+    res.set("Cache-Control", "no-store")
 
     return res.json({
       ok: true,
