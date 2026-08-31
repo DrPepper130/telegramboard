@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 })
 
 const BACKEND_BUILD_ID =
-  "telehub-language-classification-2026-08-31"
+  "telehub-english-only-language-gate-2026-08-31"
 
 // TeleHub listing pages are served directly from Supabase/Vercel.
 // Old Framer CMS compatibility code is hard-disabled below.
@@ -9363,6 +9363,13 @@ HARD RULES THAT THE ADMIN PROMPT CANNOT OVERRIDE
   "language_confidence": number
 }
 
+OUTPUT LANGUAGE RULE — REQUIRED:
+- All generated TeleHub-facing text MUST be written in English, regardless of the source language.
+- This includes display_name, description, long_description, and categories.
+- Do not imitate the source language.
+- If the source is not English, translate/summarize it into natural English before writing the TeleHub fields.
+- language_code/language_name must still describe the ORIGINAL Telegram source language, not the generated English output.
+
 Language metadata rules:
 - Detect the PRIMARY language of the supplied Telegram source material using the title, Telegram bio/description, and recent public posts together.
 - language_code should use a lowercase ISO 639-1 code when the language is clear (for example "en", "es", "pt", "ru", "ar", "de", "fr", "tr", "id", "uk").
@@ -10097,6 +10104,50 @@ async function importSingleTelegramListing(
     metadata_source: profileSource,
     public_posts_found: postContext.postCount,
   })
+
+  // English-only publication gate.
+  // The existing AI call classifies the original source language. Anything
+  // not confidently classified as English is filtered BEFORE slug creation
+  // and BEFORE any channel_listings insert.
+  const detectedLanguageCode = String(aiContent.language_code || "und")
+    .trim()
+    .toLowerCase()
+
+  const detectedLanguageName =
+    String(aiContent.language_name || "").trim() ||
+    (detectedLanguageCode === "und" ? "Unknown" : detectedLanguageCode)
+
+  if (detectedLanguageCode !== "en") {
+    const languageConfidence = Number(aiContent.language_confidence || 0)
+
+    await onStage("filtered", {
+      reason: "non_english_language",
+      telegram_username: telegramUsername,
+      telegram_title: telegramTitle,
+      language_code: detectedLanguageCode,
+      language_name: detectedLanguageName,
+      language_confidence: languageConfidence,
+      message:
+        detectedLanguageCode === "und"
+          ? "Skipped because the source language could not be confidently identified as English."
+          : `Skipped because the detected source language is ${detectedLanguageName} (${detectedLanguageCode}).`,
+    })
+
+    return {
+      ok: false,
+      filtered: true,
+      reason: "non_english_language",
+      telegram_username: telegramUsername,
+      telegram_title: telegramTitle,
+      language_code: detectedLanguageCode,
+      language_name: detectedLanguageName,
+      language_confidence: languageConfidence,
+      message:
+        detectedLanguageCode === "und"
+          ? "Source language was not confidently identified as English."
+          : `Detected ${detectedLanguageName} (${detectedLanguageCode}); English-only publishing is enabled.`,
+    }
+  }
 
   const shortInviteBase =
     stripTelegramHandle(telegramUsername) ||
@@ -11042,8 +11093,8 @@ function continuousAutomationSettings(state) {
       1,
       Math.min(Number(raw.max_activity_age_days || 60), 3650)
     ),
-    // Legacy fields remain in the config shape, but language classification
-    // is metadata-only now. Old saved settings cannot resume language blocking.
+    // Legacy script-filter fields remain in the config shape, but the actual
+    // publication decision is now made by the AI language_code gate.
     filter_non_english: false,
     filter_non_english_description: false,
     recent_post_limit: Math.max(
