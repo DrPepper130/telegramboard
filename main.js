@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 })
 
 const BACKEND_BUILD_ID =
-  "telehub-listing-analytics-pilot-telegram-post-cards-2026-08-31"
+  "telehub-listing-analytics-pilot-safe-post-cards-2026-08-31"
 
 // TeleHub listing pages are served directly from Supabase/Vercel.
 // Old Framer CMS compatibility code is hard-disabled below.
@@ -847,102 +847,6 @@ function isMeaningfulTelegramPostText(value) {
   return !serviceEventPatterns.some((pattern) => pattern.test(text))
 }
 
-
-function parseTelegramViewCount(value) {
-  const raw = String(value || "").trim().replace(/,/g, "")
-  if (!raw) return null
-
-  const match = raw.match(/^([\d.]+)\s*([KMB])?$/i)
-  if (!match) return null
-
-  const amount = Number(match[1])
-  if (!Number.isFinite(amount)) return null
-
-  const suffix = String(match[2] || "").toUpperCase()
-  const multiplier =
-    suffix === "K" ? 1_000 :
-    suffix === "M" ? 1_000_000 :
-    suffix === "B" ? 1_000_000_000 :
-    1
-
-  return Math.round(amount * multiplier)
-}
-
-function parseStructuredTelegramPosts(html, username, limit = 6) {
-  const source = String(html || "")
-  const posts = []
-  const postStartRegex =
-    /<div[^>]+class=["'][^"']*tgme_widget_message(?:\s|_)[^"']*["'][^>]+data-post=["']([^"']+)["'][^>]*>/gi
-
-  const starts = []
-  let startMatch
-  while ((startMatch = postStartRegex.exec(source))) {
-    starts.push({
-      index: startMatch.index,
-      dataPost: decodeHtmlEntities(startMatch[1] || "").trim(),
-    })
-  }
-
-  for (let index = 0; index < starts.length && posts.length < limit; index += 1) {
-    const current = starts[index]
-    const next = starts[index + 1]
-    const chunk = source.slice(current.index, next ? next.index : source.length)
-
-    const textMatch = chunk.match(
-      /<div[^>]+class=["'][^"']*tgme_widget_message_text[^"']*["'][^>]*>([\s\S]*?)<\/div>/i
-    )
-    const text = compactTelegramPostText(textMatch?.[1] || "")
-    if (!isMeaningfulTelegramPostText(text)) continue
-
-    const timeMatch = chunk.match(/<time[^>]+datetime=["']([^"']+)["'][^>]*>/i)
-    const rawTime = decodeHtmlEntities(timeMatch?.[1] || "").trim()
-    const timestampMs = Date.parse(rawTime)
-
-    const hrefMatch = chunk.match(
-      /<a[^>]+class=["'][^"']*tgme_widget_message_date[^"']*["'][^>]+href=["']([^"']+)["']/i
-    )
-    const fallbackPostPath = current.dataPost
-      ? `https://t.me/${current.dataPost.replace(/^@/, "")}`
-      : null
-    const postUrl = decodeHtmlEntities(hrefMatch?.[1] || "").trim() || fallbackPostPath
-
-    const viewsMatch = chunk.match(
-      /<span[^>]+class=["'][^"']*tgme_widget_message_views[^"']*["'][^>]*>([\s\S]*?)<\/span>/i
-    )
-    const viewsText = compactTelegramPostText(viewsMatch?.[1] || "")
-    const views = parseTelegramViewCount(viewsText)
-
-    let mediaUrl = null
-    const mediaPatterns = [
-      /class=["'][^"']*tgme_widget_message_photo_wrap[^"']*["'][^>]*style=["'][^"']*background-image\s*:\s*url\((?:&quot;|["']?)(https?:[^)"'&]+)(?:&quot;|["']?)\)/i,
-      /<video[^>]+poster=["'](https?:[^"']+)["']/i,
-      /<img[^>]+class=["'][^"']*tgme_widget_message_photo[^"']*["'][^>]+src=["'](https?:[^"']+)["']/i,
-    ]
-    for (const pattern of mediaPatterns) {
-      const mediaMatch = chunk.match(pattern)
-      if (mediaMatch?.[1]) {
-        mediaUrl = decodeHtmlEntities(mediaMatch[1]).trim()
-        break
-      }
-    }
-
-    const numericPostIdMatch = current.dataPost.match(/\/(\d+)$/)
-
-    posts.push({
-      id: numericPostIdMatch?.[1] || current.dataPost || String(posts.length + 1),
-      text,
-      posted_at: Number.isFinite(timestampMs) ? new Date(timestampMs).toISOString() : null,
-      views,
-      views_text: viewsText || null,
-      post_url: postUrl || null,
-      media_url: mediaUrl || null,
-      username: username || null,
-    })
-  }
-
-  return posts
-}
-
 async function fetchPublicTelegramPostContext(listing, options = {}) {
   const username = publicTelegramUsername(listing)
 
@@ -1006,11 +910,6 @@ async function fetchPublicTelegramPostContext(listing, options = {}) {
     const imageUrls = []
     const telegramLinks = []
     const postTimestamps = []
-    const structuredPosts = parseStructuredTelegramPosts(
-      html,
-      username,
-      Math.min(maxPosts, 10)
-    )
     const messageRegex =
       /<div[^>]+class="[^"]*tgme_widget_message_text[^"]*"[^>]*>([\s\S]*?)<\/div>/gi
 
@@ -1099,7 +998,6 @@ async function fetchPublicTelegramPostContext(listing, options = {}) {
       username,
       pageUrl,
       posts,
-      structuredPosts,
       postCount: posts.length,
       contextText: posts.join("\n\n---\n\n"),
       imageUrls,
@@ -4939,23 +4837,9 @@ app.get("/api/public/listing-analytics-pilot", async (req, res) => {
         error: postContextError?.message || null,
       },
       network: graph,
-      recent_posts:
-        Array.isArray(postContext.structuredPosts) &&
-        postContext.structuredPosts.length
-          ? postContext.structuredPosts.slice(0, 3)
-          : (postContext.posts || [])
-              .filter(isMeaningfulTelegramPostText)
-              .slice(0, 3)
-              .map((text, index) => ({
-                id: `fallback-${index + 1}`,
-                text,
-                posted_at: null,
-                views: null,
-                views_text: null,
-                post_url: null,
-                media_url: null,
-                username: publicTelegramUsername(listing) || null,
-              })),
+      recent_posts: (postContext.posts || [])
+        .filter(isMeaningfulTelegramPostText)
+        .slice(0, 3),
     })
   } catch (err) {
     console.error("Public listing analytics pilot error:", err)
