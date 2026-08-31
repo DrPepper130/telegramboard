@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 })
 
 const BACKEND_BUILD_ID =
-  "telehub-listing-analytics-pilot-live-snapshot-growth-fixes-2026-08-31"
+  "telehub-listing-analytics-pilot-four-related-2026-08-31"
 
 // TeleHub listing pages are served directly from Supabase/Vercel.
 // Old Framer CMS compatibility code is hard-disabled below.
@@ -4562,7 +4562,7 @@ async function loadTagMatchedRelatedCommunities(listing) {
       if (b.matchCount !== a.matchCount) return b.matchCount - a.matchCount
       return Number(b.row.member_count || 0) - Number(a.row.member_count || 0)
     })
-    .slice(0, 6)
+    .slice(0, 4)
     .map(({ row, matchingTags, matchCount }) => ({
       id: row.id,
       short_invite: row.short_invite,
