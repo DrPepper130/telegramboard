@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 })
 
 const BACKEND_BUILD_ID =
-  "telehub-listing-analytics-production-2026-08-31"
+  "telehub-analytics-seeding-full-sync-pagination-2026-08-31"
 
 // TeleHub listing pages are served directly from Supabase/Vercel.
 // Old Framer CMS compatibility code is hard-disabled below.
@@ -2188,73 +2188,148 @@ async function removeBrokenListingFromPublic(listing, errorMessage) {
 }
 
 
+const TELEGRAM_SYNC_QUERY_BATCH_SIZE = Math.max(
+  100,
+  Math.min(Number(process.env.TELEGRAM_SYNC_QUERY_BATCH_SIZE || 1000), 1000)
+)
+
+const TELEGRAM_SYNC_SELECT_COLUMNS =
+  "id, telegram_chat_id, telegram_username, telegram_link, telegram_title, telegram_description, listing_type, member_count, icon_url, short_invite, slug, telegram_metadata_synced_at, last_member_scraped_at, last_metadata_scraped_at, last_icon_scraped_at, scrape_source, scrape_failure_count"
+
+async function fetchApprovedListingsInKeysetBatches({
+  selectColumns = TELEGRAM_SYNC_SELECT_COLUMNS,
+  batchSize = TELEGRAM_SYNC_QUERY_BATCH_SIZE,
+  onBatch = null,
+} = {}) {
+  let lastId = null
+  let batchNumber = 0
+  const allListings = []
+
+  while (true) {
+    let query = supabaseAdmin
+      .from("channel_listings")
+      .select(selectColumns)
+      .eq("status", "approved")
+      .or("is_banned.is.null,is_banned.eq.false")
+      .order("id", { ascending: true })
+      .limit(batchSize)
+
+    if (lastId) query = query.gt("id", lastId)
+
+    const { data, error } = await query
+    if (error) throw error
+
+    const batch = data || []
+    if (!batch.length) break
+
+    batchNumber += 1
+
+    if (typeof onBatch === "function") {
+      await onBatch(batch, {
+        batchNumber,
+        batchSize,
+      })
+    } else {
+      allListings.push(...batch)
+    }
+
+    lastId = batch[batch.length - 1]?.id || null
+
+    if (batch.length < batchSize) break
+  }
+
+  return {
+    listings: allListings,
+    batches: batchNumber,
+    batch_size: batchSize,
+  }
+}
+
 async function runHourlyTelegramSync(options = {}) {
   const startedAt = Date.now()
-
-  const { data: listings, error } = await supabaseAdmin
-    .from("channel_listings")
-    .select(
-      "id, telegram_chat_id, telegram_username, telegram_link, telegram_title, telegram_description, listing_type, member_count, icon_url, short_invite, slug, telegram_metadata_synced_at, last_member_scraped_at, last_metadata_scraped_at, last_icon_scraped_at, scrape_source, scrape_failure_count"
-    )
-    .eq("status", "approved")
-    .or("is_banned.is.null,is_banned.eq.false")
-
-  if (error) throw error
-
-  const workerResults = await runWithConcurrency(
-    listings || [],
-    TELEGRAM_SYNC_CONCURRENCY,
-    (listing) => syncListingMemberCountFast(listing)
-  )
-
-  const results = workerResults.map((result, index) => {
-    const listing = listings[index]
-
-    if (result.ok) {
-      return {
-        id: listing.id,
-        ok: true,
-        member_count: result.value.memberCount,
-        source: result.value.source,
-        metadata_refreshed: result.value.metadataRefreshed,
-        icon_refreshed: result.value.iconRefreshed,
-      }
-    }
-
-    return {
-      id: listing.id,
-      ok: false,
-      error: result.error,
-      permanent_failure: isPermanentTelegramListingFailure(result.error),
-    }
-  })
-
+  const results = []
   const removedListings = []
   const removalFailures = []
+  let batchesProcessed = 0
+  let scannedListings = 0
 
-  for (let index = 0; index < results.length; index += 1) {
-    const result = results[index]
-    const listing = listings[index]
+  await fetchApprovedListingsInKeysetBatches({
+    selectColumns: TELEGRAM_SYNC_SELECT_COLUMNS,
+    batchSize: TELEGRAM_SYNC_QUERY_BATCH_SIZE,
+    onBatch: async (listings, batchInfo) => {
+      batchesProcessed = batchInfo.batchNumber
+      scannedListings += listings.length
 
-    if (result.ok || !result.permanent_failure) continue
-
-    try {
-      await removeBrokenListingFromPublic(listing, result.error)
-      result.removed_from_public = true
-      removedListings.push({
-        id: listing.id,
-        error: result.error,
+      console.log("Telegram sync batch started:", {
+        batch: batchInfo.batchNumber,
+        batch_size: listings.length,
+        scanned_so_far: scannedListings,
+        concurrency: TELEGRAM_SYNC_CONCURRENCY,
       })
-    } catch (removeError) {
-      result.removed_from_public = false
-      result.removal_error = removeError.message
-      removalFailures.push({
-        id: listing.id,
-        error: result.error,
-        removal_error: removeError.message,
+
+      const workerResults = await runWithConcurrency(
+        listings,
+        TELEGRAM_SYNC_CONCURRENCY,
+        (listing) => syncListingMemberCountFast(listing)
+      )
+
+      const batchResults = workerResults.map((result, index) => {
+        const listing = listings[index]
+
+        if (result.ok) {
+          return {
+            id: listing.id,
+            ok: true,
+            member_count: result.value.memberCount,
+            source: result.value.source,
+            metadata_refreshed: result.value.metadataRefreshed,
+            icon_refreshed: result.value.iconRefreshed,
+          }
+        }
+
+        return {
+          id: listing.id,
+          ok: false,
+          error: result.error,
+          permanent_failure: isPermanentTelegramListingFailure(result.error),
+        }
       })
-    }
-  }
+
+      for (let index = 0; index < batchResults.length; index += 1) {
+        const result = batchResults[index]
+        const listing = listings[index]
+
+        if (!result.ok && result.permanent_failure) {
+          try {
+            await removeBrokenListingFromPublic(listing, result.error)
+            result.removed_from_public = true
+            removedListings.push({
+              id: listing.id,
+              error: result.error,
+            })
+          } catch (removeError) {
+            result.removed_from_public = false
+            result.removal_error = removeError.message
+            removalFailures.push({
+              id: listing.id,
+              error: result.error,
+              removal_error: removeError.message,
+            })
+          }
+        }
+
+        results.push(result)
+      }
+
+      console.log("Telegram sync batch completed:", {
+        batch: batchInfo.batchNumber,
+        batch_size: listings.length,
+        succeeded: batchResults.filter((item) => item.ok).length,
+        failed: batchResults.filter((item) => !item.ok).length,
+        total_processed: results.length,
+      })
+    },
+  })
 
   let homepageCache = null
   try {
@@ -2276,6 +2351,8 @@ async function runHourlyTelegramSync(options = {}) {
     framer_deployed: false,
     framer_cms_disabled: true,
     concurrency: TELEGRAM_SYNC_CONCURRENCY,
+    query_batch_size: TELEGRAM_SYNC_QUERY_BATCH_SIZE,
+    batches_processed: batchesProcessed,
     metadata_refreshed: results.filter(
       (item) => item.ok && item.metadata_refreshed
     ).length,
@@ -2294,6 +2371,7 @@ async function runHourlyTelegramSync(options = {}) {
       : null,
   }
 }
+
 
 
 app.post("/api/auth/is-admin", async (req, res) => {
@@ -3751,13 +3829,13 @@ app.get("/api/cron/daily-full-sync", async (req, res) => {
     // Defer any Framer deployment until the final member-field update.
     const telegramResult = await runHourlyTelegramSync({ publish: false })
 
-    const { data: freshListings, error: listingsError } = await supabaseAdmin
-      .from("channel_listings")
-      .select("*")
-      .eq("status", "approved")
-      .or("is_banned.is.null,is_banned.eq.false")
-
-    if (listingsError) throw listingsError
+    const {
+      listings: freshListings,
+      batches: freshListingBatches,
+    } = await fetchApprovedListingsInKeysetBatches({
+      selectColumns: "*",
+      batchSize: TELEGRAM_SYNC_QUERY_BATCH_SIZE,
+    })
 
     const metadataListingIds = telegramResult.results
       .filter(
@@ -4654,6 +4732,24 @@ async function loadPilotGraphAnalytics(listing, liveTelegramLinks = []) {
 }
 
 
+
+async function loadStoredListingActivity(listingId) {
+  if (!listingId) return null
+
+  const { data, error } = await supabaseAdmin
+    .from("telegram_listing_activity")
+    .select("latest_post_at, observed_post_count, source, checked_at")
+    .eq("listing_id", listingId)
+    .maybeSingle()
+
+  if (error) {
+    // Migration may not exist yet; live analytics should still work.
+    return null
+  }
+
+  return data || null
+}
+
 // Public listing analytics used by every approved TeleHub listing page.
 // Expensive Telegram/public-post data is CDN-cacheable; member counts themselves
 // still come from the current channel_listings row.
@@ -4736,6 +4832,19 @@ app.get("/api/public/listing-analytics", async (req, res) => {
       postContextError = error
     }
 
+    const storedActivity = postContextError
+      ? await loadStoredListingActivity(listing.id)
+      : null
+
+    if (storedActivity) {
+      postContext = {
+        ...postContext,
+        latestPostAt: storedActivity.latest_post_at || null,
+        postCount: Number(storedActivity.observed_post_count || 0),
+        source: storedActivity.source || "stored_activity_seed",
+      }
+    }
+
     const postTimestampMs = (postContext.postTimestamps || [])
       .map((value) => new Date(value).getTime())
       .filter(Number.isFinite)
@@ -4765,8 +4874,8 @@ app.get("/api/public/listing-analytics", async (req, res) => {
       .slice(0, 3)
 
     const activityAvailable =
-      !postContextError &&
-      Boolean(postContext.source)
+      Boolean(postContext.source) &&
+      (!postContextError || Boolean(storedActivity))
 
     const growthDay1 = publicGrowthStat(currentMembers, snapshots, 1)
     const growthDay7 = publicGrowthStat(currentMembers, snapshots, 7)
@@ -8219,6 +8328,24 @@ app.post("/api/telegram/sync-hourly", async (req, res) => {
     }
 
     const result = await runHourlyTelegramSync()
+    const summaryOnly =
+      String(req.query?.summary_only || "").toLowerCase() === "true" ||
+      String(req.query?.summary_only || "") === "1"
+
+    if (summaryOnly) {
+      const {
+        results,
+        removed_listings,
+        removal_failures,
+        ...summary
+      } = result
+
+      return res.json({
+        ...summary,
+        result_rows_omitted: Array.isArray(results) ? results.length : 0,
+      })
+    }
+
     return res.json(result)
   } catch (err) {
     console.error("Hourly sync error:", err)
@@ -9419,6 +9546,127 @@ function analyzeLikelyEnglishTelegramDescription(description) {
   }
 }
 
+
+async function persistImportedListingActivitySeed({
+  listingId,
+  postContext,
+  source,
+}) {
+  if (!listingId) return { ok: false, skipped: true }
+
+  const checkedAt = new Date().toISOString()
+  const latestPostAt = postContext?.latestPostAt || null
+  const observedPostCount = Number(postContext?.postCount || 0)
+
+  const { error } = await supabaseAdmin
+    .from("telegram_listing_activity")
+    .upsert(
+      {
+        listing_id: listingId,
+        latest_post_at: latestPostAt,
+        observed_post_count: observedPostCount,
+        source: postContext?.source || source || null,
+        checked_at: checkedAt,
+        updated_at: checkedAt,
+      },
+      { onConflict: "listing_id" }
+    )
+
+  if (error) {
+    // Keep the importer running if the migration has not been applied yet.
+    console.warn("Imported listing activity seed could not be saved:", {
+      listing_id: listingId,
+      error: error.message,
+    })
+    return { ok: false, error: error.message }
+  }
+
+  return {
+    ok: true,
+    latest_post_at: latestPostAt,
+    observed_post_count: observedPostCount,
+    source: postContext?.source || source || null,
+  }
+}
+
+async function persistImportedListingGraphEdges({
+  sourceLink,
+  telegramLinks,
+}) {
+  const links = Array.from(
+    new Set(
+      (Array.isArray(telegramLinks) ? telegramLinks : [])
+        .map((link) => normalizeTelegramLinkForComparison(link))
+        .filter(Boolean)
+    )
+  )
+
+  let saved = 0
+  let failed = 0
+
+  for (const targetLink of links) {
+    const result = await recordTelegramGraphEdge({
+      sourceLink,
+      targetLink,
+      runId: null,
+      depth: 0,
+    })
+
+    if (result?.ok) saved += 1
+    else if (!result?.skipped) failed += 1
+  }
+
+  return {
+    attempted: links.length,
+    saved,
+    failed,
+  }
+}
+
+async function seedImportedListingAnalytics({
+  listingId,
+  memberCount,
+  telegramLink,
+  postContext,
+  profileSource,
+}) {
+  const createdAt = new Date().toISOString()
+
+  const { error: snapshotError } = await supabaseAdmin
+    .from("channel_member_snapshots")
+    .insert({
+      listing_id: listingId,
+      member_count: Number(memberCount || 0),
+      created_at: createdAt,
+    })
+
+  if (snapshotError) {
+    console.warn("Initial auto-adder member snapshot failed:", {
+      listing_id: listingId,
+      error: snapshotError.message,
+    })
+  }
+
+  const [activity, graph] = await Promise.all([
+    persistImportedListingActivitySeed({
+      listingId,
+      postContext,
+      source: profileSource,
+    }),
+    persistImportedListingGraphEdges({
+      sourceLink: telegramLink,
+      telegramLinks: postContext?.telegramLinks || [],
+    }),
+  ])
+
+  return {
+    member_snapshot_saved: !snapshotError,
+    member_snapshot_error: snapshotError?.message || null,
+    activity,
+    graph,
+  }
+}
+
 async function importSingleTelegramListing(
   link,
   options,
@@ -9911,6 +10159,23 @@ async function importSingleTelegramListing(
     public_posts_found: postContext.postCount,
   })
 
+  const analyticsSeed = await seedImportedListingAnalytics({
+    listingId: inserted.id,
+    memberCount,
+    telegramLink: normalizedTelegramLink,
+    postContext,
+    profileSource,
+  })
+
+  await onStage("analytics_seeded", {
+    listing_id: inserted.id,
+    member_snapshot_saved: analyticsSeed.member_snapshot_saved,
+    latest_public_post_at: analyticsSeed.activity?.latest_post_at || null,
+    observed_public_posts: analyticsSeed.activity?.observed_post_count || 0,
+    graph_edges_saved: analyticsSeed.graph?.saved || 0,
+    graph_edges_attempted: analyticsSeed.graph?.attempted || 0,
+  })
+
   let iconUrl = null
   let iconError = null
 
@@ -10036,6 +10301,7 @@ async function importSingleTelegramListing(
     related_background_query: backgroundResult.query || null,
     related_background_provider_id: backgroundResult.providerId || null,
     public_post_images_found: postContext.imageCount || 0,
+    analytics_seed: analyticsSeed,
     framer_synced: !!framerResult?.ok,
     framer_error: framerError,
   }
