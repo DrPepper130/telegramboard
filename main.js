@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 })
 
 const BACKEND_BUILD_ID =
-  "telehub-description-language-filter-2026-08-30"
+  "telehub-listing-analytics-pilot-2026-08-31"
 
 // TeleHub listing pages are served directly from Supabase/Vercel.
 // Old Framer CMS compatibility code is hard-disabled below.
@@ -981,6 +981,10 @@ async function fetchPublicTelegramPostContext(listing, options = {}) {
           ? new Date(latestPostTimestampMs).toISOString()
           : null,
       postTimestampCount: postTimestamps.length,
+      postTimestamps: postTimestamps
+        .filter(Number.isFinite)
+        .sort((a, b) => a - b)
+        .map((timestampMs) => new Date(timestampMs).toISOString()),
       source: "tme_public_posts",
     }
   } finally {
@@ -4395,6 +4399,292 @@ app.get("/api/analytics/owner-summary", async (req, res) => {
       ok: false,
       error: err.message || "Could not load listing analytics.",
       code: err.code || null,
+    })
+  }
+})
+
+
+
+function nearestSnapshotAtOrBefore(snapshots, targetMs) {
+  let best = null
+
+  for (const snapshot of snapshots || []) {
+    const createdMs = new Date(snapshot.created_at).getTime()
+    if (!Number.isFinite(createdMs) || createdMs > targetMs) continue
+    if (!best || createdMs > best.createdMs) {
+      best = {
+        createdMs,
+        memberCount: Number(snapshot.member_count || 0),
+      }
+    }
+  }
+
+  return best
+}
+
+function publicGrowthStat(currentMembers, snapshots, days) {
+  const targetMs = Date.now() - days * 24 * 60 * 60 * 1000
+  const baseline = nearestSnapshotAtOrBefore(snapshots, targetMs)
+
+  if (!baseline || !Number.isFinite(baseline.memberCount)) {
+    return {
+      days,
+      change: null,
+      percent: null,
+      baseline_members: null,
+      baseline_at: null,
+    }
+  }
+
+  const change = Number(currentMembers || 0) - baseline.memberCount
+  const percent =
+    baseline.memberCount > 0
+      ? (change / baseline.memberCount) * 100
+      : null
+
+  return {
+    days,
+    change,
+    percent: Number.isFinite(percent) ? Number(percent.toFixed(2)) : null,
+    baseline_members: baseline.memberCount,
+    baseline_at: new Date(baseline.createdMs).toISOString(),
+  }
+}
+
+async function loadPilotGraphAnalytics(listing, liveTelegramLinks = []) {
+  const username = String(
+    listing.telegram_username ||
+    extractUsernameFromLink(listing.telegram_link) ||
+    ""
+  )
+    .replace(/^@/, "")
+    .trim()
+    .toLowerCase()
+
+  const liveOutgoingUsernames = Array.from(
+    new Set(
+      (liveTelegramLinks || [])
+        .map((link) => extractUsernameFromLink(link))
+        .filter(Boolean)
+        .map((value) => String(value).replace(/^@/, "").toLowerCase())
+        .filter((value) => value && value !== username)
+    )
+  )
+
+  let storedOutgoing = []
+  let storedIncoming = []
+
+  if (username) {
+    const [outgoingResult, incomingResult] = await Promise.all([
+      supabaseAdmin
+        .from("telegram_graph_edges")
+        .select("target_username,target_link,last_seen_at")
+        .eq("source_username", username)
+        .order("last_seen_at", { ascending: false })
+        .limit(100),
+      supabaseAdmin
+        .from("telegram_graph_edges")
+        .select("source_username,source_link,last_seen_at")
+        .eq("target_username", username)
+        .order("last_seen_at", { ascending: false })
+        .limit(100),
+    ])
+
+    if (!outgoingResult.error) storedOutgoing = outgoingResult.data || []
+    if (!incomingResult.error) storedIncoming = incomingResult.data || []
+  }
+
+  const outgoingUsernames = Array.from(
+    new Set([
+      ...liveOutgoingUsernames,
+      ...storedOutgoing
+        .map((edge) => String(edge.target_username || "").toLowerCase())
+        .filter(Boolean),
+    ])
+  )
+
+  const incomingUsernames = Array.from(
+    new Set(
+      storedIncoming
+        .map((edge) => String(edge.source_username || "").toLowerCase())
+        .filter(Boolean)
+    )
+  )
+
+  let related = []
+  const relatedCandidates = outgoingUsernames.slice(0, 40)
+
+  if (relatedCandidates.length) {
+    const variants = Array.from(
+      new Set(
+        relatedCandidates.flatMap((value) => [
+          value,
+          `@${value}`,
+        ])
+      )
+    )
+
+    const { data, error } = await supabaseAdmin
+      .from("channel_listings")
+      .select(
+        "id,short_invite,channel_name,telegram_title,telegram_username,member_count,icon_url,listing_type,status,is_banned"
+      )
+      .in("telegram_username", variants)
+      .eq("status", "approved")
+      .or("is_banned.is.null,is_banned.eq.false")
+      .limit(6)
+
+    if (!error) {
+      related = (data || [])
+        .filter((row) => row.id !== listing.id && row.short_invite)
+        .slice(0, 6)
+        .map((row) => ({
+          id: row.id,
+          short_invite: row.short_invite,
+          name: row.channel_name || row.telegram_title || row.telegram_username,
+          username: row.telegram_username,
+          member_count: Number(row.member_count || 0),
+          icon_url: row.icon_url || null,
+          listing_type: row.listing_type || "channel",
+        }))
+    }
+  }
+
+  return {
+    linked_communities: outgoingUsernames.length,
+    channels_linking_here: incomingUsernames.length,
+    outgoing_usernames: outgoingUsernames.slice(0, 100),
+    incoming_usernames: incomingUsernames.slice(0, 100),
+    related_communities: related,
+    edge_storage_available:
+      storedOutgoing.length > 0 ||
+      storedIncoming.length > 0,
+  }
+}
+
+
+// Public analytics pilot for ONE listing only.
+// Every other listing remains on the existing page/data behavior.
+app.get("/api/public/listing-analytics-pilot", async (req, res) => {
+  try {
+    const requestedSlug = String(req.query?.slug || "").trim().toLowerCase()
+
+    if (requestedSlug !== "telehub") {
+      return res.status(404).json({
+        ok: false,
+        error: "Analytics pilot is only enabled for /channel/telehub.",
+      })
+    }
+
+    const { data: listing, error: listingError } = await supabaseAdmin
+      .from("channel_listings")
+      .select(
+        "id,short_invite,channel_name,telegram_title,telegram_username,telegram_link,member_count,last_synced_at,updated_at,status,is_banned"
+      )
+      .eq("short_invite", "telehub")
+      .maybeSingle()
+
+    if (listingError) throw listingError
+    if (!listing || listing.status !== "approved" || listing.is_banned) {
+      return res.status(404).json({ ok: false, error: "Listing not found." })
+    }
+
+    const snapshotSince = new Date(Date.now() - 370 * 24 * 60 * 60 * 1000)
+
+    const snapshotResult = await supabaseAdmin
+      .from("channel_member_snapshots")
+      .select("listing_id,member_count,created_at")
+      .eq("listing_id", listing.id)
+      .gte("created_at", snapshotSince.toISOString())
+      .order("created_at", { ascending: true })
+
+    if (snapshotResult.error) throw snapshotResult.error
+
+    const snapshots = snapshotResult.data || []
+    const currentMembers = Number(listing.member_count || 0)
+
+    let postContext = {
+      posts: [],
+      postCount: 0,
+      telegramLinks: [],
+      latestPostAt: null,
+      postTimestamps: [],
+      source: null,
+    }
+    let postContextError = null
+
+    try {
+      postContext = await fetchPublicTelegramPostContext(listing, {
+        maxPosts: 30,
+        maxCharacters: 12000,
+      })
+    } catch (error) {
+      postContextError = error
+    }
+
+    const postTimestampMs = (postContext.postTimestamps || [])
+      .map((value) => new Date(value).getTime())
+      .filter(Number.isFinite)
+
+    const sevenDaysAgo = Date.now() - 7 * 24 * 60 * 60 * 1000
+    const postsLast7Days = postTimestampMs.filter(
+      (timestampMs) => timestampMs >= sevenDaysAgo
+    ).length
+
+    const graph = await loadPilotGraphAnalytics(
+      listing,
+      postContext.telegramLinks || []
+    )
+
+    const latestSnapshotAt = snapshots.length
+      ? snapshots[snapshots.length - 1].created_at
+      : null
+
+    const statisticsUpdatedAt =
+      listing.last_synced_at ||
+      latestSnapshotAt ||
+      listing.updated_at ||
+      new Date().toISOString()
+
+    res.set("Cache-Control", "public, max-age=300, s-maxage=900")
+
+    return res.json({
+      ok: true,
+      pilot: true,
+      slug: "telehub",
+      listing_id: listing.id,
+      current_members: currentMembers,
+      statistics_updated_at: statisticsUpdatedAt,
+      growth: {
+        day_1: publicGrowthStat(currentMembers, snapshots, 1),
+        day_7: publicGrowthStat(currentMembers, snapshots, 7),
+        day_30: publicGrowthStat(currentMembers, snapshots, 30),
+      },
+      member_history: snapshots.map((snapshot) => ({
+        member_count: Number(snapshot.member_count || 0),
+        created_at: snapshot.created_at,
+      })),
+      activity: {
+        latest_post_at: postContext.latestPostAt || null,
+        posts_observed_last_7_days: postsLast7Days,
+        average_observed_posts_per_day:
+          postsLast7Days > 0
+            ? Number((postsLast7Days / 7).toFixed(1))
+            : 0,
+        public_preview_post_count: Number(postContext.postCount || 0),
+        source: postContext.source || null,
+        warning:
+          "Post frequency is based on the posts currently exposed by Telegram's public web preview and can undercount very active channels.",
+        error: postContextError?.message || null,
+      },
+      network: graph,
+      recent_posts: (postContext.posts || []).slice(0, 3),
+    })
+  } catch (err) {
+    console.error("Public listing analytics pilot error:", err)
+    return res.status(500).json({
+      ok: false,
+      error: err.message || "Could not load public listing analytics pilot.",
     })
   }
 })
@@ -10375,6 +10665,60 @@ function continuousAutomationSettings(state) {
   }
 }
 
+
+async function recordTelegramGraphEdge({
+  sourceLink,
+  targetLink,
+  runId = null,
+  depth = null,
+}) {
+  const sourceNormalized = normalizeTelegramLinkForComparison(sourceLink)
+  const targetNormalized = normalizeTelegramLinkForComparison(targetLink)
+
+  if (!sourceNormalized || !targetNormalized || sourceNormalized === targetNormalized) {
+    return { ok: false, skipped: true }
+  }
+
+  const sourceUsername = extractUsernameFromLink(sourceNormalized)
+  const targetUsername = extractUsernameFromLink(targetNormalized)
+
+  if (!sourceUsername || !targetUsername) {
+    return { ok: false, skipped: true }
+  }
+
+  const now = new Date().toISOString()
+  const payload = {
+    source_username: String(sourceUsername).replace(/^@/, "").toLowerCase(),
+    target_username: String(targetUsername).replace(/^@/, "").toLowerCase(),
+    source_link: sourceNormalized,
+    target_link: targetNormalized,
+    last_seen_at: now,
+    last_run_id: runId || null,
+    last_depth: Number.isFinite(Number(depth)) ? Number(depth) : null,
+  }
+
+  const { error } = await supabaseAdmin
+    .from("telegram_graph_edges")
+    .upsert(payload, {
+      onConflict: "source_username,target_username",
+      ignoreDuplicates: false,
+    })
+
+  if (error) {
+    // Allow deployment before the migration is applied. The crawler should not
+    // fail just because graph persistence is unavailable.
+    console.warn("Telegram graph edge persistence skipped:", {
+      source: payload.source_username,
+      target: payload.target_username,
+      error: error.message,
+    })
+    return { ok: false, error: error.message }
+  }
+
+  return { ok: true }
+}
+
+
 async function loadGraphCrawlHistory(normalizedLinks) {
   const links = Array.from(
     new Set((normalizedLinks || []).filter(Boolean))
@@ -12063,6 +12407,13 @@ async function runTelegramGraphDiscovery(run, metadata) {
             })
             continue
           }
+
+          await recordTelegramGraphEdge({
+            sourceLink: seedLink,
+            targetLink: verified.telegramLink,
+            runId: run.id,
+            depth: depth + 1,
+          })
 
           if (Number(verified.memberCount || 0) < minimumMemberCount) {
             await logScraperEvent({
