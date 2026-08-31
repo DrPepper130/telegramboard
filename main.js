@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 })
 
 const BACKEND_BUILD_ID =
-  "telehub-analytics-seeding-full-sync-pagination-2026-08-31"
+  "telehub-language-classification-2026-08-31"
 
 // TeleHub listing pages are served directly from Supabase/Vercel.
 // Old Framer CMS compatibility code is hard-disabled below.
@@ -9184,12 +9184,61 @@ function sanitizeAiImportContent(raw, fallback) {
     .trim()
     .slice(0, 2000)
 
+  const rawLanguageCode = String(
+    source.language_code ||
+    source.languageCode ||
+    fallback.language_code ||
+    "und"
+  )
+    .trim()
+    .toLowerCase()
+
+  const languageCode =
+    /^[a-z]{2,3}$/.test(rawLanguageCode) ||
+    rawLanguageCode === "mixed" ||
+    rawLanguageCode === "und"
+      ? rawLanguageCode
+      : "und"
+
+  let languageName = String(
+    source.language_name ||
+    source.languageName ||
+    fallback.language_name ||
+    ""
+  )
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 80)
+
+  if (!languageName) {
+    languageName =
+      languageCode === "mixed"
+        ? "Multilingual"
+        : languageCode === "und"
+          ? "Unknown"
+          : languageCode
+  }
+
+  const rawLanguageConfidence = Number(
+    source.language_confidence ??
+    source.languageConfidence ??
+    fallback.language_confidence ??
+    0
+  )
+
+  const languageConfidence = Number.isFinite(rawLanguageConfidence)
+    ? Math.max(0, Math.min(1, rawLanguageConfidence))
+    : 0
+
   return {
     display_name: displayName,
     description,
     long_description: longDescription,
     categories,
     is_nsfw: source.is_nsfw === true,
+    language_code: languageCode,
+    language_name: languageName,
+    language_confidence: Number(languageConfidence.toFixed(3)),
   }
 }
 
@@ -9235,6 +9284,9 @@ function fallbackImportContent({
     long_description: longDescription.slice(0, 2000),
     categories,
     is_nsfw: false,
+    language_code: "und",
+    language_name: "Unknown",
+    language_confidence: 0,
   }
 }
 
@@ -9305,8 +9357,21 @@ HARD RULES THAT THE ADMIN PROMPT CANNOT OVERRIDE
   "description": string,
   "long_description": string,
   "categories": string[],
-  "is_nsfw": boolean
+  "is_nsfw": boolean,
+  "language_code": string,
+  "language_name": string,
+  "language_confidence": number
 }
+
+Language metadata rules:
+- Detect the PRIMARY language of the supplied Telegram source material using the title, Telegram bio/description, and recent public posts together.
+- language_code should use a lowercase ISO 639-1 code when the language is clear (for example "en", "es", "pt", "ru", "ar", "de", "fr", "tr", "id", "uk").
+- Use "mixed" when two or more languages are genuinely used as primary content languages.
+- Use "und" when there is not enough linguistic text to classify reliably.
+- language_name should be the normal English language name, such as "English", "Russian", "Spanish", "Portuguese", "Arabic", "Multilingual", or "Unknown".
+- language_confidence must be a number from 0 to 1.
+- Classify the SOURCE language, not the language you happen to use when writing the generated TeleHub descriptions.
+- Do not reject, downgrade, or omit a listing because its source language is not English.
 
 2. Ground factual claims only in the supplied source:
 - Telegram title
@@ -9957,51 +10022,14 @@ async function importSingleTelegramListing(
     })
   }
 
+  // Language is metadata now, not a publication filter.
+  // Keep the existing script checks only as non-blocking diagnostics.
+  // Actual language classification is returned by the existing AI generation
+  // request below, so this does not add another OpenAI call.
   const descriptionLanguageCheck =
     analyzeLikelyEnglishTelegramDescription(telegramDescription)
-  const filterNonEnglishDescription =
-    options?.filterNonEnglishDescription !== false
 
-  if (
-    filterNonEnglishDescription &&
-    !descriptionLanguageCheck.isEnglishEnough
-  ) {
-    await onStage("telegram_description_language_filtered", {
-      telegram_username: telegramUsername,
-      telegram_title: telegramTitle,
-      reason: descriptionLanguageCheck.reason,
-      description_language_check: descriptionLanguageCheck,
-    })
-
-    return {
-      ok: true,
-      skipped: true,
-      filtered: true,
-      reason: "telegram_description_non_english",
-      error:
-        "Listing filtered because its Telegram description is clearly mostly non-Latin text.",
-      link: normalizedTelegramLink,
-      telegram_username: telegramUsername,
-      telegram_title: telegramTitle,
-      description_language_check: descriptionLanguageCheck,
-      metadata_source: profileSource,
-      public_posts_found: postContext.postCount,
-    }
-  }
-
-  if (
-    !filterNonEnglishDescription &&
-    !descriptionLanguageCheck.isEnglishEnough
-  ) {
-    await onStage("telegram_description_language_filter_bypassed", {
-      telegram_username: telegramUsername,
-      telegram_title: telegramTitle,
-      reason: descriptionLanguageCheck.reason,
-      description_language_check: descriptionLanguageCheck,
-    })
-  }
-
-  const languageCheck = analyzeLikelyEnglishListingContent({
+  const languageScriptCheck = analyzeLikelyEnglishListingContent({
     title: telegramTitle,
     description: [
       telegramDescription,
@@ -10009,39 +10037,13 @@ async function importSingleTelegramListing(
     ].filter(Boolean).join(" "),
   })
 
-  const filterNonEnglish = options?.filterNonEnglish !== false
-
-  if (filterNonEnglish && !languageCheck.isEnglish) {
-    await onStage("language_filtered", {
-      telegram_username: telegramUsername,
-      telegram_title: telegramTitle,
-      reason: languageCheck.reason,
-      language_check: languageCheck,
-    })
-
-    return {
-      ok: true,
-      skipped: true,
-      filtered: true,
-      reason: "non_english",
-      error: "Listing filtered because the Telegram title is fully non-Latin or the content is overwhelmingly non-Latin.",
-      link: normalizedTelegramLink,
-      telegram_username: telegramUsername,
-      telegram_title: telegramTitle,
-      language_check: languageCheck,
-      metadata_source: profileSource,
-      public_posts_found: postContext.postCount,
-    }
-  }
-
-  if (!filterNonEnglish && !languageCheck.isEnglish) {
-    await onStage("language_filter_bypassed", {
-      telegram_username: telegramUsername,
-      telegram_title: telegramTitle,
-      reason: languageCheck.reason,
-      language_check: languageCheck,
-    })
-  }
+  await onStage("language_precheck", {
+    telegram_username: telegramUsername,
+    telegram_title: telegramTitle,
+    non_blocking: true,
+    description_language_check: descriptionLanguageCheck,
+    language_script_check: languageScriptCheck,
+  })
 
   await onStage("ai_generation_started", {
     source_title: telegramTitle,
@@ -10084,6 +10086,9 @@ async function importSingleTelegramListing(
     ).length,
     categories: aiContent.categories,
     is_nsfw: aiContent.is_nsfw,
+    language_code: aiContent.language_code,
+    language_name: aiContent.language_name,
+    language_confidence: aiContent.language_confidence,
     ai_used: aiContent.ai_used,
     ai_error: aiContent.ai_error || null,
     creative_profile: aiContent.creative_profile || null,
@@ -10121,6 +10126,9 @@ async function importSingleTelegramListing(
     long_description: aiContent.long_description,
     categories: aiContent.categories,
     is_nsfw: aiContent.is_nsfw,
+    language_code: aiContent.language_code || "und",
+    language_name: aiContent.language_name || "Unknown",
+    language_confidence: Number(aiContent.language_confidence || 0),
     short_invite: shortInvite,
     slug: `${listingType}-${slugifyImportValue(telegramTitle || telegramUsername)}-${Date.now().toString().slice(-6)}`,
     status: "approved",
@@ -10155,6 +10163,9 @@ async function importSingleTelegramListing(
     status: "approved",
     categories: aiContent.categories,
     description: aiContent.description,
+    language_code: aiContent.language_code,
+    language_name: aiContent.language_name,
+    language_confidence: aiContent.language_confidence,
     metadata_source: profileSource,
     public_posts_found: postContext.postCount,
   })
@@ -10278,6 +10289,9 @@ async function importSingleTelegramListing(
     description: aiContent.description,
     long_description_length: String(aiContent.long_description || "").length,
     is_nsfw: aiContent.is_nsfw,
+    language_code: aiContent.language_code || "und",
+    language_name: aiContent.language_name || "Unknown",
+    language_confidence: Number(aiContent.language_confidence || 0),
     telegram_username: telegramUsername,
     telegram_title: telegramTitle || null,
     telegram_chat_id: telegramChatId,
@@ -11028,9 +11042,10 @@ function continuousAutomationSettings(state) {
       1,
       Math.min(Number(raw.max_activity_age_days || 60), 3650)
     ),
-    filter_non_english: raw.filter_non_english !== false,
-    filter_non_english_description:
-      raw.filter_non_english_description !== false,
+    // Legacy fields remain in the config shape, but language classification
+    // is metadata-only now. Old saved settings cannot resume language blocking.
+    filter_non_english: false,
+    filter_non_english_description: false,
     recent_post_limit: Math.max(
       1,
       Math.min(Number(raw.recent_post_limit || 20), 20)
