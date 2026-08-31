@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 })
 
 const BACKEND_BUILD_ID =
-  "telehub-listing-analytics-pilot-related-tags-post-filter-2026-08-31"
+  "telehub-listing-analytics-pilot-live-snapshot-growth-fixes-2026-08-31"
 
 // TeleHub listing pages are served directly from Supabase/Vercel.
 // Old Framer CMS compatibility code is hard-disabled below.
@@ -4465,15 +4465,24 @@ function publicGrowthStat(currentMembers, snapshots, days) {
   }
 
   const change = Number(currentMembers || 0) - baseline.memberCount
-  const percent =
+  const rawPercent =
     baseline.memberCount > 0
       ? (change / baseline.memberCount) * 100
+      : null
+
+  // Very small historical baselines can create visually absurd percentages
+  // (for example +4,500%) even when the absolute member change is valid.
+  // Preserve the real member delta, but omit an extreme percentage rather
+  // than presenting a misleading precision.
+  const percent =
+    Number.isFinite(rawPercent) && Math.abs(rawPercent) <= 1000
+      ? Number(rawPercent.toFixed(2))
       : null
 
   return {
     days,
     change,
-    percent: Number.isFinite(percent) ? Number(percent.toFixed(2)) : null,
+    percent,
     baseline_members: baseline.memberCount,
     baseline_at: new Date(baseline.createdMs).toISOString(),
   }
@@ -4682,8 +4691,76 @@ app.get("/api/public/listing-analytics-pilot", async (req, res) => {
 
     if (snapshotResult.error) throw snapshotResult.error
 
-    const snapshots = snapshotResult.data || []
+    let snapshots = snapshotResult.data || []
     const currentMembers = Number(listing.member_count || 0)
+
+    // The listing's member_count can be fresher than channel_member_snapshots
+    // (for example after a manual/current Telegram sync). Always make the
+    // public chart end at the same current count shown at the top of the page.
+    // For this one-page pilot, also persist a fresh snapshot when the latest
+    // stored snapshot is missing, stale, or has a different count.
+    const nowIso = new Date().toISOString()
+    const latestStoredSnapshot = snapshots.length
+      ? snapshots[snapshots.length - 1]
+      : null
+    const latestStoredMs = latestStoredSnapshot
+      ? new Date(latestStoredSnapshot.created_at).getTime()
+      : NaN
+    const latestStoredCount = latestStoredSnapshot
+      ? Number(latestStoredSnapshot.member_count || 0)
+      : null
+    const latestStoredAgeMs = Number.isFinite(latestStoredMs)
+      ? Date.now() - latestStoredMs
+      : Infinity
+
+    const shouldWriteFreshSnapshot =
+      currentMembers > 0 &&
+      (
+        !latestStoredSnapshot ||
+        latestStoredCount !== currentMembers ||
+        latestStoredAgeMs > 6 * 60 * 60 * 1000
+      )
+
+    if (shouldWriteFreshSnapshot) {
+      const { data: insertedSnapshot, error: freshSnapshotError } =
+        await supabaseAdmin
+          .from("channel_member_snapshots")
+          .insert({
+            listing_id: listing.id,
+            member_count: currentMembers,
+            created_at: nowIso,
+          })
+          .select("listing_id,member_count,created_at")
+          .single()
+
+      if (freshSnapshotError) {
+        console.warn("Pilot current member snapshot insert failed:", {
+          listing_id: listing.id,
+          error: freshSnapshotError.message,
+        })
+      } else if (insertedSnapshot) {
+        snapshots = [...snapshots, insertedSnapshot]
+      }
+    }
+
+    // Even if the insert fails, append an in-memory current point so the chart
+    // can never end on an old member count while the page header is newer.
+    const finalSnapshot = snapshots.length
+      ? snapshots[snapshots.length - 1]
+      : null
+    if (
+      currentMembers > 0 &&
+      Number(finalSnapshot?.member_count || 0) !== currentMembers
+    ) {
+      snapshots = [
+        ...snapshots,
+        {
+          listing_id: listing.id,
+          member_count: currentMembers,
+          created_at: nowIso,
+        },
+      ]
+    }
 
     let postContext = {
       posts: [],
