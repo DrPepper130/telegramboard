@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 })
 
 const BACKEND_BUILD_ID =
-  "telehub-multilingual-auto-adder-2026-09-03"
+  "telehub-directory-language-rpc-2026-09-03"
 
 // TeleHub listing pages are served directly from Supabase/Vercel.
 // Old Framer CMS compatibility code is hard-disabled below.
@@ -5069,6 +5069,11 @@ const DIRECTORY_LANGUAGE_CACHE_TTL_MS = 10 * 60 * 1000
 const DIRECTORY_LANGUAGE_SCAN_CHUNK = 250
 const directoryLanguageCache = new Map()
 
+function invalidateDirectoryLanguageCache() {
+  directoryLanguageCache.clear()
+}
+
+
 function normalizeDirectoryLanguage(value) {
   const clean = String(value || "").trim().toLowerCase()
   if (!clean || clean === "all") return null
@@ -5289,226 +5294,37 @@ async function fetchLanguageFilteredDirectoryPage({
   listingLimit,
   listingOffset,
 }) {
-  const normalizedType = normalizeDirectoryType(type)
-  const normalizedQuery = cleanDirectorySearch(query).toLowerCase()
-  const normalizedCategory =
-    String(category || "All").trim().slice(0, 80) || "All"
-  const normalizedCategoryLower = normalizedCategory.toLowerCase()
-  const normalizedSort = normalizeDirectorySort(sort)
-  const normalizedNsfw = Boolean(showNsfw)
-
-  const matched = []
-  const pageSize = 1000
-
-  for (let from = 0; ; from += pageSize) {
-    let request = supabaseAdmin
-      .from("channel_listings")
-      .select("*")
-      .eq("status", "approved")
-      .eq("is_banned", false)
-      .eq("is_nsfw", normalizedNsfw)
-      .eq("language_code", language)
-      .order("id", { ascending: true })
-      .range(from, from + pageSize - 1)
-
-    if (normalizedType !== "all") {
-      request = request.eq("listing_type", normalizedType)
+  const { data, error } = await supabaseAdmin.rpc(
+    "telehub_directory_page",
+    {
+      p_type: type,
+      p_query: query,
+      p_category: category,
+      p_sort: sort,
+      p_show_nsfw: showNsfw,
+      p_limit: listingLimit,
+      p_offset: listingOffset,
+      p_language: language,
     }
+  )
 
-    const { data, error } = await request
-    if (error) throw error
-
-    const rows = data || []
-
-    for (const row of rows) {
-      if (normalizedCategoryLower !== "all") {
-        const categories = Array.isArray(row.categories)
-          ? row.categories
-          : []
-
-        const hasCategory = categories.some(
-          (item) =>
-            String(item || "").trim().toLowerCase() ===
-            normalizedCategoryLower
-        )
-
-        if (!hasCategory) continue
-      }
-
-      if (normalizedQuery) {
-        const searchable = [
-          row.channel_name,
-          row.telegram_title,
-          row.telegram_username,
-          row.telegram_link,
-          row.description,
-          ...(Array.isArray(row.categories) ? row.categories : []),
-        ]
-          .filter(Boolean)
-          .join(" ")
-          .toLowerCase()
-
-        if (!searchable.includes(normalizedQuery)) continue
-      }
-
-      matched.push(row)
-    }
-
-    if (rows.length < pageSize) break
-  }
-
-  if (!matched.length) {
-    return {
-      listings: [],
-      total_count: 0,
-    }
-  }
-
-  const listingIds = matched.map((item) => item.id).filter(Boolean)
-  let snapshots = []
-
-  if (
-    listingIds.length > 0 &&
-    (normalizedSort === "Top" || normalizedSort === "Active")
-  ) {
-    const since = new Date(
-      Date.now() - 24 * 60 * 60 * 1000
-    ).toISOString()
-
-    try {
-      snapshots = await fetchMemberSnapshotsInBatches(
-        listingIds,
-        since
-      )
-    } catch (error) {
-      console.warn(
-        "Language directory growth snapshot read failed; continuing without growth:",
-        error?.message || String(error)
-      )
-      snapshots = []
-    }
-  }
-
-  const snapshotsByListing = {}
-
-  for (const snapshot of snapshots || []) {
-    if (!snapshotsByListing[snapshot.listing_id]) {
-      snapshotsByListing[snapshot.listing_id] = []
-    }
-    snapshotsByListing[snapshot.listing_id].push(snapshot)
-  }
-
-  const withGrowth = matched.map((listing) => {
-    const listingSnapshots =
-      snapshotsByListing[listing.id] || []
-
-    const firstSnapshot = listingSnapshots[0]
-    const latestSnapshot =
-      listingSnapshots[listingSnapshots.length - 1]
-
-    const oldMembers = Number(
-      firstSnapshot?.member_count ??
-      listing.member_count ??
-      0
+  if (error) {
+    throw new Error(
+      `Language directory query failed. Run the TeleHub directory language RPC migration. ${error.message}`
     )
-
-    const latestMembers = Number(
-      latestSnapshot?.member_count ??
-      listing.member_count ??
-      0
-    )
-
-    return {
-      ...listing,
-      member_growth_24h: Math.max(
-        0,
-        latestMembers - oldMembers
-      ),
-    }
-  })
-
-  const maxStats = {
-    maxVotes: Math.max(
-      1,
-      ...withGrowth.map((item) =>
-        Number(item.votes_count || 0)
-      )
-    ),
-    maxGrowth: Math.max(
-      1,
-      ...withGrowth.map((item) =>
-        Number(item.member_growth_24h || 0)
-      )
-    ),
   }
 
-  function paidPriority(item) {
-    const rank = String(
-      item.paid_rank || "free"
-    ).toLowerCase()
-
-    const status = String(
-      item.paid_rank_status || "inactive"
-    ).toLowerCase()
-
-    if (
-      status !== "active" &&
-      status !== "trialing"
-    ) {
-      return 0
-    }
-
-    if (rank === "sponsor") return 3
-    if (rank === "gold") return 2
-    if (rank === "silver") return 1
-    return 0
-  }
-
-  const ranked = withGrowth
-    .map((listing) => ({
-      ...listing,
-      ...calculateRankingScore(listing, maxStats),
-      _paid_priority: paidPriority(listing),
-    }))
-    .sort((a, b) => {
-      if (b._paid_priority !== a._paid_priority) {
-        return b._paid_priority - a._paid_priority
-      }
-
-      if (normalizedSort === "Members") {
-        const memberDelta =
-          Number(b.member_count || 0) -
-          Number(a.member_count || 0)
-
-        if (memberDelta !== 0) return memberDelta
-      } else if (normalizedSort === "Active") {
-        const growthDelta =
-          Number(b.member_growth_24h || 0) -
-          Number(a.member_growth_24h || 0)
-
-        if (growthDelta !== 0) return growthDelta
-      } else {
-        const rankingDelta =
-          Number(b.ranking_score || 0) -
-          Number(a.ranking_score || 0)
-
-        if (rankingDelta !== 0) return rankingDelta
-      }
-
-      return (
-        new Date(b.created_at || 0).getTime() -
-        new Date(a.created_at || 0).getTime()
-      )
-    })
+  const payload =
+    data && typeof data === "object" ? data : {}
 
   return {
-    listings: ranked
-      .slice(
-        listingOffset,
-        listingOffset + listingLimit
-      )
-      .map(({ _paid_priority, ...item }) => item),
-    total_count: ranked.length,
+    listings: Array.isArray(payload.listings)
+      ? payload.listings
+      : [],
+    total_count: Math.max(
+      0,
+      Number(payload.total_count || 0)
+    ),
   }
 }
 
@@ -9072,6 +8888,7 @@ app.get("/api/directory", async (req, res) => {
         p_show_nsfw: showNsfw,
         p_limit: listingLimit,
         p_offset: listingOffset,
+        p_language: null,
       })
 
       if (pageResult.error) {
@@ -15092,7 +14909,7 @@ app.post("/api/admin/languages/backfill", async (req, res) => {
       )
     )
 
-    directoryLanguageCache.clear()
+    invalidateDirectoryLanguageCache()
 
     const processed = results.filter(Boolean).length
     const updated = results.filter((item) => item?.ok).length
