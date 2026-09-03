@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 })
 
 const BACKEND_BUILD_ID =
-  "telehub-language-directory-backfill-2026-09-03"
+  "telehub-language-backfill-skip-classified-2026-09-03"
 
 // TeleHub listing pages are served directly from Supabase/Vercel.
 // Old Framer CMS compatibility code is hard-disabled below.
@@ -14853,6 +14853,11 @@ app.post("/api/admin/languages/backfill", async (req, res) => {
       )
       .eq("status", "approved")
       .eq("is_banned", false)
+      // Only fetch listings that still need classification. This makes the
+      // backfill safe and cheap to restart after a Framer publish, token expiry,
+      // page refresh, or browser restart: already-classified rows never reach
+      // the scraper or OpenAI again.
+      .is("language_code", null)
       .order("id", { ascending: true })
       .limit(batchSize)
 
