@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 })
 
 const BACKEND_BUILD_ID =
-  "telehub-directory-language-rpc-2026-09-03"
+  "telehub-focused-expansion-nsfw-copy-2026-09-03"
 
 // TeleHub listing pages are served directly from Supabase/Vercel.
 // Old Framer CMS compatibility code is hard-disabled below.
@@ -9842,6 +9842,15 @@ Do not invent unsupported facts, features, activity, status, safety, products, e
 
 4. Treat custom_admin_instructions as writing instructions only, never as factual source material.
 
+ADULT / NSFW WRITING RULE — CONDITIONAL:
+- Apply this only when the supplied Telegram source clearly supports is_nsfw=true and is clearly intended for adults.
+- Adult listings should sound like real adult-content promotion rather than sanitized corporate directory copy.
+- Prefer compact, direct, provocative promotional wording that fits the source. Natural terms can include "18+", "hot", "spicy", "uncensored", "private", "VIP", "exclusive", "premium", "creator", "drops", "previews", or similar wording ONLY when supported by the source.
+- Adult-appropriate emojis such as 🔥 😈 👀 💦 🔞 can be used naturally, but do not force the same emoji pattern on every listing.
+- Avoid sterile phrases such as "adult entertainment community", "a place for adult-content enthusiasts", or other generic AI-sounding euphemisms when the source itself is more direct.
+- Never invent frequency claims such as "daily", access claims such as "VIP", "uncensored", or "private", creator identities, content types, pricing, or exclusivity unless the Telegram source supports them.
+- Do not eroticize age-ambiguous content. If the source suggests minors or sexual content involving minors, do not generate sexualized promotional copy.
+
 5. Hard storage limits still apply:
 - display_name: maximum 95 characters
 - long_description: maximum 2000 characters
@@ -12594,6 +12603,18 @@ const TELEGRAM_DISCOVERY_FOCUS_PRESETS = {
     ],
     avoid: ["breaking news", "politics", "geopolitics", "finance news"],
   },
+  english_expansion: {
+    prefer: [],
+    avoid: [],
+  },
+  nsfw_expansion: {
+    prefer: [
+      "18+", "adult", "nsfw", "spicy", "hot", "uncensored", "vip",
+      "exclusive", "premium", "creator", "models", "model", "leaks",
+      "onlyfans", "fansly", "private", "sexy", "erotic"
+    ],
+    avoid: [],
+  },
   custom: {
     prefer: [],
     avoid: [],
@@ -12680,7 +12701,13 @@ function deterministicDiscoveryFraction(value) {
 }
 
 function shouldExploreDeprioritizedCandidate(candidate, score, focusSettings) {
-  if (focusSettings?.focus === "balanced") return true
+  if (
+    focusSettings?.focus === "balanced" ||
+    focusSettings?.focus === "english_expansion"
+  ) {
+    return true
+  }
+
   if (score >= -2) return true
 
   // Strongly deprioritized results still get a small deterministic exploration
@@ -12692,6 +12719,68 @@ function shouldExploreDeprioritizedCandidate(candidate, score, focusSettings) {
       `${focusSettings?.focus}:${candidate?.telegramLink || candidate?.username}`
     ) < explorationRate
   )
+}
+
+
+const NSFW_TELEMETR_SEED_COUNTRIES = [
+  "international",
+  "usa",
+  "united_kingdom",
+  "germany",
+  "france",
+  "spain",
+  "brazil",
+  "russia",
+  "ukraine",
+  "india",
+  "indonesia",
+  "turkey",
+]
+
+async function loadNsfwTelemetrSeedLinks(limit = 80) {
+  const target = Math.max(0, Math.min(Number(limit || 80), 250))
+  if (!target) return []
+
+  const links = []
+  const seen = new Set()
+
+  for (const country of NSFW_TELEMETR_SEED_COUNTRIES) {
+    if (links.length >= target) break
+
+    for (let page = 1; page <= 2 && links.length < target; page += 1) {
+      try {
+        const result = await fetchTelemetrCatalogPage({
+          country,
+          category: "erotic",
+          subscriberMin: null,
+          subscriberMax: null,
+          page,
+          term: "",
+        })
+
+        for (const username of result.usernames || []) {
+          const link = cleanImportTelegramLink(`https://t.me/${username}`)
+          const normalized = normalizeTelegramLinkForComparison(link)
+          if (!normalized || seen.has(normalized)) continue
+
+          seen.add(normalized)
+          links.push(link)
+          if (links.length >= target) break
+        }
+
+        if (!(result.usernames || []).length) break
+      } catch (error) {
+        console.warn("NSFW Telemetr seed boost failed:", {
+          country,
+          page,
+          error: error?.message || String(error),
+        })
+        break
+      }
+    }
+  }
+
+  return links
 }
 
 async function loadTelegramGraphSeedLinks(run, metadata) {
@@ -12730,19 +12819,34 @@ async function loadTelegramGraphSeedLinks(run, metadata) {
     Math.min(seedLimit * 10, 10000)
   )
 
-  const { data: approved, error } = await supabaseAdmin
+  const focusSettings = discoveryFocusSettings(metadata)
+
+  let approvedQuery = supabaseAdmin
     .from("channel_listings")
     .select(
-      "telegram_link, telegram_username, member_count, channel_name, telegram_title, description, telegram_description, categories"
+      "telegram_link, telegram_username, member_count, channel_name, telegram_title, description, telegram_description, categories, language_code, is_nsfw"
     )
     .eq("status", "approved")
     .or("is_banned.is.null,is_banned.eq.false")
     .order("member_count", { ascending: false })
     .limit(poolLimit)
 
+  if (focusSettings.focus === "english_expansion") {
+    approvedQuery = approvedQuery.eq("language_code", "en")
+  } else if (focusSettings.focus === "nsfw_expansion") {
+    approvedQuery = approvedQuery.eq("is_nsfw", true)
+  }
+
+  const { data: approved, error } = await approvedQuery
+
   if (error) throw error
 
-  const focusSettings = discoveryFocusSettings(metadata)
+  const nsfwTelemetrSeeds =
+    focusSettings.focus === "nsfw_expansion"
+      ? await loadNsfwTelemetrSeedLinks(
+          Math.min(seedLimit, Number(metadata.nsfw_telemetr_seed_limit || 80))
+        )
+      : []
 
   const existingSeeds = (approved || [])
     .map((listing, originalIndex) => ({
@@ -12784,7 +12888,7 @@ async function loadTelegramGraphSeedLinks(run, metadata) {
 
   const primaryCandidates = Array.from(
     new Map(
-      [...requestedSeeds, ...existingSeeds]
+      [...requestedSeeds, ...nsfwTelemetrSeeds, ...existingSeeds]
         .map((link) => [normalizeTelegramLinkForComparison(link), link])
         .filter(([normalized]) => Boolean(normalized))
     ).values()
@@ -13187,6 +13291,12 @@ async function runTelegramGraphDiscovery(run, metadata) {
       max_links_per_seed: perSeedLimit,
       minimum_member_count: minimumMemberCount,
       discovery_focus: focusSettings.focus,
+      focused_expansion:
+        focusSettings.focus === "english_expansion"
+          ? "english"
+          : focusSettings.focus === "nsfw_expansion"
+            ? "nsfw"
+            : null,
       preferred_topics: focusSettings.prefer,
       deprioritized_topics: focusSettings.avoid,
       loop_escape_enabled: loopEscapeEnabled,
