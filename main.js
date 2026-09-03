@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 })
 
 const BACKEND_BUILD_ID =
-  "telehub-english-only-language-gate-2026-08-31"
+  "telehub-language-directory-backfill-2026-09-03"
 
 // TeleHub listing pages are served directly from Supabase/Vercel.
 // Old Framer CMS compatibility code is hard-disabled below.
@@ -5064,6 +5064,374 @@ app.get("/api/referrals/track", async (req, res) => {
 // RANKING ALGORITHM
 // ========================================
 
+
+const DIRECTORY_LANGUAGE_CACHE_TTL_MS = 10 * 60 * 1000
+const DIRECTORY_LANGUAGE_SCAN_CHUNK = 250
+let directoryLanguageCache = {
+  expires_at: 0,
+  languages: [],
+}
+
+function normalizeDirectoryLanguage(value) {
+  const clean = String(value || "").trim().toLowerCase()
+  if (!clean || clean === "all") return null
+  if (clean === "mixed" || clean === "und") return clean
+  return /^[a-z]{2,3}$/.test(clean) ? clean : null
+}
+
+function normalizeLanguageClassification(raw = {}) {
+  const rawCode = String(
+    raw.language_code ||
+    raw.languageCode ||
+    raw.code ||
+    "und"
+  ).trim().toLowerCase()
+
+  const code =
+    /^[a-z]{2,3}$/.test(rawCode) ||
+    rawCode === "mixed" ||
+    rawCode === "und"
+      ? rawCode
+      : "und"
+
+  let name = String(
+    raw.language_name ||
+    raw.languageName ||
+    raw.name ||
+    ""
+  ).replace(/\s+/g, " ").trim().slice(0, 80)
+
+  if (!name) {
+    name =
+      code === "mixed"
+        ? "Multilingual"
+        : code === "und"
+          ? "Unknown"
+          : code
+  }
+
+  const confidenceRaw = Number(
+    raw.language_confidence ??
+    raw.languageConfidence ??
+    raw.confidence ??
+    0
+  )
+
+  const confidence = Number.isFinite(confidenceRaw)
+    ? Math.max(0, Math.min(1, confidenceRaw))
+    : 0
+
+  return {
+    language_code: code,
+    language_name: name,
+    language_confidence: Number(confidence.toFixed(3)),
+  }
+}
+
+async function getDirectoryLanguageOptions({ force = false } = {}) {
+  const now = Date.now()
+
+  if (
+    !force &&
+    directoryLanguageCache.expires_at > now &&
+    Array.isArray(directoryLanguageCache.languages)
+  ) {
+    return directoryLanguageCache.languages
+  }
+
+  const counts = new Map()
+  const pageSize = 1000
+
+  for (let from = 0; ; from += pageSize) {
+    const { data, error } = await supabaseAdmin
+      .from("channel_listings")
+      .select("language_code, language_name")
+      .eq("status", "approved")
+      .eq("is_banned", false)
+      .not("language_code", "is", null)
+      .order("id", { ascending: true })
+      .range(from, from + pageSize - 1)
+
+    if (error) throw error
+
+    const rows = data || []
+
+    for (const row of rows) {
+      const code = normalizeDirectoryLanguage(row.language_code)
+      if (!code || code === "und") continue
+
+      const existing = counts.get(code) || {
+        code,
+        name:
+          String(row.language_name || "").trim() ||
+          (code === "mixed" ? "Multilingual" : code),
+        count: 0,
+      }
+
+      existing.count += 1
+      if (
+        (!existing.name || existing.name === code) &&
+        row.language_name
+      ) {
+        existing.name = String(row.language_name).trim()
+      }
+
+      counts.set(code, existing)
+    }
+
+    if (rows.length < pageSize) break
+  }
+
+  const languages = Array.from(counts.values()).sort((a, b) => {
+    if (a.code === "en") return -1
+    if (b.code === "en") return 1
+    return b.count - a.count || a.name.localeCompare(b.name)
+  })
+
+  directoryLanguageCache = {
+    expires_at: now + DIRECTORY_LANGUAGE_CACHE_TTL_MS,
+    languages,
+  }
+
+  return languages
+}
+
+async function getLanguageCodesForListings(listings) {
+  const ids = (listings || []).map((item) => item?.id).filter(Boolean)
+  if (!ids.length) return new Map()
+
+  const { data, error } = await supabaseAdmin
+    .from("channel_listings")
+    .select("id, language_code, language_name, language_confidence")
+    .in("id", ids)
+
+  if (error) throw error
+
+  return new Map(
+    (data || []).map((row) => [
+      row.id,
+      {
+        language_code: String(row.language_code || "und").toLowerCase(),
+        language_name: row.language_name || null,
+        language_confidence: Number(row.language_confidence || 0),
+      },
+    ])
+  )
+}
+
+async function fetchLanguageFilteredDirectoryPage({
+  type,
+  query,
+  category,
+  sort,
+  showNsfw,
+  language,
+  listingLimit,
+  listingOffset,
+}) {
+  const matched = []
+  let baselineOffset = 0
+  let baselineTotal = null
+
+  while (baselineTotal === null || baselineOffset < baselineTotal) {
+    const { data, error } = await supabaseAdmin.rpc(
+      "telehub_directory_page",
+      {
+        p_type: type,
+        p_query: query,
+        p_category: category,
+        p_sort: sort,
+        p_show_nsfw: showNsfw,
+        p_limit: DIRECTORY_LANGUAGE_SCAN_CHUNK,
+        p_offset: baselineOffset,
+      }
+    )
+
+    if (error) throw error
+
+    const payload =
+      data && typeof data === "object" ? data : {}
+
+    const rows = Array.isArray(payload.listings)
+      ? payload.listings
+      : []
+
+    if (baselineTotal === null) {
+      baselineTotal = Math.max(0, Number(payload.total_count || 0))
+    }
+
+    if (!rows.length) break
+
+    const languageById = await getLanguageCodesForListings(rows)
+
+    for (const row of rows) {
+      const metadata = languageById.get(row.id)
+      if (metadata?.language_code !== language) continue
+
+      matched.push({
+        ...row,
+        ...metadata,
+      })
+    }
+
+    baselineOffset += rows.length
+
+    if (rows.length < DIRECTORY_LANGUAGE_SCAN_CHUNK) break
+  }
+
+  return {
+    listings: matched.slice(
+      listingOffset,
+      listingOffset + listingLimit
+    ),
+    total_count: matched.length,
+  }
+}
+
+async function classifyTelegramSourceLanguage({
+  title,
+  description,
+  recentPosts,
+}) {
+  if (!process.env.OPENAI_API_KEY) {
+    throw new Error("OPENAI_API_KEY is required for language backfill.")
+  }
+
+  const source = {
+    telegram_title: String(title || "").slice(0, 500),
+    telegram_description: String(description || "").slice(0, 3000),
+    recent_public_posts: Array.isArray(recentPosts)
+      ? recentPosts.slice(0, 12).map((item) => String(item || "").slice(0, 1200))
+      : [],
+  }
+
+  const response = await fetch(
+    "https://api.openai.com/v1/chat/completions",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: OPENAI_IMPORT_MODEL,
+        response_format: { type: "json_object" },
+        temperature: 0,
+        max_tokens: 140,
+        messages: [
+          {
+            role: "system",
+            content: `Classify the PRIMARY language of the supplied Telegram source material. Return ONLY JSON:
+{"language_code":"en","language_name":"English","language_confidence":0.99}
+Use lowercase ISO 639-1 when clear. Use "mixed" only when multiple languages are genuinely primary. Use "und" when there is not enough linguistic text. Classify the original source language, not usernames, emoji, URLs, or proper names.`,
+          },
+          {
+            role: "user",
+            content: JSON.stringify(source),
+          },
+        ],
+      }),
+    }
+  )
+
+  const json = await response.json().catch(() => ({}))
+
+  if (!response.ok) {
+    throw new Error(
+      json?.error?.message || "OpenAI language classification failed."
+    )
+  }
+
+  const content = json?.choices?.[0]?.message?.content || "{}"
+  return normalizeLanguageClassification(JSON.parse(content))
+}
+
+async function backfillOneListingLanguage(listing) {
+  let liveProfile = null
+  let postContext = null
+  let profileError = null
+  let postsError = null
+
+  try {
+    liveProfile = await fetchPublicTelegramPage(listing)
+  } catch (error) {
+    profileError = error?.message || String(error)
+  }
+
+  try {
+    postContext = await fetchPublicTelegramPostContext(listing, {
+      maxPosts: 12,
+      maxCharacters: 6000,
+    })
+  } catch (error) {
+    postsError = error?.message || String(error)
+  }
+
+  const title =
+    liveProfile?.title ||
+    listing.telegram_title ||
+    listing.channel_name ||
+    ""
+
+  const description =
+    liveProfile?.description ||
+    listing.telegram_description ||
+    listing.description ||
+    ""
+
+  const recentPosts = Array.isArray(postContext?.posts)
+    ? postContext.posts
+    : []
+
+  const sourceLetters = [title, description, ...recentPosts]
+    .join(" ")
+    .match(/\p{L}/gu)
+
+  if (!sourceLetters || sourceLetters.length < 8) {
+    return {
+      ok: false,
+      skipped: true,
+      listing_id: listing.id,
+      short_invite: listing.short_invite,
+      error: "Not enough linguistic source text to classify reliably.",
+      profile_error: profileError,
+      posts_error: postsError,
+    }
+  }
+
+  const classification = await classifyTelegramSourceLanguage({
+    title,
+    description,
+    recentPosts,
+  })
+
+  const { error: updateError } = await supabaseAdmin
+    .from("channel_listings")
+    .update({
+      language_code: classification.language_code,
+      language_name: classification.language_name,
+      language_confidence: classification.language_confidence,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", listing.id)
+
+  if (updateError) throw updateError
+
+  return {
+    ok: true,
+    listing_id: listing.id,
+    short_invite: listing.short_invite,
+    telegram_username:
+      listing.telegram_username ||
+      extractUsernameFromLink(listing.telegram_link),
+    ...classification,
+    profile_source: liveProfile?.source || "stored_metadata",
+    public_posts_found: recentPosts.length,
+    profile_error: profileError,
+    posts_error: postsError,
+  }
+}
+
 const DIRECTORY_PAGE_MAX_SIZE = 36
 
 async function rebuildDirectoryRankings() {
@@ -8436,8 +8804,38 @@ app.get("/api/directory", async (req, res) => {
         ? 0
         : Math.max(0, (page - 1) * pageSize - sponsorSlots)
 
-    const [pageResult, metadataResult] = await Promise.all([
-      supabaseAdmin.rpc("telehub_directory_page", {
+    const language = normalizeDirectoryLanguage(req.query.language)
+
+    const metadataPromise = supabaseAdmin
+      .from("directory_metadata_cache")
+      .select("categories, total_count, updated_at")
+      .eq("id", type)
+      .maybeSingle()
+
+    const languagesPromise = getDirectoryLanguageOptions().catch((error) => {
+      console.warn("Directory language metadata read failed:", error.message)
+      return []
+    })
+
+    let listings = []
+    let totalCount = 0
+
+    if (language) {
+      const languageResult = await fetchLanguageFilteredDirectoryPage({
+        type,
+        query,
+        category,
+        sort,
+        showNsfw,
+        language,
+        listingLimit,
+        listingOffset,
+      })
+
+      listings = languageResult.listings
+      totalCount = languageResult.total_count
+    } else {
+      const pageResult = await supabaseAdmin.rpc("telehub_directory_page", {
         p_type: type,
         p_query: query,
         p_category: category,
@@ -8445,37 +8843,37 @@ app.get("/api/directory", async (req, res) => {
         p_show_nsfw: showNsfw,
         p_limit: listingLimit,
         p_offset: listingOffset,
-      }),
-      supabaseAdmin
-        .from("directory_metadata_cache")
-        .select("categories, total_count, updated_at")
-        .eq("id", type)
-        .maybeSingle(),
-    ])
+      })
 
-    if (pageResult.error) {
-      throw new Error(
-        `Directory query failed. Make sure 01-Supabase-Directory-Speed-Migration.sql has been run. ${pageResult.error.message}`
+      if (pageResult.error) {
+        throw new Error(
+          `Directory query failed. Make sure 01-Supabase-Directory-Speed-Migration.sql has been run. ${pageResult.error.message}`
+        )
+      }
+
+      const payload =
+        pageResult.data && typeof pageResult.data === "object"
+          ? pageResult.data
+          : {}
+
+      listings = Array.isArray(payload.listings)
+        ? payload.listings
+        : []
+
+      totalCount = Math.max(
+        0,
+        Number(payload.total_count || 0)
       )
     }
+
+    const [metadataResult, languages] = await Promise.all([
+      metadataPromise,
+      languagesPromise,
+    ])
 
     if (metadataResult.error) {
       console.warn("Directory metadata cache read failed:", metadataResult.error.message)
     }
-
-    const payload =
-      pageResult.data && typeof pageResult.data === "object"
-        ? pageResult.data
-        : {}
-
-    const listings = Array.isArray(payload.listings)
-      ? payload.listings
-      : []
-
-    const totalCount = Math.max(
-      0,
-      Number(payload.total_count || 0)
-    )
 
     const totalPages = Math.max(
       1,
@@ -8510,6 +8908,7 @@ app.get("/api/directory", async (req, res) => {
       has_previous_page: page > 1,
       categories,
       category_counts: categoryRows,
+      languages,
       metadata_updated_at: metadataResult.data?.updated_at || null,
       filters: {
         type,
@@ -8517,6 +8916,7 @@ app.get("/api/directory", async (req, res) => {
         category,
         sort,
         nsfw: showNsfw,
+        language: language || "all",
       },
     })
   } catch (err) {
@@ -14427,6 +14827,105 @@ app.post("/api/admin/scraper/rotation/reset", async (req, res) => {
   }
 })
 
+
+
+app.post("/api/admin/languages/backfill", async (req, res) => {
+  try {
+    const user = await getAdminUserFromRequest(req)
+    if (!user) {
+      return res.status(403).json({ error: "Admin access required." })
+    }
+
+    const batchSize = Math.max(
+      1,
+      Math.min(Number.parseInt(req.body?.batch_size, 10) || 12, 30)
+    )
+    const concurrency = Math.max(
+      1,
+      Math.min(Number.parseInt(req.body?.concurrency, 10) || 3, 5)
+    )
+    const afterId = String(req.body?.after_id || "").trim()
+
+    let query = supabaseAdmin
+      .from("channel_listings")
+      .select(
+        "id, short_invite, telegram_link, telegram_username, telegram_title, telegram_description, channel_name, description, language_code, language_name, language_confidence"
+      )
+      .eq("status", "approved")
+      .eq("is_banned", false)
+      .order("id", { ascending: true })
+      .limit(batchSize)
+
+    if (afterId) {
+      query = query.gt("id", afterId)
+    }
+
+    const { data: rows, error } = await query
+    if (error) throw error
+
+    const listings = rows || []
+    const results = new Array(listings.length)
+    let cursor = 0
+
+    async function worker() {
+      while (true) {
+        const index = cursor
+        cursor += 1
+        if (index >= listings.length) return
+
+        const listing = listings[index]
+
+        try {
+          results[index] = await backfillOneListingLanguage(listing)
+        } catch (error) {
+          results[index] = {
+            ok: false,
+            listing_id: listing.id,
+            short_invite: listing.short_invite,
+            error: error?.message || String(error),
+          }
+        }
+      }
+    }
+
+    await Promise.all(
+      Array.from(
+        { length: Math.min(concurrency, Math.max(1, listings.length)) },
+        () => worker()
+      )
+    )
+
+    directoryLanguageCache.expires_at = 0
+
+    const processed = results.filter(Boolean).length
+    const updated = results.filter((item) => item?.ok).length
+    const skipped = results.filter((item) => item?.skipped).length
+    const failed = Math.max(0, processed - updated - skipped)
+    const nextAfterId = listings.length
+      ? listings[listings.length - 1].id
+      : afterId || null
+    const done = listings.length < batchSize
+
+    return res.json({
+      ok: true,
+      processed,
+      updated,
+      skipped,
+      failed,
+      batch_size: batchSize,
+      concurrency,
+      next_after_id: nextAfterId,
+      done,
+      results,
+    })
+  } catch (error) {
+    console.error("Language backfill batch failed:", error)
+    return res.status(500).json({
+      ok: false,
+      error: error?.message || String(error),
+    })
+  }
+})
 
 app.get("/api/admin/automation/status", async (req, res) => {
   try {
