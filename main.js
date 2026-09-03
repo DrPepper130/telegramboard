@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 })
 
 const BACKEND_BUILD_ID =
-  "telehub-language-counts-match-directory-filters-2026-09-03"
+  "telehub-language-counts-direct-listings-2026-09-03"
 
 // TeleHub listing pages are served directly from Supabase/Vercel.
 // Old Framer CMS compatibility code is hard-disabled below.
@@ -5126,19 +5126,24 @@ function normalizeLanguageClassification(raw = {}) {
 }
 
 async function getDirectoryLanguageOptions({
-  type,
-  query,
-  category,
-  sort,
-  showNsfw,
+  type = "all",
+  query = "",
+  category = "All",
+  showNsfw = false,
   force = false,
 } = {}) {
+  const normalizedType = normalizeDirectoryType(type)
+  const normalizedQuery = cleanDirectorySearch(query).toLowerCase()
+  const normalizedCategory =
+    String(category || "All").trim().slice(0, 80) || "All"
+  const normalizedCategoryLower = normalizedCategory.toLowerCase()
+  const normalizedNsfw = Boolean(showNsfw)
+
   const cacheKey = JSON.stringify({
-    type: normalizeDirectoryType(type),
-    query: cleanDirectorySearch(query),
-    category: String(category || "All").trim().slice(0, 80) || "All",
-    sort: normalizeDirectorySort(sort),
-    showNsfw: Boolean(showNsfw),
+    type: normalizedType,
+    query: normalizedQuery,
+    category: normalizedCategoryLower,
+    nsfw: normalizedNsfw,
   })
 
   const now = Date.now()
@@ -5154,54 +5159,66 @@ async function getDirectoryLanguageOptions({
   }
 
   const counts = new Map()
-  let baselineOffset = 0
-  let baselineTotal = null
+  const pageSize = 1000
 
-  while (baselineTotal === null || baselineOffset < baselineTotal) {
-    const { data, error } = await supabaseAdmin.rpc(
-      "telehub_directory_page",
-      {
-        p_type: normalizeDirectoryType(type),
-        p_query: cleanDirectorySearch(query),
-        p_category:
-          String(category || "All").trim().slice(0, 80) || "All",
-        p_sort: normalizeDirectorySort(sort),
-        p_show_nsfw: Boolean(showNsfw),
-        p_limit: DIRECTORY_LANGUAGE_SCAN_CHUNK,
-        p_offset: baselineOffset,
-      }
-    )
-
-    if (error) throw error
-
-    const payload =
-      data && typeof data === "object" ? data : {}
-
-    const rows = Array.isArray(payload.listings)
-      ? payload.listings
-      : []
-
-    if (baselineTotal === null) {
-      baselineTotal = Math.max(
-        0,
-        Number(payload.total_count || 0)
+  for (let from = 0; ; from += pageSize) {
+    let request = supabaseAdmin
+      .from("channel_listings")
+      .select(
+        "id, language_code, language_name, listing_type, is_nsfw, categories, channel_name, telegram_title, telegram_username, telegram_link, description"
       )
+      .eq("status", "approved")
+      .eq("is_banned", false)
+      .not("language_code", "is", null)
+      .eq("is_nsfw", normalizedNsfw)
+      .order("id", { ascending: true })
+      .range(from, from + pageSize - 1)
+
+    if (normalizedType !== "all") {
+      request = request.eq("listing_type", normalizedType)
     }
 
-    if (!rows.length) break
+    const { data, error } = await request
+    if (error) throw error
 
-    const languageById = await getLanguageCodesForListings(rows)
+    const rows = data || []
 
     for (const row of rows) {
-      const metadata = languageById.get(row.id)
-      const code = normalizeDirectoryLanguage(
-        metadata?.language_code
-      )
+      if (normalizedCategoryLower !== "all") {
+        const categories = Array.isArray(row.categories)
+          ? row.categories
+          : []
 
+        const hasCategory = categories.some(
+          (item) =>
+            String(item || "").trim().toLowerCase() ===
+            normalizedCategoryLower
+        )
+
+        if (!hasCategory) continue
+      }
+
+      if (normalizedQuery) {
+        const searchable = [
+          row.channel_name,
+          row.telegram_title,
+          row.telegram_username,
+          row.telegram_link,
+          row.description,
+          ...(Array.isArray(row.categories) ? row.categories : []),
+        ]
+          .filter(Boolean)
+          .join(" ")
+          .toLowerCase()
+
+        if (!searchable.includes(normalizedQuery)) continue
+      }
+
+      const code = normalizeDirectoryLanguage(row.language_code)
       if (!code || code === "und") continue
 
       const name =
-        String(metadata?.language_name || "").trim() ||
+        String(row.language_name || "").trim() ||
         (code === "mixed" ? "Multilingual" : code)
 
       const existing = counts.get(code) || {
@@ -5214,21 +5231,15 @@ async function getDirectoryLanguageOptions({
 
       if (
         (!existing.name || existing.name === code) &&
-        metadata?.language_name
+        row.language_name
       ) {
-        existing.name = String(
-          metadata.language_name
-        ).trim()
+        existing.name = String(row.language_name).trim()
       }
 
       counts.set(code, existing)
     }
 
-    baselineOffset += rows.length
-
-    if (rows.length < DIRECTORY_LANGUAGE_SCAN_CHUNK) {
-      break
-    }
+    if (rows.length < pageSize) break
   }
 
   const languages = Array.from(counts.values()).sort((a, b) => {
@@ -8865,7 +8876,6 @@ app.get("/api/directory", async (req, res) => {
       type,
       query,
       category,
-      sort,
       showNsfw,
     }).catch((error) => {
       console.warn("Directory language metadata read failed:", error.message)
