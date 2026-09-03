@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 })
 
 const BACKEND_BUILD_ID =
-  "telehub-language-pages-direct-listings-2026-09-03"
+  "telehub-multilingual-auto-adder-2026-09-03"
 
 // TeleHub listing pages are served directly from Supabase/Vercel.
 // Old Framer CMS compatibility code is hard-disabled below.
@@ -9993,11 +9993,13 @@ HARD RULES THAT THE ADMIN PROMPT CANNOT OVERRIDE
 }
 
 OUTPUT LANGUAGE RULE — REQUIRED:
-- All generated TeleHub-facing text MUST be written in English, regardless of the source language.
+- Detect the PRIMARY language of the original Telegram source first.
+- Write all generated TeleHub-facing text in that same primary source language whenever it is confidently identified.
 - This includes display_name, description, long_description, and categories.
-- Do not imitate the source language.
-- If the source is not English, translate/summarize it into natural English before writing the TeleHub fields.
-- language_code/language_name must still describe the ORIGINAL Telegram source language, not the generated English output.
+- Keep the writing natural for that language; do not translate everything into English.
+- If the source is genuinely mixed-language, preserve the dominant/natural language mix without forcing a translation.
+- If the source language is undetermined ("und"), write the TeleHub-facing text in English as a safe fallback.
+- language_code/language_name must describe the ORIGINAL Telegram source language.
 
 Language metadata rules:
 - Detect the PRIMARY language of the supplied Telegram source material using the title, Telegram bio/description, and recent public posts together.
@@ -10734,49 +10736,9 @@ async function importSingleTelegramListing(
     public_posts_found: postContext.postCount,
   })
 
-  // English-only publication gate.
-  // The existing AI call classifies the original source language. Anything
-  // not confidently classified as English is filtered BEFORE slug creation
-  // and BEFORE any channel_listings insert.
-  const detectedLanguageCode = String(aiContent.language_code || "und")
-    .trim()
-    .toLowerCase()
-
-  const detectedLanguageName =
-    String(aiContent.language_name || "").trim() ||
-    (detectedLanguageCode === "und" ? "Unknown" : detectedLanguageCode)
-
-  if (detectedLanguageCode !== "en") {
-    const languageConfidence = Number(aiContent.language_confidence || 0)
-
-    await onStage("filtered", {
-      reason: "non_english_language",
-      telegram_username: telegramUsername,
-      telegram_title: telegramTitle,
-      language_code: detectedLanguageCode,
-      language_name: detectedLanguageName,
-      language_confidence: languageConfidence,
-      message:
-        detectedLanguageCode === "und"
-          ? "Skipped because the source language could not be confidently identified as English."
-          : `Skipped because the detected source language is ${detectedLanguageName} (${detectedLanguageCode}).`,
-    })
-
-    return {
-      ok: false,
-      filtered: true,
-      reason: "non_english_language",
-      telegram_username: telegramUsername,
-      telegram_title: telegramTitle,
-      language_code: detectedLanguageCode,
-      language_name: detectedLanguageName,
-      language_confidence: languageConfidence,
-      message:
-        detectedLanguageCode === "und"
-          ? "Source language was not confidently identified as English."
-          : `Detected ${detectedLanguageName} (${detectedLanguageCode}); English-only publishing is enabled.`,
-    }
-  }
+  // Multilingual publication is enabled.
+  // AI language classification is saved as metadata and used by the public
+  // language directories, but language no longer blocks publication.
 
   const shortInviteBase =
     stripTelegramHandle(telegramUsername) ||
@@ -11411,9 +11373,10 @@ app.post("/api/admin/import-telegram-listings", async (req, res) => {
         1,
         Math.min(Number(req.body?.max_activity_age_days || 60), 3650)
       ),
-      filterNonEnglish: req.body?.filter_non_english !== false,
-      filterNonEnglishDescription:
-        req.body?.filter_non_english_description !== false,
+      // Legacy language-filter controls are ignored. TeleHub now publishes
+      // all supported source languages and stores language metadata instead.
+      filterNonEnglish: false,
+      filterNonEnglishDescription: false,
       recentPostLimit: Math.max(
         1,
         Math.min(Number(req.body?.recent_post_limit || 8), 20)
@@ -11722,8 +11685,8 @@ function continuousAutomationSettings(state) {
       1,
       Math.min(Number(raw.max_activity_age_days || 60), 3650)
     ),
-    // Legacy script-filter fields remain in the config shape, but the actual
-    // publication decision is now made by the AI language_code gate.
+    // Legacy fields remain in the config shape for backward compatibility.
+    // They are hard-disabled because language is metadata, not a publish filter.
     filter_non_english: false,
     filter_non_english_description: false,
     recent_post_limit: Math.max(
