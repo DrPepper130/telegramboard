@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 })
 
 const BACKEND_BUILD_ID =
-  "telehub-focused-expansion-nsfw-copy-2026-09-03"
+  "telehub-post-metrics-v1-2026-09-09"
 
 // TeleHub listing pages are served directly from Supabase/Vercel.
 // Old Framer CMS compatibility code is hard-disabled below.
@@ -823,8 +823,8 @@ function isMeaningfulTelegramPostText(value) {
   const text = compactTelegramPostText(value)
   if (!text) return false
 
-  // Telegram public previews can expose service/history events in the same
-  // feed area as authored posts. These are not useful listing content.
+  // Telegram's public preview can expose service/history events in the same
+  // feed area as authored posts. These are not useful semantic content.
   const serviceEventPatterns = [
     /^channel created[.!]?$/i,
     /^group created[.!]?$/i,
@@ -845,6 +845,140 @@ function isMeaningfulTelegramPostText(value) {
   ]
 
   return !serviceEventPatterns.some((pattern) => pattern.test(text))
+}
+
+function parseTelegramCompactMetric(value) {
+  const cleaned = decodeHtmlEntities(stripHtml(value))
+    .replace(/\u00a0/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+
+  if (!cleaned) return null
+
+  const match = cleaned.match(/([\d\s.,]+)\s*([kmb])?/i)
+  if (!match) return null
+
+  const suffix = String(match[2] || "").toLowerCase()
+  let numericText = String(match[1] || "").replace(/\s+/g, "").trim()
+  if (!numericText) return null
+
+  if (suffix) {
+    // Telegram commonly renders compact counts such as 12.4K or 1,2M.
+    if (numericText.includes(",") && !numericText.includes(".")) {
+      numericText = numericText.replace(",", ".")
+    } else {
+      numericText = numericText.replace(/,/g, "")
+    }
+  } else {
+    // Without a compact suffix, punctuation is a thousands separator.
+    numericText = numericText.replace(/[.,]/g, "")
+  }
+
+  const numeric = Number(numericText)
+  if (!Number.isFinite(numeric) || numeric < 0) return null
+
+  const multiplier =
+    suffix === "k"
+      ? 1_000
+      : suffix === "m"
+        ? 1_000_000
+        : suffix === "b"
+          ? 1_000_000_000
+          : 1
+
+  return Math.round(numeric * multiplier)
+}
+
+function extractTelegramPublicPostObjects(html, fallbackUsername, options = {}) {
+  const rawHtml = String(html || "")
+  const maxMetricPosts = Math.max(
+    1,
+    Math.min(Number(options.maxMetricPosts || 30), 50)
+  )
+
+  // data-post="username/123" gives us a stable message boundary. Slice from
+  // one marker to the next so the post id, text, timestamp and view count stay
+  // attached to one another instead of being collected in unrelated arrays.
+  const markerRegex = /data-post=["']([^"']+)["']/gi
+  const markers = []
+  let markerMatch
+
+  while ((markerMatch = markerRegex.exec(rawHtml))) {
+    markers.push({
+      index: markerMatch.index,
+      dataPost: decodeHtmlEntities(markerMatch[1] || "").trim(),
+    })
+  }
+
+  const parsed = []
+
+  for (let index = 0; index < markers.length; index += 1) {
+    const marker = markers[index]
+    const nextMarker = markers[index + 1]
+    const block = rawHtml.slice(
+      marker.index,
+      nextMarker ? nextMarker.index : rawHtml.length
+    )
+
+    const dataParts = marker.dataPost.split("/").filter(Boolean)
+    const postId = Number(dataParts[dataParts.length - 1] || "")
+    if (!Number.isInteger(postId) || postId <= 0) continue
+
+    const username = String(
+      dataParts.length > 1
+        ? dataParts[dataParts.length - 2]
+        : fallbackUsername || ""
+    )
+      .replace(/^@/, "")
+      .trim()
+
+    const textMatch = block.match(
+      /<div[^>]+class=["'][^"']*tgme_widget_message_text[^"']*["'][^>]*>([\s\S]*?)<\/div>/i
+    )
+    const rawText = textMatch?.[1] || ""
+    const cleanText = compactTelegramPostText(rawText)
+    const meaningfulText = isMeaningfulTelegramPostText(cleanText)
+      ? cleanText
+      : null
+
+    const timeMatch = block.match(
+      /<time[^>]+datetime=["']([^"']+)["'][^>]*>/i
+    )
+    const rawTimestamp = decodeHtmlEntities(timeMatch?.[1] || "").trim()
+    const timestampMs = Date.parse(rawTimestamp)
+    const postedAt = Number.isFinite(timestampMs)
+      ? new Date(timestampMs).toISOString()
+      : null
+
+    const viewsMatch = block.match(
+      /<[^>]+class=["'][^"']*\btgme_widget_message_views\b[^"']*["'][^>]*>([\s\S]*?)<\/[^>]+>/i
+    )
+    const viewsRaw = viewsMatch
+      ? compactTelegramPostText(viewsMatch[1])
+      : null
+    const views = viewsRaw ? parseTelegramCompactMetric(viewsRaw) : null
+
+    parsed.push({
+      postId,
+      telegramUsername:
+        username || String(fallbackUsername || "").replace(/^@/, ""),
+      dataPost: marker.dataPost,
+      messageUrl: username ? `https://t.me/${username}/${postId}` : null,
+      postedAt,
+      text: meaningfulText,
+      views,
+      viewsRaw,
+    })
+  }
+
+  return parsed
+    .sort((a, b) => {
+      const aMs = a.postedAt ? Date.parse(a.postedAt) : 0
+      const bMs = b.postedAt ? Date.parse(b.postedAt) : 0
+      if (aMs !== bMs) return aMs - bMs
+      return Number(a.postId || 0) - Number(b.postId || 0)
+    })
+    .slice(-maxMetricPosts)
 }
 
 async function fetchPublicTelegramPostContext(listing, options = {}) {
@@ -868,6 +1002,10 @@ async function fetchPublicTelegramPostContext(listing, options = {}) {
       Number(options.maxCharacters || process.env.TME_IMPORT_CONTEXT_MAX_CHARS || 7000),
       15000
     )
+  )
+  const maxMetricPosts = Math.max(
+    maxPosts,
+    Math.min(Number(options.maxMetricPosts || 30), 50)
   )
 
   const controller = new AbortController()
@@ -906,32 +1044,58 @@ async function fetchPublicTelegramPostContext(listing, options = {}) {
     }
 
     const html = await response.text()
+    const postObjects = extractTelegramPublicPostObjects(html, username, {
+      maxMetricPosts,
+    })
     const posts = []
     const imageUrls = []
     const telegramLinks = []
-    const postTimestamps = []
-    const messageRegex =
-      /<div[^>]+class="[^"]*tgme_widget_message_text[^"]*"[^>]*>([\s\S]*?)<\/div>/gi
 
-    // Telegram's public /s/ pages expose each visible post timestamp in a
-    // <time datetime="..."> element. Capture all valid timestamps so the
-    // importer can reject stale channels before spending an AI request.
-    const postTimeRegex =
-      /<time[^>]+datetime=["']([^"']+)["'][^>]*>/gi
-
-    let postTimeMatch
-    while ((postTimeMatch = postTimeRegex.exec(html))) {
-      const rawTimestamp = decodeHtmlEntities(postTimeMatch[1] || "").trim()
-      const timestampMs = Date.parse(rawTimestamp)
-      if (Number.isFinite(timestampMs)) postTimestamps.push(timestampMs)
+    // Preserve the old `posts` string-array contract for every existing caller.
+    let totalCharacters = 0
+    for (const post of postObjects) {
+      if (!post.text || posts.length >= maxPosts) continue
+      const remaining = maxCharacters - totalCharacters
+      if (remaining <= 0) break
+      const clipped = post.text.slice(0, remaining)
+      posts.push(clipped)
+      totalCharacters += clipped.length
     }
 
-    // Public Telegram post pages expose photo URLs in inline background-image
-    // styles. Video posts often expose a poster image instead.
+    // If Telegram ever changes/removes data-post markers, keep the old text
+    // parser as a compatibility fallback so AI import/activity features survive.
+    if (!posts.length) {
+      const messageRegex =
+        /<div[^>]+class="[^"]*tgme_widget_message_text[^"]*"[^>]*>([\s\S]*?)<\/div>/gi
+      let messageMatch
+      while ((messageMatch = messageRegex.exec(html)) && posts.length < maxPosts) {
+        const cleanText = compactTelegramPostText(messageMatch[1])
+        if (!isMeaningfulTelegramPostText(cleanText)) continue
+        const remaining = maxCharacters - totalCharacters
+        if (remaining <= 0) break
+        const clipped = cleanText.slice(0, remaining)
+        posts.push(clipped)
+        totalCharacters += clipped.length
+      }
+    }
+
+    let postTimestamps = postObjects
+      .map((post) => (post.postedAt ? Date.parse(post.postedAt) : NaN))
+      .filter(Number.isFinite)
+
+    if (!postTimestamps.length) {
+      const postTimeRegex = /<time[^>]+datetime=["']([^"']+)["'][^>]*>/gi
+      let postTimeMatch
+      while ((postTimeMatch = postTimeRegex.exec(html))) {
+        const rawTimestamp = decodeHtmlEntities(postTimeMatch[1] || "").trim()
+        const timestampMs = Date.parse(rawTimestamp)
+        if (Number.isFinite(timestampMs)) postTimestamps.push(timestampMs)
+      }
+    }
+
     const photoRegex =
       /class=["'][^"']*tgme_widget_message_photo_wrap[^"']*["'][^>]*style=["'][^"']*background-image\s*:\s*url\((?:&quot;|["']?)(https?:[^)"'&]+)(?:&quot;|["']?)\)/gi
-    const posterRegex =
-      /<video[^>]+poster=["'](https?:[^"']+)["']/gi
+    const posterRegex = /<video[^>]+poster=["'](https?:[^"']+)["']/gi
     const imageTagRegex =
       /<img[^>]+class=["'][^"']*tgme_widget_message_photo[^"']*["'][^>]+src=["'](https?:[^"']+)["']/gi
 
@@ -975,24 +1139,13 @@ async function fetchPublicTelegramPostContext(listing, options = {}) {
       if (telegramLinks.length >= 100) break
     }
 
-    let match
-    let totalCharacters = 0
-
-    while ((match = messageRegex.exec(html)) && posts.length < maxPosts) {
-      const cleanText = compactTelegramPostText(match[1])
-      if (!isMeaningfulTelegramPostText(cleanText)) continue
-
-      const remaining = maxCharacters - totalCharacters
-      if (remaining <= 0) break
-
-      const clipped = cleanText.slice(0, remaining)
-      posts.push(clipped)
-      totalCharacters += clipped.length
-    }
-
     const latestPostTimestampMs = postTimestamps.length
       ? Math.max(...postTimestamps)
       : null
+
+    const viewSamples = postObjects
+      .map((post) => Number(post.views))
+      .filter((value) => Number.isFinite(value) && value >= 0)
 
     return {
       username,
@@ -1000,6 +1153,9 @@ async function fetchPublicTelegramPostContext(listing, options = {}) {
       posts,
       postCount: posts.length,
       contextText: posts.join("\n\n---\n\n"),
+      postObjects,
+      metricPostCount: postObjects.length,
+      viewSampleCount: viewSamples.length,
       imageUrls,
       imageCount: imageUrls.length,
       telegramLinks,
@@ -1019,7 +1175,6 @@ async function fetchPublicTelegramPostContext(listing, options = {}) {
     clearTimeout(timeout)
   }
 }
-
 
 function detectImageFormat(buffer) {
   if (!Buffer.isBuffer(buffer) || buffer.length < 12) return null
@@ -10118,6 +10273,194 @@ async function persistImportedListingActivitySeed({
   }
 }
 
+function medianNumber(values) {
+  const nums = (values || [])
+    .map(Number)
+    .filter((value) => Number.isFinite(value))
+    .sort((a, b) => a - b)
+
+  if (!nums.length) return null
+  const middle = Math.floor(nums.length / 2)
+  return nums.length % 2 === 0
+    ? (nums[middle - 1] + nums[middle]) / 2
+    : nums[middle]
+}
+
+async function persistTelegramPostMetrics({
+  listingId,
+  memberCount,
+  postContext,
+  maxSnapshotPosts = 12,
+}) {
+  if (!listingId) return { ok: false, skipped: true, reason: "missing_listing_id" }
+
+  const postObjects = Array.isArray(postContext?.postObjects)
+    ? postContext.postObjects
+    : []
+
+  if (!postObjects.length) {
+    return { ok: true, skipped: true, reason: "no_structured_posts", posts_seen: 0 }
+  }
+
+  const scrapedAt = new Date().toISOString()
+  const normalizedMemberCount = Math.max(0, Number(memberCount || 0))
+
+  const baseRows = postObjects
+    .filter((post) => Number.isInteger(Number(post?.postId)) && Number(post.postId) > 0)
+    .map((post) => ({
+      listing_id: listingId,
+      telegram_username: String(post.telegramUsername || postContext?.username || "")
+        .replace(/^@/, "")
+        .trim(),
+      post_id: Number(post.postId),
+      posted_at: post.postedAt || null,
+      text: post.text || null,
+      text_hash: post.text
+        ? crypto.createHash("sha256").update(String(post.text)).digest("hex")
+        : null,
+      message_url: post.messageUrl || null,
+      last_seen_at: scrapedAt,
+      source: postContext?.source || "tme_public_posts",
+      updated_at: scrapedAt,
+      views: Number.isFinite(Number(post.views)) ? Number(post.views) : null,
+    }))
+
+  const withViews = baseRows.filter((row) => row.views !== null)
+  const withoutViews = baseRows.filter((row) => row.views === null)
+  let postsSaved = 0
+
+  if (withViews.length) {
+    const payload = withViews.map(({ views, ...row }) => ({
+      ...row,
+      latest_views: views,
+      metrics_updated_at: scrapedAt,
+    }))
+
+    const { error } = await supabaseAdmin
+      .from("telegram_public_posts")
+      .upsert(payload, { onConflict: "listing_id,post_id" })
+
+    if (error) {
+      console.warn("Telegram public post metric rows could not be saved:", {
+        listing_id: listingId,
+        error: error.message,
+      })
+      return { ok: false, error: error.message, migration_required: true }
+    }
+    postsSaved += payload.length
+  }
+
+  if (withoutViews.length) {
+    const payload = withoutViews.map(({ views, ...row }) => row)
+    const { error } = await supabaseAdmin
+      .from("telegram_public_posts")
+      .upsert(payload, { onConflict: "listing_id,post_id" })
+
+    if (error) {
+      console.warn("Telegram public post rows without views could not be saved:", {
+        listing_id: listingId,
+        error: error.message,
+      })
+      return { ok: false, error: error.message, migration_required: true }
+    }
+    postsSaved += payload.length
+  }
+
+  const snapshotCandidates = withViews
+    .slice()
+    .sort((a, b) => {
+      const aMs = a.posted_at ? Date.parse(a.posted_at) : 0
+      const bMs = b.posted_at ? Date.parse(b.posted_at) : 0
+      if (aMs !== bMs) return bMs - aMs
+      return Number(b.post_id || 0) - Number(a.post_id || 0)
+    })
+    .slice(0, Math.max(1, Math.min(Number(maxSnapshotPosts || 12), 30)))
+
+  let snapshotsSaved = 0
+  if (snapshotCandidates.length) {
+    const { error } = await supabaseAdmin
+      .from("telegram_post_metric_snapshots")
+      .insert(
+        snapshotCandidates.map((row) => ({
+          listing_id: listingId,
+          post_id: row.post_id,
+          scraped_at: scrapedAt,
+          views: row.views,
+          member_count_at_scrape: normalizedMemberCount || null,
+          source: postContext?.source || "tme_public_posts",
+        }))
+      )
+
+    if (error) {
+      console.warn("Telegram post metric snapshots could not be saved:", {
+        listing_id: listingId,
+        error: error.message,
+      })
+    } else {
+      snapshotsSaved = snapshotCandidates.length
+    }
+  }
+
+  const viewValues = withViews.map((row) => Number(row.views))
+  const medianViews = medianNumber(viewValues)
+  const averageViews = viewValues.length
+    ? viewValues.reduce((sum, value) => sum + value, 0) / viewValues.length
+    : null
+
+  const newestWithViews = withViews
+    .slice()
+    .sort((a, b) => {
+      const aMs = a.posted_at ? Date.parse(a.posted_at) : 0
+      const bMs = b.posted_at ? Date.parse(b.posted_at) : 0
+      if (aMs !== bMs) return bMs - aMs
+      return Number(b.post_id || 0) - Number(a.post_id || 0)
+    })[0] || null
+
+  const summaryUpdate = {
+    post_metrics_checked_at: scrapedAt,
+    view_sample_size: viewValues.length,
+    latest_post_views: newestWithViews?.views ?? null,
+    median_visible_post_views:
+      medianViews === null ? null : Math.round(medianViews),
+    average_visible_post_views:
+      averageViews === null ? null : Number(averageViews.toFixed(2)),
+    median_views_per_member:
+      medianViews !== null && normalizedMemberCount > 0
+        ? Number((medianViews / normalizedMemberCount).toFixed(6))
+        : null,
+    updated_at: scrapedAt,
+  }
+
+  const { error: activityError } = await supabaseAdmin
+    .from("telegram_listing_activity")
+    .update(summaryUpdate)
+    .eq("listing_id", listingId)
+
+  if (activityError) {
+    console.warn("Telegram listing view summary could not be updated:", {
+      listing_id: listingId,
+      error: activityError.message,
+    })
+  }
+
+  return {
+    ok: true,
+    posts_seen: baseRows.length,
+    posts_saved: postsSaved,
+    views_observed: viewValues.length,
+    snapshots_saved: snapshotsSaved,
+    latest_post_views: newestWithViews?.views ?? null,
+    median_visible_post_views:
+      medianViews === null ? null : Math.round(medianViews),
+    average_visible_post_views:
+      averageViews === null ? null : Number(averageViews.toFixed(2)),
+    median_views_per_member: summaryUpdate.median_views_per_member,
+    scraped_at: scrapedAt,
+    activity_summary_saved: !activityError,
+    activity_summary_error: activityError?.message || null,
+  }
+}
+
 async function persistImportedListingGraphEdges({
   sourceLink,
   telegramLinks,
@@ -10176,15 +10519,22 @@ async function seedImportedListingAnalytics({
     })
   }
 
-  const [activity, graph] = await Promise.all([
-    persistImportedListingActivitySeed({
-      listingId,
-      postContext,
-      source: profileSource,
-    }),
+  // Create/update the activity row first; metric persistence enriches it.
+  const activity = await persistImportedListingActivitySeed({
+    listingId,
+    postContext,
+    source: profileSource,
+  })
+
+  const [graph, postMetrics] = await Promise.all([
     persistImportedListingGraphEdges({
       sourceLink: telegramLink,
       telegramLinks: postContext?.telegramLinks || [],
+    }),
+    persistTelegramPostMetrics({
+      listingId,
+      memberCount,
+      postContext,
     }),
   ])
 
@@ -10193,8 +10543,348 @@ async function seedImportedListingAnalytics({
     member_snapshot_error: snapshotError?.message || null,
     activity,
     graph,
+    post_metrics: postMetrics,
   }
 }
+
+
+async function refreshSingleListingPostMetrics(listing) {
+  const postContext = await fetchPublicTelegramPostContext(listing, {
+    maxPosts: 30,
+    maxCharacters: 12000,
+    maxMetricPosts: 30,
+  })
+
+  const activity = await persistImportedListingActivitySeed({
+    listingId: listing.id,
+    postContext,
+    source: postContext.source,
+  })
+
+  const postMetrics = await persistTelegramPostMetrics({
+    listingId: listing.id,
+    memberCount: listing.member_count,
+    postContext,
+    maxSnapshotPosts: 12,
+  })
+
+  return {
+    listing_id: listing.id,
+    short_invite: listing.short_invite || null,
+    telegram_username:
+      listing.telegram_username || extractUsernameFromLink(listing.telegram_link),
+    latest_post_at: postContext.latestPostAt || null,
+    metric_post_count: Number(postContext.metricPostCount || 0),
+    view_sample_count: Number(postContext.viewSampleCount || 0),
+    activity,
+    post_metrics: postMetrics,
+  }
+}
+
+async function refreshPostMetricsBatch(options = {}) {
+  const batchSize = Math.max(
+    1,
+    Math.min(Number.parseInt(options.batchSize ?? options.limit, 10) || 12, 30)
+  )
+  const concurrency = Math.max(
+    1,
+    Math.min(Number.parseInt(options.concurrency, 10) || 2, 4)
+  )
+  const afterId = String(options.afterId || "").trim()
+  const pauseMs = Math.max(
+    0,
+    Math.min(Number.parseInt(options.pauseMs, 10) || 250, 5000)
+  )
+
+  let query = supabaseAdmin
+    .from("channel_listings")
+    .select(
+      "id,telegram_username,telegram_link,member_count,status,is_banned,short_invite"
+    )
+    .eq("status", "approved")
+    .or("is_banned.is.null,is_banned.eq.false")
+    .order("id", { ascending: true })
+    .limit(batchSize)
+
+  if (afterId) query = query.gt("id", afterId)
+
+  const { data, error } = await query
+  if (error) throw error
+
+  const listings = data || []
+  const results = new Array(listings.length)
+  let cursor = 0
+  let stopScheduling = false
+  let rateLimited = false
+
+  async function worker() {
+    while (true) {
+      if (stopScheduling) return
+      const index = cursor
+      cursor += 1
+      if (index >= listings.length) return
+
+      const listing = listings[index]
+      const username = publicTelegramUsername(listing)
+
+      if (!username) {
+        results[index] = {
+          ok: true,
+          skipped: true,
+          reason: "no_public_username",
+          listing_id: listing.id,
+          short_invite: listing.short_invite || null,
+        }
+        continue
+      }
+
+      try {
+        results[index] = {
+          ok: true,
+          ...(await refreshSingleListingPostMetrics(listing)),
+        }
+      } catch (error) {
+        const isRateLimit =
+          error?.code === "TME_POST_CONTEXT_RATE_LIMITED" || error?.status === 429
+
+        results[index] = {
+          ok: false,
+          rate_limited: isRateLimit,
+          listing_id: listing.id,
+          short_invite: listing.short_invite || null,
+          telegram_username:
+            listing.telegram_username || extractUsernameFromLink(listing.telegram_link),
+          code: error?.code || null,
+          status: error?.status || null,
+          error: error?.message || String(error),
+        }
+
+        if (isRateLimit) {
+          rateLimited = true
+          stopScheduling = true
+        }
+      }
+
+      if (!stopScheduling && pauseMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, pauseMs))
+      }
+    }
+  }
+
+  await Promise.all(
+    Array.from(
+      { length: Math.min(concurrency, Math.max(1, listings.length)) },
+      () => worker()
+    )
+  )
+
+  // Advance only across a contiguous processed prefix. If Telegram rate-limits
+  // a listing, leave the cursor immediately before it so the next run retries it.
+  let contiguousProcessed = 0
+  for (let index = 0; index < listings.length; index += 1) {
+    const result = results[index]
+    if (!result || result.rate_limited) break
+    contiguousProcessed += 1
+  }
+
+  const nextAfterId =
+    contiguousProcessed > 0
+      ? listings[contiguousProcessed - 1].id
+      : afterId || null
+
+  const completedResults = results.filter(Boolean)
+  const reachedEnd = !rateLimited && listings.length < batchSize
+
+  return {
+    ok: true,
+    batch_size: batchSize,
+    concurrency,
+    selected: listings.length,
+    processed: completedResults.length,
+    succeeded: completedResults.filter((item) => item.ok && !item.skipped).length,
+    skipped: completedResults.filter((item) => item.skipped).length,
+    failed: completedResults.filter((item) => !item.ok).length,
+    rate_limited: rateLimited,
+    next_after_id: nextAfterId,
+    done: reachedEnd,
+    results: completedResults,
+  }
+}
+
+async function loadPostMetricsCollectionState() {
+  const { data, error } = await supabaseAdmin
+    .from("telegram_post_metrics_collection_state")
+    .select("*")
+    .eq("state_key", "global")
+    .maybeSingle()
+
+  if (error) throw error
+  if (data) return data
+
+  const now = new Date().toISOString()
+  const { data: inserted, error: insertError } = await supabaseAdmin
+    .from("telegram_post_metrics_collection_state")
+    .upsert(
+      {
+        state_key: "global",
+        cycle_started_at: now,
+        updated_at: now,
+      },
+      { onConflict: "state_key" }
+    )
+    .select("*")
+    .single()
+
+  if (insertError) throw insertError
+  return inserted
+}
+
+async function runScheduledPostMetricsBatch(options = {}) {
+  const state = await loadPostMetricsCollectionState()
+  const now = new Date().toISOString()
+  const afterId = String(state?.after_listing_id || "").trim()
+
+  const result = await refreshPostMetricsBatch({
+    batchSize: options.batchSize,
+    concurrency: options.concurrency,
+    pauseMs: options.pauseMs,
+    afterId,
+  })
+
+  const update = {
+    after_listing_id: result.done ? null : result.next_after_id,
+    cycle_started_at:
+      result.done ? null : state?.cycle_started_at || now,
+    cycle_completed_at: result.done
+      ? now
+      : state?.cycle_completed_at || null,
+    last_run_at: now,
+    last_run_processed: Number(result.processed || 0),
+    last_run_succeeded: Number(result.succeeded || 0),
+    last_run_failed: Number(result.failed || 0),
+    last_rate_limited: result.rate_limited === true,
+    updated_at: now,
+  }
+
+  const { error } = await supabaseAdmin
+    .from("telegram_post_metrics_collection_state")
+    .update(update)
+    .eq("state_key", "global")
+
+  if (error) throw error
+
+  return {
+    ...result,
+    cron_cursor_before: afterId || null,
+    cron_cursor_after: update.after_listing_id,
+    cycle_completed: result.done,
+  }
+}
+
+app.get("/api/cron/refresh-post-metrics", async (req, res) => {
+  try {
+    if (req.query.secret !== process.env.CRON_SECRET) {
+      return res.status(401).json({ error: "Unauthorized" })
+    }
+
+    const result = await runScheduledPostMetricsBatch({
+      batchSize: req.query.batch_size,
+      concurrency: req.query.concurrency,
+      pauseMs: req.query.pause_ms,
+    })
+
+    res.set("Cache-Control", "no-store")
+    return res.json(result)
+  } catch (error) {
+    console.error("Post-metrics cron refresh failed:", error)
+    return res.status(500).json({
+      ok: false,
+      error: error.message || "Could not refresh Telegram post metrics.",
+    })
+  }
+})
+
+app.get("/api/admin/post-metrics/status", async (req, res) => {
+  try {
+    const user = await getAdminUserFromRequest(req)
+    if (!user) {
+      return res.status(403).json({ error: "Admin access required." })
+    }
+
+    const [eligible, checked, posts, snapshots, latestCheck, state] =
+      await Promise.all([
+        supabaseAdmin
+          .from("channel_listings")
+          .select("*", { count: "exact", head: true })
+          .eq("status", "approved")
+          .or("is_banned.is.null,is_banned.eq.false"),
+        supabaseAdmin
+          .from("telegram_listing_activity")
+          .select("*", { count: "exact", head: true })
+          .not("post_metrics_checked_at", "is", null),
+        supabaseAdmin
+          .from("telegram_public_posts")
+          .select("*", { count: "exact", head: true }),
+        supabaseAdmin
+          .from("telegram_post_metric_snapshots")
+          .select("*", { count: "exact", head: true }),
+        supabaseAdmin
+          .from("telegram_listing_activity")
+          .select("post_metrics_checked_at")
+          .not("post_metrics_checked_at", "is", null)
+          .order("post_metrics_checked_at", { ascending: false })
+          .limit(1)
+          .maybeSingle(),
+        loadPostMetricsCollectionState(),
+      ])
+
+    for (const result of [eligible, checked, posts, snapshots, latestCheck]) {
+      if (result?.error) throw result.error
+    }
+
+    return res.json({
+      ok: true,
+      eligible_listings: Number(eligible.count || 0),
+      listings_with_metrics: Number(checked.count || 0),
+      stored_posts: Number(posts.count || 0),
+      metric_snapshots: Number(snapshots.count || 0),
+      latest_metrics_check_at:
+        latestCheck.data?.post_metrics_checked_at || null,
+      collection_state: state,
+    })
+  } catch (error) {
+    console.error("Admin post-metrics status failed:", error)
+    return res.status(500).json({
+      ok: false,
+      error: error.message || "Could not load post-metrics status.",
+    })
+  }
+})
+
+app.post("/api/admin/post-metrics/backfill", async (req, res) => {
+  try {
+    const user = await getAdminUserFromRequest(req)
+    if (!user) {
+      return res.status(403).json({ error: "Admin access required." })
+    }
+
+    const result = await refreshPostMetricsBatch({
+      batchSize: req.body?.batch_size,
+      concurrency: req.body?.concurrency,
+      afterId: req.body?.after_id,
+      pauseMs: req.body?.pause_ms,
+    })
+
+    res.set("Cache-Control", "no-store")
+    return res.json(result)
+  } catch (error) {
+    console.error("Admin post-metrics backfill failed:", error)
+    return res.status(500).json({
+      ok: false,
+      error: error.message || "Could not backfill Telegram post metrics.",
+    })
+  }
+})
 
 async function importSingleTelegramListing(
   link,
@@ -10653,6 +11343,11 @@ async function importSingleTelegramListing(
     observed_public_posts: analyticsSeed.activity?.observed_post_count || 0,
     graph_edges_saved: analyticsSeed.graph?.saved || 0,
     graph_edges_attempted: analyticsSeed.graph?.attempted || 0,
+    metric_posts_saved: analyticsSeed.post_metrics?.posts_saved || 0,
+    view_samples_observed: analyticsSeed.post_metrics?.views_observed || 0,
+    view_snapshots_saved: analyticsSeed.post_metrics?.snapshots_saved || 0,
+    median_visible_post_views:
+      analyticsSeed.post_metrics?.median_visible_post_views ?? null,
   })
 
   let iconUrl = null
