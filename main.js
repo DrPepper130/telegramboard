@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 })
 
 const BACKEND_BUILD_ID =
-  "telehub-ad-planner-v1-2026-09-09"
+  "telehub-ad-planner-v1.1-2026-09-09"
 
 // TeleHub listing pages are served directly from Supabase/Vercel.
 // Old Framer CMS compatibility code is hard-disabled below.
@@ -10433,8 +10433,19 @@ async function persistTelegramPostMetrics({
 
   const { error: activityError } = await supabaseAdmin
     .from("telegram_listing_activity")
-    .update(summaryUpdate)
-    .eq("listing_id", listingId)
+    .upsert(
+      {
+        listing_id: listingId,
+        latest_post_at: postContext?.latestPostAt || null,
+        observed_post_count: Number(
+          postContext?.postCount || postObjects.length || 0
+        ),
+        source: postContext?.source || "tme_public_posts",
+        checked_at: scrapedAt,
+        ...summaryUpdate,
+      },
+      { onConflict: "listing_id" }
+    )
 
   if (activityError) {
     console.warn("Telegram listing view summary could not be updated:", {
@@ -17641,11 +17652,17 @@ function adPlannerFormatListingResult(candidate, rank) {
     estimated_reach: Math.max(0, Number(candidate._adjusted_reach || 0)),
     median_views: Math.max(0, Number(candidate._median_views || 0)),
     views_per_member:
+      candidate._views_per_member !== null &&
+      candidate._views_per_member !== undefined &&
+      candidate._views_per_member !== "" &&
       Number.isFinite(Number(candidate._views_per_member)) &&
       Number(candidate._views_per_member) >= 0
         ? Number(candidate._views_per_member)
         : null,
     member_growth_24h:
+      candidate.member_growth_24h !== null &&
+      candidate.member_growth_24h !== undefined &&
+      candidate.member_growth_24h !== "" &&
       Number.isFinite(Number(candidate.member_growth_24h))
         ? Number(candidate.member_growth_24h)
         : null,
@@ -17665,8 +17682,11 @@ function adPlannerFormatListingResult(candidate, rank) {
         : "Reach modeled from listing data",
     cluster: candidate._cluster,
     semantic_similarity:
+      candidate._semantic_similarity !== null &&
+      candidate._semantic_similarity !== undefined &&
+      candidate._semantic_similarity !== "" &&
       Number.isFinite(Number(candidate._semantic_similarity))
-        ? Number(candidate._semantic_similarity.toFixed(4))
+        ? Number(Number(candidate._semantic_similarity).toFixed(4))
         : null,
     marginal_score: Number(candidate._marginal_score.toFixed(2)),
   }
@@ -17799,7 +17819,10 @@ async function buildTeleHubAdPlannerCampaign({
     candidate._reach_measured = reach.measured
     candidate._reach_score = reachScore
     candidate._views_per_member =
-      Number.isFinite(Number(activity?.median_views_per_member))
+      activity?.median_views_per_member !== null &&
+      activity?.median_views_per_member !== undefined &&
+      activity?.median_views_per_member !== "" &&
+      Number.isFinite(Number(activity.median_views_per_member))
         ? Number(activity.median_views_per_member)
         : null
     candidate._value_score = adPlannerValueScore(
