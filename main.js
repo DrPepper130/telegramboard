@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 })
 
 const BACKEND_BUILD_ID =
-  "telehub-ad-planner-v1.1-2026-09-09"
+  "telehub-listing-reports-v1-2026-10-04"
 
 // TeleHub listing pages are served directly from Supabase/Vercel.
 // Old Framer CMS compatibility code is hard-disabled below.
@@ -18152,6 +18152,568 @@ app.get("/api/cron/ad-planner-features", async (req, res) => {
 // on the existing directory once it reaches full coverage.
 scheduleAdPlannerFeatureWorker(15_000)
 
+
+
+
+// ========================================
+// LISTING REPORTS
+// Public report submission + admin review.
+// ========================================
+
+const LISTING_REPORT_STATUSES = new Set([
+  "pending",
+  "reviewed",
+  "resolved",
+  "dismissed",
+])
+
+const listingReportRateBuckets = new Map()
+
+function listingReportClientIp(req) {
+  const forwarded = String(req.headers["x-forwarded-for"] || "")
+    .split(",")[0]
+    .trim()
+
+  return (
+    forwarded ||
+    String(req.headers["x-real-ip"] || "").trim() ||
+    String(req.ip || "").trim() ||
+    "unknown"
+  )
+}
+
+function checkListingReportRateLimit(req) {
+  const now = Date.now()
+  const windowMs = 60 * 60 * 1000
+  const maxRequests = Math.max(
+    1,
+    Number(process.env.LISTING_REPORTS_PER_HOUR || 10)
+  )
+
+  const rawIp = listingReportClientIp(req)
+  const key = crypto
+    .createHash("sha256")
+    .update(
+      `${process.env.REPORT_HASH_SALT || "telehub-listing-reports-v1"}:${rawIp}`
+    )
+    .digest("hex")
+
+  const previous = listingReportRateBuckets.get(key)
+  const bucket =
+    previous && previous.resetAt > now
+      ? previous
+      : { count: 0, resetAt: now + windowMs }
+
+  bucket.count += 1
+  listingReportRateBuckets.set(key, bucket)
+
+  // Opportunistic cleanup so this in-memory map stays bounded.
+  if (listingReportRateBuckets.size > 5000) {
+    for (const [bucketKey, value] of listingReportRateBuckets.entries()) {
+      if (!value || value.resetAt <= now) {
+        listingReportRateBuckets.delete(bucketKey)
+      }
+    }
+  }
+
+  return {
+    allowed: bucket.count <= maxRequests,
+    retryAfterSeconds: Math.max(
+      1,
+      Math.ceil((bucket.resetAt - now) / 1000)
+    ),
+  }
+}
+
+function normalizeReportUrl(value) {
+  const raw = String(value || "").trim().slice(0, 2000)
+  if (!raw) return ""
+
+  try {
+    const withProtocol = /^https?:\/\//i.test(raw)
+      ? raw
+      : raw.startsWith("t.me/") || raw.startsWith("telegram.me/")
+        ? `https://${raw}`
+        : raw
+
+    const parsed = new URL(withProtocol)
+
+    if (!["http:", "https:"].includes(parsed.protocol)) return raw
+
+    parsed.hash = ""
+    return parsed.toString()
+  } catch {
+    return raw
+  }
+}
+
+function reportReferenceFromInput(listingUrl, explicitSlug = "") {
+  const rawUrl = String(listingUrl || "").trim()
+  const suppliedSlug = String(explicitSlug || "")
+    .trim()
+    .replace(/^\/+|\/+$/g, "")
+    .slice(0, 160)
+
+  let slug = suppliedSlug || null
+  let telegramUsername = null
+
+  try {
+    const candidate = /^https?:\/\//i.test(rawUrl)
+      ? rawUrl
+      : rawUrl.startsWith("t.me/") || rawUrl.startsWith("telegram.me/")
+        ? `https://${rawUrl}`
+        : null
+
+    if (candidate) {
+      const parsed = new URL(candidate)
+      const host = parsed.hostname.toLowerCase().replace(/^www\./, "")
+      const parts = parsed.pathname.split("/").filter(Boolean)
+
+      if (host === "telehub.to" && parts[0]?.toLowerCase() === "channel") {
+        if (!slug && parts[1]) {
+          slug = decodeURIComponent(parts[1]).trim().slice(0, 160)
+        }
+      }
+
+      if (host === "t.me" || host === "telegram.me") {
+        const possibleUsername = String(parts[0] || "")
+          .replace(/^@/, "")
+          .trim()
+
+        if (
+          possibleUsername &&
+          !["s", "joinchat", "addstickers", "addemoji"].includes(
+            possibleUsername.toLowerCase()
+          ) &&
+          /^[a-zA-Z0-9_]{3,64}$/.test(possibleUsername)
+        ) {
+          telegramUsername = possibleUsername
+        }
+      }
+    }
+  } catch {
+    // Keep the raw input. Resolution is best-effort; the report can still be saved.
+  }
+
+  return { slug, telegramUsername }
+}
+
+async function resolveListingForReport(listingUrl, explicitSlug = "") {
+  const reference = reportReferenceFromInput(listingUrl, explicitSlug)
+
+  const selection = [
+    "id",
+    "short_invite",
+    "slug",
+    "channel_name",
+    "telegram_username",
+    "telegram_link",
+    "listing_type",
+    "status",
+    "is_banned",
+  ].join(",")
+
+  if (reference.slug) {
+    let lookup = await supabaseAdmin
+      .from("channel_listings")
+      .select(selection)
+      .eq("short_invite", reference.slug)
+      .maybeSingle()
+
+    if (lookup.error) throw lookup.error
+    if (lookup.data) return lookup.data
+
+    lookup = await supabaseAdmin
+      .from("channel_listings")
+      .select(selection)
+      .eq("slug", reference.slug)
+      .maybeSingle()
+
+    if (lookup.error) throw lookup.error
+    if (lookup.data) return lookup.data
+  }
+
+  if (reference.telegramUsername) {
+    const variants = [
+      reference.telegramUsername,
+      `@${reference.telegramUsername}`,
+    ]
+
+    for (const username of variants) {
+      const lookup = await supabaseAdmin
+        .from("channel_listings")
+        .select(selection)
+        .eq("telegram_username", username)
+        .limit(1)
+        .maybeSingle()
+
+      if (lookup.error) throw lookup.error
+      if (lookup.data) return lookup.data
+    }
+
+    const linkVariants = [
+      `https://t.me/${reference.telegramUsername}`,
+      `http://t.me/${reference.telegramUsername}`,
+    ]
+
+    for (const telegramLink of linkVariants) {
+      const lookup = await supabaseAdmin
+        .from("channel_listings")
+        .select(selection)
+        .eq("telegram_link", telegramLink)
+        .limit(1)
+        .maybeSingle()
+
+      if (lookup.error) throw lookup.error
+      if (lookup.data) return lookup.data
+    }
+  }
+
+  return null
+}
+
+app.post("/api/listing-reports", async (req, res) => {
+  const rateLimit = checkListingReportRateLimit(req)
+
+  if (!rateLimit.allowed) {
+    res.set("Retry-After", String(rateLimit.retryAfterSeconds))
+    return res.status(429).json({
+      ok: false,
+      error: "Too many reports from this connection. Try again later.",
+      retry_after_seconds: rateLimit.retryAfterSeconds,
+    })
+  }
+
+  try {
+    const listingUrl = normalizeReportUrl(req.body?.listing_url)
+    const explicitSlug = String(req.body?.listing_slug || "")
+      .trim()
+      .slice(0, 160)
+
+    const reason = String(req.body?.reason || "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 120)
+
+    const details = String(req.body?.details || "")
+      .trim()
+      .slice(0, 5000)
+
+    const reporterEmailRaw = String(req.body?.reporter_email || "")
+      .trim()
+      .toLowerCase()
+      .slice(0, 320)
+
+    const source = String(req.body?.source || "report_page")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 80) || "report_page"
+
+    if (!listingUrl) {
+      return res.status(400).json({
+        ok: false,
+        error: "Enter the TeleHub listing URL or Telegram URL you want to report.",
+      })
+    }
+
+    if (!reason) {
+      return res.status(400).json({
+        ok: false,
+        error: "Choose or enter a reason for the report.",
+      })
+    }
+
+    if (details.length < 3) {
+      return res.status(400).json({
+        ok: false,
+        error: "Add a little more detail about the issue.",
+      })
+    }
+
+    let reporterEmail = null
+    if (reporterEmailRaw) {
+      const validEmail =
+        /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(reporterEmailRaw)
+
+      if (!validEmail) {
+        return res.status(400).json({
+          ok: false,
+          error: "Enter a valid email address or leave the email field blank.",
+        })
+      }
+
+      reporterEmail = reporterEmailRaw
+    }
+
+    const listing = await resolveListingForReport(listingUrl, explicitSlug)
+
+    const reference = reportReferenceFromInput(listingUrl, explicitSlug)
+    const storedSlug =
+      listing?.short_invite ||
+      listing?.slug ||
+      reference.slug ||
+      null
+
+    const { data: inserted, error: insertError } = await supabaseAdmin
+      .from("listing_reports")
+      .insert({
+        listing_id: listing?.id || null,
+        listing_slug: storedSlug,
+        listing_url: listingUrl,
+        reason,
+        details,
+        reporter_email: reporterEmail,
+        source,
+        status: "pending",
+        updated_at: new Date().toISOString(),
+      })
+      .select(
+        "id, listing_id, listing_slug, listing_url, reason, status, created_at"
+      )
+      .single()
+
+    if (insertError) {
+      if (
+        String(insertError.message || "")
+          .toLowerCase()
+          .includes("listing_reports")
+      ) {
+        return res.status(503).json({
+          ok: false,
+          error:
+            "The report system database migration has not been deployed yet.",
+        })
+      }
+
+      throw insertError
+    }
+
+    console.log("Listing report submitted:", {
+      report_id: inserted?.id,
+      listing_id: inserted?.listing_id || null,
+      listing_slug: inserted?.listing_slug || null,
+      reason: inserted?.reason,
+      source,
+    })
+
+    res.set("Cache-Control", "no-store")
+    return res.status(201).json({
+      ok: true,
+      report: inserted,
+      listing_resolved: Boolean(listing?.id),
+      message:
+        "Report submitted. TeleHub will review the listing.",
+    })
+  } catch (error) {
+    console.error("Listing report submission failed:", error)
+
+    return res.status(500).json({
+      ok: false,
+      error:
+        error?.message ||
+        "TeleHub could not submit this report.",
+    })
+  }
+})
+
+app.get("/api/admin/listing-reports", async (req, res) => {
+  try {
+    const user = await getAdminUserFromRequest(req)
+    if (!user) {
+      return res.status(403).json({ error: "Admin access required." })
+    }
+
+    const requestedStatus = String(req.query.status || "all")
+      .trim()
+      .toLowerCase()
+
+    const status =
+      requestedStatus === "all" || LISTING_REPORT_STATUSES.has(requestedStatus)
+        ? requestedStatus
+        : "all"
+
+    const limit = Math.max(
+      1,
+      Math.min(Number.parseInt(req.query.limit, 10) || 250, 500)
+    )
+
+    let query = supabaseAdmin
+      .from("listing_reports")
+      .select("*")
+      .order("created_at", { ascending: false })
+      .limit(limit)
+
+    if (status !== "all") {
+      query = query.eq("status", status)
+    }
+
+    const { data: reports, error } = await query
+
+    if (error) throw error
+
+    const reportRows = Array.isArray(reports) ? reports : []
+    const listingIds = [
+      ...new Set(
+        reportRows
+          .map((report) => String(report.listing_id || "").trim())
+          .filter(Boolean)
+      ),
+    ]
+
+    let listingsById = new Map()
+
+    if (listingIds.length) {
+      const { data: listings, error: listingError } = await supabaseAdmin
+        .from("channel_listings")
+        .select(
+          "id, channel_name, short_invite, slug, telegram_username, telegram_link, listing_type, status, is_banned"
+        )
+        .in("id", listingIds)
+
+      if (listingError) throw listingError
+
+      listingsById = new Map(
+        (listings || []).map((listing) => [String(listing.id), listing])
+      )
+    }
+
+    const enriched = reportRows.map((report) => ({
+      ...report,
+      listing: report.listing_id
+        ? listingsById.get(String(report.listing_id)) || null
+        : null,
+    }))
+
+    const { data: countRows, error: countError } = await supabaseAdmin
+      .from("listing_reports")
+      .select("status")
+
+    if (countError) throw countError
+
+    const counts = {
+      all: 0,
+      pending: 0,
+      reviewed: 0,
+      resolved: 0,
+      dismissed: 0,
+    }
+
+    for (const row of countRows || []) {
+      counts.all += 1
+      const rowStatus = String(row.status || "")
+      if (Object.prototype.hasOwnProperty.call(counts, rowStatus)) {
+        counts[rowStatus] += 1
+      }
+    }
+
+    res.set("Cache-Control", "no-store")
+    return res.json({
+      ok: true,
+      reports: enriched,
+      counts,
+      status,
+    })
+  } catch (error) {
+    console.error("Could not load listing reports:", error)
+
+    return res.status(500).json({
+      ok: false,
+      error:
+        error?.message ||
+        "Could not load listing reports.",
+    })
+  }
+})
+
+app.post("/api/admin/listing-reports/:id/status", async (req, res) => {
+  try {
+    const user = await getAdminUserFromRequest(req)
+    if (!user) {
+      return res.status(403).json({ error: "Admin access required." })
+    }
+
+    const reportId = String(req.params.id || "").trim()
+    const nextStatus = String(req.body?.status || "")
+      .trim()
+      .toLowerCase()
+
+    if (!reportId) {
+      return res.status(400).json({ error: "Report ID is required." })
+    }
+
+    if (!LISTING_REPORT_STATUSES.has(nextStatus)) {
+      return res.status(400).json({
+        error: "Invalid report status.",
+      })
+    }
+
+    const now = new Date().toISOString()
+    const payload = {
+      status: nextStatus,
+      updated_at: now,
+      reviewed_at: nextStatus === "pending" ? null : now,
+      reviewed_by: nextStatus === "pending" ? null : user.id,
+    }
+
+    const { data, error } = await supabaseAdmin
+      .from("listing_reports")
+      .update(payload)
+      .eq("id", reportId)
+      .select("*")
+      .single()
+
+    if (error) throw error
+
+    return res.json({
+      ok: true,
+      report: data,
+    })
+  } catch (error) {
+    console.error("Could not update listing report:", error)
+
+    return res.status(500).json({
+      ok: false,
+      error:
+        error?.message ||
+        "Could not update listing report.",
+    })
+  }
+})
+
+app.delete("/api/admin/listing-reports/:id", async (req, res) => {
+  try {
+    const user = await getAdminUserFromRequest(req)
+    if (!user) {
+      return res.status(403).json({ error: "Admin access required." })
+    }
+
+    const reportId = String(req.params.id || "").trim()
+    if (!reportId) {
+      return res.status(400).json({ error: "Report ID is required." })
+    }
+
+    const { error } = await supabaseAdmin
+      .from("listing_reports")
+      .delete()
+      .eq("id", reportId)
+
+    if (error) throw error
+
+    return res.json({
+      ok: true,
+      deleted: reportId,
+    })
+  } catch (error) {
+    console.error("Could not delete listing report:", error)
+
+    return res.status(500).json({
+      ok: false,
+      error:
+        error?.message ||
+        "Could not delete listing report.",
+    })
+  }
+})
 
 
 app.listen(PORT, () => {
