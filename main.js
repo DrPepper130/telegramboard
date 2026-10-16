@@ -8965,6 +8965,38 @@ async function fetchMemberSnapshotsInBatches(listingIds, since) {
   return allSnapshots
 }
 
+// ========================================
+// DIRECTORY REQUEST PRESSURE GUARD
+// ========================================
+// Keep visitor-facing directory requests lightweight while Supabase/PostgREST
+// is recovering. Identical concurrent requests share one in-flight DB call,
+// but results are not cached after completion, so ranking/order remains live.
+const directoryRequestFlights = new Map()
+
+function runDirectoryRequestSingleFlight(key, task) {
+  const existing = directoryRequestFlights.get(key)
+  if (existing) return existing
+
+  const promise = Promise.resolve()
+    .then(task)
+    .finally(() => {
+      if (directoryRequestFlights.get(key) === promise) {
+        directoryRequestFlights.delete(key)
+      }
+    })
+
+  directoryRequestFlights.set(key, promise)
+  return promise
+}
+
+// The old language-options path scans channel_listings in 1,000-row batches.
+// Do not run that scan during a normal /api/directory page request.
+// Language-filtered directory requests still work through the existing RPC.
+// Set DIRECTORY_LIVE_LANGUAGE_SCAN_ENABLED=true later if you intentionally
+// want to restore the expensive live language dropdown scan.
+const DIRECTORY_LIVE_LANGUAGE_SCAN_ENABLED =
+  String(process.env.DIRECTORY_LIVE_LANGUAGE_SCAN_ENABLED || "false").toLowerCase() === "true"
+
 app.get("/api/directory", async (req, res) => {
   try {
     const type = normalizeDirectoryType(req.query.type)
@@ -9007,65 +9039,81 @@ app.get("/api/directory", async (req, res) => {
       .eq("id", type)
       .maybeSingle()
 
-    const languagesPromise = getDirectoryLanguageOptions({
+    const languagesPromise = DIRECTORY_LIVE_LANGUAGE_SCAN_ENABLED
+      ? getDirectoryLanguageOptions({
+          type,
+          query,
+          category,
+          showNsfw,
+        }).catch((error) => {
+          console.warn("Directory language metadata read failed:", error.message)
+          return []
+        })
+      : Promise.resolve([])
+
+    const directoryFlightKey = JSON.stringify({
       type,
       query,
       category,
+      sort,
       showNsfw,
-    }).catch((error) => {
-      console.warn("Directory language metadata read failed:", error.message)
-      return []
+      language: language || null,
+      listingLimit,
+      listingOffset,
     })
 
-    let listings = []
-    let totalCount = 0
+    const directoryResult = await runDirectoryRequestSingleFlight(
+      directoryFlightKey,
+      async () => {
+        if (language) {
+          const languageResult = await fetchLanguageFilteredDirectoryPage({
+            type,
+            query,
+            category,
+            sort,
+            showNsfw,
+            language,
+            listingLimit,
+            listingOffset,
+          })
 
-    if (language) {
-      const languageResult = await fetchLanguageFilteredDirectoryPage({
-        type,
-        query,
-        category,
-        sort,
-        showNsfw,
-        language,
-        listingLimit,
-        listingOffset,
-      })
+          return {
+            listings: languageResult.listings || [],
+            totalCount: Math.max(0, Number(languageResult.total_count || 0)),
+          }
+        }
 
-      listings = languageResult.listings
-      totalCount = languageResult.total_count
-    } else {
-      const pageResult = await supabaseAdmin.rpc("telehub_directory_page", {
-        p_type: type,
-        p_query: query,
-        p_category: category,
-        p_sort: sort,
-        p_show_nsfw: showNsfw,
-        p_limit: listingLimit,
-        p_offset: listingOffset,
-        p_language: null,
-      })
+        const pageResult = await supabaseAdmin.rpc("telehub_directory_page", {
+          p_type: type,
+          p_query: query,
+          p_category: category,
+          p_sort: sort,
+          p_show_nsfw: showNsfw,
+          p_limit: listingLimit,
+          p_offset: listingOffset,
+          p_language: null,
+        })
 
-      if (pageResult.error) {
-        throw new Error(
-          `Directory query failed. Make sure 01-Supabase-Directory-Speed-Migration.sql has been run. ${pageResult.error.message}`
-        )
+        if (pageResult.error) {
+          throw new Error(
+            `Directory query failed. Make sure 01-Supabase-Directory-Speed-Migration.sql has been run. ${pageResult.error.message}`
+          )
+        }
+
+        const payload =
+          pageResult.data && typeof pageResult.data === "object"
+            ? pageResult.data
+            : {}
+
+        return {
+          listings: Array.isArray(payload.listings) ? payload.listings : [],
+          totalCount: Math.max(0, Number(payload.total_count || 0)),
+        }
       }
+    )
 
-      const payload =
-        pageResult.data && typeof pageResult.data === "object"
-          ? pageResult.data
-          : {}
-
-      listings = Array.isArray(payload.listings)
-        ? payload.listings
-        : []
-
-      totalCount = Math.max(
-        0,
-        Number(payload.total_count || 0)
-      )
-    }
+    const listings = directoryResult.listings
+    const totalCount = directoryResult.totalCount
 
     const [metadataResult, languages] = await Promise.all([
       metadataPromise,
