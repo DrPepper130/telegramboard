@@ -4906,8 +4906,8 @@ async function loadStoredListingActivity(listingId) {
 }
 
 // Public listing analytics used by every approved TeleHub listing page.
-// Expensive Telegram/public-post data is CDN-cacheable; member counts themselves
-// still come from the current channel_listings row.
+// All public analytics are reads of previously saved Supabase data.
+// Background collectors own Telegram scraping; listing pages never scrape.
 app.get("/api/public/listing-analytics", async (req, res) => {
   try {
     const requestedSlug = String(req.query?.slug || "").trim().toLowerCase()
@@ -4968,76 +4968,63 @@ app.get("/api/public/listing-analytics", async (req, res) => {
       ]
     }
 
-    let postContext = {
-      posts: [],
-      postCount: 0,
-      telegramLinks: [],
-      latestPostAt: null,
-      postTimestamps: [],
-      source: null,
+    // Serve only previously collected analytics. Never scrape Telegram inside
+    // a visitor-triggered request: that work belongs to the existing background
+    // discovery/post-metrics jobs (persistTelegramPostMetrics and activity seed).
+    const [activityResult, recentPostsResult, graph] = await Promise.all([
+      supabaseAdmin
+        .from("telegram_listing_activity")
+        .select("latest_post_at,observed_post_count,source,checked_at")
+        .eq("listing_id", listing.id)
+        .maybeSingle(),
+      supabaseAdmin
+        .from("telegram_public_posts")
+        .select("text,posted_at")
+        .eq("listing_id", listing.id)
+        .not("text", "is", null)
+        .order("posted_at", { ascending: false })
+        .limit(30),
+      // Graph edges are also pre-collected; no Telegram scraping here.
+      loadPilotGraphAnalytics(listing),
+    ])
+
+    if (activityResult.error) {
+      console.warn("Cached listing activity unavailable:", activityResult.error.message)
     }
-    let postContextError = null
-
-    try {
-      postContext = await fetchPublicTelegramPostContext(listing, {
-        maxPosts: 30,
-        maxCharacters: 12000,
-      })
-    } catch (error) {
-      postContextError = error
-    }
-
-    const storedActivity = postContextError
-      ? await loadStoredListingActivity(listing.id)
-      : null
-
-    if (storedActivity) {
-      postContext = {
-        ...postContext,
-        latestPostAt: storedActivity.latest_post_at || null,
-        postCount: Number(storedActivity.observed_post_count || 0),
-        source: storedActivity.source || "stored_activity_seed",
-      }
+    if (recentPostsResult.error) {
+      console.warn("Cached recent posts unavailable:", recentPostsResult.error.message)
     }
 
-    const postTimestampMs = (postContext.postTimestamps || [])
-      .map((value) => new Date(value).getTime())
-      .filter(Number.isFinite)
-
+    const storedActivity = activityResult.error ? null : activityResult.data
+    const storedPosts = recentPostsResult.error ? [] : (recentPostsResult.data || [])
     const sevenDaysAgo = Date.now() - 7 * 24 * 60 * 60 * 1000
-    const postsLast7Days = postTimestampMs.filter(
-      (timestampMs) => timestampMs >= sevenDaysAgo
-    ).length
-
-    const graph = await loadPilotGraphAnalytics(
-      listing,
-      postContext.telegramLinks || []
-    )
+    const postsLast7Days = storedPosts.filter((post) => {
+      const timestamp = Date.parse(post.posted_at || "")
+      return Number.isFinite(timestamp) && timestamp >= sevenDaysAgo
+    }).length
 
     const latestSnapshotAt = snapshots.length
       ? snapshots[snapshots.length - 1].created_at
       : null
-
     const statisticsUpdatedAt =
+      storedActivity?.checked_at ||
       listing.last_synced_at ||
       latestSnapshotAt ||
       listing.updated_at ||
       nowIso
 
-    const meaningfulRecentPosts = (postContext.posts || [])
+    const meaningfulRecentPosts = storedPosts
+      .map((post) => String(post.text || "").trim())
       .filter(isMeaningfulTelegramPostText)
       .slice(0, 3)
-
-    const activityAvailable =
-      Boolean(postContext.source) &&
-      (!postContextError || Boolean(storedActivity))
+    const activityAvailable = Boolean(storedActivity?.checked_at)
 
     const growthDay1 = publicGrowthStat(currentMembers, snapshots, 1)
     const growthDay7 = publicGrowthStat(currentMembers, snapshots, 7)
     const growthDay30 = publicGrowthStat(currentMembers, snapshots, 30)
 
-    // Cache the public analytics payload for one hour. This prevents Googlebot
-    // and normal page traffic from repeatedly re-scraping Telegram on every hit.
+    // Cache the read-only analytics payload for one hour; background jobs update
+    // the source tables independently. CDN caching depends on the deployment.
     res.set(
       "Cache-Control",
       "public, max-age=300, s-maxage=3600, stale-while-revalidate=86400"
@@ -5064,19 +5051,18 @@ app.get("/api/public/listing-analytics", async (req, res) => {
       })),
       activity: {
         available: activityAvailable,
-        latest_post_at: postContext.latestPostAt || null,
+        latest_post_at: storedActivity?.latest_post_at || null,
+        // This is a lower-bound based on the most recent 30 stored post rows.
+        // If the collector has more posts, this sample can undercount activity.
         posts_observed_last_7_days: postsLast7Days,
         average_observed_posts_per_day:
-          postsLast7Days > 0
-            ? Number((postsLast7Days / 7).toFixed(1))
-            : 0,
-        public_preview_post_count: Number(postContext.postCount || 0),
-        source: postContext.source || null,
-        warning:
-          activityAvailable
-            ? "Post frequency is based on the posts currently exposed by Telegram's public web preview and can undercount very active channels."
-            : null,
-        error: postContextError?.message || null,
+          Number((postsLast7Days / 7).toFixed(1)),
+        public_preview_post_count: Number(storedActivity?.observed_post_count || 0),
+        source: storedActivity?.source || null,
+        warning: activityAvailable
+          ? "Post frequency is estimated from the latest 30 stored public posts and may undercount activity."
+          : null,
+        error: null,
       },
       network: {
         ...graph,
@@ -18810,8 +18796,6 @@ app.delete("/api/admin/listing-reports/:id", async (req, res) => {
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`)
 
-  // 24/7 automation state lives in Supabase, so a Render restart does not
-  // disable it. If enabled, resume the worker after the server is listening.
   setTimeout(() => {
     getContinuousAutomationState()
       .then((state) => {
