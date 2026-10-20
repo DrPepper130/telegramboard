@@ -7090,8 +7090,8 @@ app.post("/api/telegram-clone/apply", async (req, res) => {
       } else {
         try {
           await client.invoke(
-            new Api.channels.EditAbout({
-              channel: destinationInput,
+            new Api.messages.EditChatAbout({
+              peer: destinationInput,
               about: sourceInspection.description || "",
             })
           )
