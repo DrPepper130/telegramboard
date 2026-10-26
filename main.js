@@ -35,6 +35,58 @@ const supabaseAdmin = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY
 )
 
+
+// ========================================
+// INDEXNOW
+// ========================================
+
+function telehubListingUrl(shortInvite) {
+  const clean = String(shortInvite || "").trim()
+  return clean ? `https://telehub.to/channel/${encodeURIComponent(clean)}` : null
+}
+
+async function notifyIndexNow(urls, reason = "listing_changed") {
+  const key = String(process.env.INDEXNOW_KEY || "").trim()
+  const cleanUrls = Array.from(
+    new Set((Array.isArray(urls) ? urls : [urls]).filter(Boolean).map((url) => String(url).trim()))
+  ).slice(0, 10000)
+
+  if (!key || !cleanUrls.length) return { ok: false, skipped: true }
+
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), 5000)
+
+  try {
+    const response = await fetch("https://api.indexnow.org/IndexNow", {
+      method: "POST",
+      signal: controller.signal,
+      headers: { "Content-Type": "application/json; charset=utf-8" },
+      body: JSON.stringify({
+        host: "telehub.to",
+        key,
+        keyLocation: `https://telehub.to/${key}.txt`,
+        urlList: cleanUrls,
+      }),
+    })
+
+    if (!response.ok && response.status !== 202) {
+      throw new Error(`IndexNow returned HTTP ${response.status}`)
+    }
+
+    console.log("[IndexNow submitted]", { reason, count: cleanUrls.length, urls: cleanUrls })
+    return { ok: true, status: response.status }
+  } catch (error) {
+    console.warn("IndexNow notification failed:", {
+      reason,
+      error: error?.message || String(error),
+      urls: cleanUrls,
+    })
+    return { ok: false, error: error?.message || String(error) }
+  } finally {
+    clearTimeout(timeout)
+  }
+}
+
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`
 
@@ -3459,6 +3511,11 @@ async function deleteListingEverywhere(listing, options = {}) {
 
   if (listingDeleteError) throw listingDeleteError
 
+  await notifyIndexNow(
+    telehubListingUrl(listing.short_invite),
+    "listing_deleted"
+  )
+
   let homepageCache = null
   try {
     homepageCache = await updateHomepageListingCache()
@@ -3725,6 +3782,11 @@ app.post("/api/admin/listings/review-approve", async (req, res) => {
 
     if (updateError) throw updateError
 
+    await notifyIndexNow(
+      telehubListingUrl(updated.short_invite),
+      "admin_review_approved"
+    )
+
     return res.json({
       ok: true,
       listing: updated,
@@ -3836,6 +3898,11 @@ app.post("/api/admin/listings/lifecycle", async (req, res) => {
 
     if (updateError) throw updateError
 
+    await notifyIndexNow(
+      telehubListingUrl(updated.short_invite),
+      `admin_${cleanAction}`
+    )
+
     return res.json({
       ok: true,
       action: cleanAction,
@@ -3850,6 +3917,40 @@ app.post("/api/admin/listings/lifecycle", async (req, res) => {
   } catch (err) {
     console.error("Admin listing lifecycle error:", err)
     return res.status(500).json({ error: err.message })
+  }
+})
+
+app.post("/api/indexnow/notify-listing", async (req, res) => {
+  try {
+    const authHeader = String(req.headers.authorization || "")
+    const token = authHeader.replace(/^Bearer\s+/i, "").trim()
+    const listingId = String(req.body?.listing_id || "").trim()
+
+    if (!token) return res.status(401).json({ error: "Missing auth token." })
+    if (!listingId) return res.status(400).json({ error: "Missing listing_id." })
+
+    const { data: { user }, error: userError } = await supabaseAdmin.auth.getUser(token)
+    if (userError || !user) return res.status(401).json({ error: "Invalid auth token." })
+
+    const { data: listing, error } = await supabaseAdmin
+      .from("channel_listings")
+      .select("id, user_id, short_invite, status, is_banned")
+      .eq("id", listingId)
+      .single()
+
+    if (error || !listing) return res.status(404).json({ error: "Listing not found." })
+
+    const admin = await isUserAdmin(user)
+    if (listing.user_id !== user.id && !admin) {
+      return res.status(403).json({ error: "You do not own this listing." })
+    }
+
+    const url = telehubListingUrl(listing.short_invite)
+    const result = await notifyIndexNow(url, "manual_listing_changed")
+    return res.json({ ok: true, url, indexnow: result })
+  } catch (error) {
+    console.error("IndexNow listing notify route failed:", error)
+    return res.status(500).json({ error: error.message || "IndexNow notification failed." })
   }
 })
 
@@ -7671,6 +7772,11 @@ app.post("/api/listings/claim/verify", async (req, res) => {
       telegram_username: expectedUsername,
     })
 
+    await notifyIndexNow(
+      telehubListingUrl(finalListing.short_invite),
+      "listing_claimed"
+    )
+
     return res.json({
       ok: true,
       verified: true,
@@ -11357,6 +11463,11 @@ async function importSingleTelegramListing(
     .single()
 
   if (insertError) throw insertError
+
+  await notifyIndexNow(
+    telehubListingUrl(inserted.short_invite),
+    "ai_auto_listing_created"
+  )
 
   await onStage("supabase_created", {
     listing_id: inserted.id,
