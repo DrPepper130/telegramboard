@@ -14068,6 +14068,108 @@ async function loadTelegramGraphSeedLinks(run, metadata) {
     }
   }
 
+  // Final fallback: pull directly from persistent crawl history.
+  // The scraper_queue fallback above only sees a relatively small/recent slice
+  // of discovered communities. Crawl history can contain tens of thousands of
+  // older graph nodes that are already past cooldown and safe to revisit.
+  //
+  // Keep this query bounded so an exhausted cycle does not scan the entire
+  // history table or recreate the database pressure that 24/7 mode is meant
+  // to avoid.
+  let historyFallbackCandidateCount = 0
+  let historyFallbackSelectedCount = 0
+
+  if (selected.length < seedLimit) {
+    const historyFallbackPoolLimit = Math.min(
+      Math.max(seedLimit * 5, 1000),
+      5000
+    )
+
+    const { data: historyRows, error: historyFallbackError } = await supabaseAdmin
+      .from("telegram_graph_crawl_history")
+      .select(
+        "normalized_link, telegram_username, last_crawled_at, last_success_at, last_result_count, last_verified_count, last_new_count, crawl_count, last_status, max_requested_depth"
+      )
+      .not("telegram_username", "is", null)
+      .order("last_crawled_at", { ascending: true })
+      .limit(historyFallbackPoolLimit)
+
+    if (historyFallbackError) {
+      console.warn(
+        "Could not load eligible crawl-history fallback seeds:",
+        historyFallbackError.message
+      )
+    } else {
+      const historySeeds = []
+
+      for (const row of historyRows || []) {
+        if (!graphHistoryEligible(row, settings)) continue
+
+        const username = String(row.telegram_username || "")
+          .replace(/^@/, "")
+          .trim()
+
+        if (!/^[A-Za-z][A-Za-z0-9_]{3,31}$/.test(username)) continue
+
+        const link = cleanImportTelegramLink(`https://t.me/${username}`)
+        const normalized = normalizeTelegramLinkForComparison(link)
+
+        if (
+          !normalized ||
+          selectedNormalized.has(normalized) ||
+          primaryCandidates.some(
+            (candidate) =>
+              normalizeTelegramLinkForComparison(candidate) === normalized
+          )
+        ) {
+          continue
+        }
+
+        historySeeds.push({ link, normalized, history: row })
+      }
+
+      historyFallbackCandidateCount = historySeeds.length
+
+      for (const entry of historySeeds) {
+        if (selected.length >= seedLimit) break
+
+        if (!history.has(entry.normalized)) {
+          history.set(entry.normalized, entry.history)
+        }
+
+        const before = selected.length
+        trySelect(entry.link, false)
+        if (selected.length > before) historyFallbackSelectedCount += 1
+      }
+
+      if (historyFallbackSelectedCount > 0) {
+        const message =
+          `24/7 discovery recovered ${historyFallbackSelectedCount} eligible ` +
+          `seed(s) directly from persistent graph crawl history.`
+
+        console.log("[24/7 history fallback]", {
+          run_id: run.id,
+          history_candidates: historyFallbackCandidateCount,
+          history_selected: historyFallbackSelectedCount,
+          total_selected: selected.length,
+        })
+
+        await logScraperEvent({
+          runId: run.id,
+          level: "success",
+          stage: "telegram_graph_history_fallback",
+          message,
+          metadata: {
+            history_candidates: historyFallbackCandidateCount,
+            history_selected: historyFallbackSelectedCount,
+            total_selected: selected.length,
+            pool_limit: historyFallbackPoolLimit,
+          },
+        })
+      }
+    }
+  }
+
   if (skippedByHistory > 0) {
     await logScraperEvent({
       runId: run.id,
@@ -14087,6 +14189,8 @@ async function loadTelegramGraphSeedLinks(run, metadata) {
         empty_crawl_cooldown_hours: settings.empty_crawl_cooldown_hours,
         fallback_candidates: fallbackCandidateCount,
         fallback_selected: fallbackSelectedCount,
+        history_fallback_candidates: historyFallbackCandidateCount,
+        history_fallback_selected: historyFallbackSelectedCount,
       },
     })
   }
@@ -14121,6 +14225,8 @@ async function loadTelegramGraphSeedLinks(run, metadata) {
       run_id: run.id,
       primary_candidates: primaryCandidates.length,
       fallback_candidates: fallbackCandidateCount,
+      history_fallback_candidates: historyFallbackCandidateCount,
+      history_fallback_selected: historyFallbackSelectedCount,
       skipped_by_history: skippedByHistory,
     })
 
@@ -14133,6 +14239,8 @@ async function loadTelegramGraphSeedLinks(run, metadata) {
       metadata: {
         primary_candidates: primaryCandidates.length,
         fallback_candidates: fallbackCandidateCount,
+        history_fallback_candidates: historyFallbackCandidateCount,
+        history_fallback_selected: historyFallbackSelectedCount,
         skipped_by_history: skippedByHistory,
       },
     })
