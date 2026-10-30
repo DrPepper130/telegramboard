@@ -5025,7 +5025,7 @@ app.get("/api/public/listing-analytics", async (req, res) => {
       .select(
         "id,short_invite,channel_name,telegram_title,telegram_username,telegram_link,member_count,categories,last_synced_at,updated_at,status,is_banned"
       )
-      .ilike("short_invite", requestedSlug)
+      .eq("short_invite", requestedSlug)
       .maybeSingle()
 
     if (listingError) throw listingError
